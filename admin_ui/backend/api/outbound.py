@@ -590,6 +590,10 @@ class LeadImportResponse(BaseModel):
     error_csv_truncated: bool = False
     warnings: List[Dict[str, Any]] = Field(default_factory=list)
     warnings_truncated: bool = False
+    # Manual add only: when the single submitted phone number already exists in
+    # the campaign, the existing lead's id — so callers can PATCH it and/or
+    # recycle it instead of parsing the duplicates counter.
+    duplicate_lead_id: Optional[str] = None
 
 
 class ManualLeadCreateRequest(BaseModel):
@@ -837,7 +841,13 @@ async def add_manual_lead(campaign_id: str, req: ManualLeadCreateRequest):
             known_agents=known_agents,
             known_contexts=known_contexts,
         )
-        return LeadImportResponse(**result)
+        response = LeadImportResponse(**result)
+        if response.duplicates and not response.accepted:
+            # Hand the caller the existing lead so it can PATCH/recycle it.
+            response.duplicate_lead_id = await store.get_lead_id_by_phone(
+                campaign_id, req.phone_number
+            )
+        return response
     except KeyError:
         raise HTTPException(status_code=404, detail="Campaign not found")
     except ValueError as e:
@@ -854,6 +864,47 @@ async def list_leads(
 ):
     store = _get_outbound_store()
     return await store.list_leads(campaign_id, page=page, page_size=page_size, state=state, q=q)
+
+
+class LeadPatchRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=200)
+    agent: Optional[str] = Field(None, max_length=64)
+    timezone: Optional[str] = Field(None, max_length=100)
+    caller_id: Optional[str] = Field(None, max_length=64)
+    custom_vars: Optional[Dict[str, Any]] = None
+
+
+@router.patch("/leads/{lead_id}")
+async def patch_lead(lead_id: str, req: LeadPatchRequest):
+    """Update editable lead fields; only fields present in the request change.
+
+    An explicit null clears the override (agent/timezone/caller_id fall back
+    to campaign defaults; custom_vars becomes {}). custom_vars is replaced as
+    a whole, not merged. Returns 409 while the lead is actively being dialed.
+    State and attempt counters are untouched — POST /leads/{lead_id}/recycle
+    re-queues the lead for a new call.
+    """
+    fields = req.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    agent = str(fields.get("agent") or "").strip()
+    if agent:
+        known_agents, _known_contexts = _load_known_agent_selectors()
+        if known_agents is not None and agent not in known_agents:
+            raise HTTPException(status_code=400, detail=f"Unknown agent '{agent}'")
+    store = _get_outbound_store()
+    try:
+        updated = await store.update_lead(lead_id, fields)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Lead cannot be updated while it is being dialed",
+        )
+    return updated
 
 
 @router.post("/leads/{lead_id}/cancel")

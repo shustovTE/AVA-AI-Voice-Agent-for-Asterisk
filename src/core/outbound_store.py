@@ -1410,6 +1410,130 @@ class OutboundStore:
 
         return await self._run(_sync)
 
+    # States in which a lead row may be edited. While an attempt is actively
+    # leased/dialing the runtime already owns the lead's data, so edits are
+    # rejected instead of racing the call.
+    _LEAD_EDITABLE_STATES = ("pending", "completed", "failed", "canceled")
+
+    async def get_lead(self, lead_id: str) -> Optional[Dict[str, Any]]:
+        """Return one lead row with parsed custom_vars, or None when unknown."""
+        if not self._enabled:
+            return None
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM outbound_leads WHERE id = ?",
+                        (str(lead_id or "").strip(),),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    d = dict(row)
+                    d["custom_vars"] = _safe_json_loads(str(d.get("custom_vars_json") or "{}"))
+                    d.pop("custom_vars_json", None)
+                    return d
+                finally:
+                    conn.close()
+
+        return await self._run(_sync)
+
+    async def get_lead_id_by_phone(self, campaign_id: str, phone_number: str) -> Optional[str]:
+        """Resolve a campaign lead id by phone number (import normalization)."""
+        if not self._enabled:
+            return None
+        try:
+            phone = _normalize_phone_number(str(phone_number or ""))
+        except ValueError:
+            return None
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM outbound_leads WHERE campaign_id = ? AND phone_number = ?",
+                        (str(campaign_id or "").strip(), phone),
+                    ).fetchone()
+                    return str(row["id"]) if row else None
+                finally:
+                    conn.close()
+
+        return await self._run(_sync)
+
+    async def update_lead(self, lead_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update editable lead fields (PATCH semantics: only provided keys).
+
+        Supported keys: name, agent (context_override + 'ai_agent' routing),
+        timezone, caller_id, custom_vars (full replace). An explicit None
+        clears the override. Does not touch state or attempt counters — use
+        recycle_lead to re-queue.
+
+        Returns the updated row, or None when the lead is in an active state.
+        Raises KeyError for an unknown lead and ValueError for invalid input.
+        """
+        if not self._enabled:
+            raise RuntimeError("OutboundStore disabled")
+
+        updates: Dict[str, Any] = {}
+        if "name" in fields:
+            name = fields["name"]
+            updates["name"] = (str(name).strip() or None) if name is not None else None
+        if "agent" in fields:
+            agent = str(fields["agent"] or "").strip()
+            updates["context_override"] = agent or None
+            if agent:
+                updates["agent_routing_method"] = "ai_agent"
+        if "timezone" in fields:
+            tz = str(fields["timezone"] or "").strip()
+            updates["lead_timezone"] = _validate_iana_timezone_name(tz) if tz else None
+        if "caller_id" in fields:
+            updates["caller_id_override"] = str(fields["caller_id"] or "").strip() or None
+        if "custom_vars" in fields:
+            custom_vars = fields["custom_vars"]
+            if custom_vars is None:
+                custom_vars = {}
+            if not isinstance(custom_vars, dict):
+                raise ValueError("custom_vars must be a JSON object")
+            try:
+                updates["custom_vars_json"] = json.dumps(custom_vars)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("custom_vars must be JSON serializable") from exc
+        if not updates:
+            raise ValueError("no updatable fields provided")
+
+        def _sync():
+            now = _utcnow_iso()
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT state FROM outbound_leads WHERE id = ?", (lead_id,)
+                    ).fetchone()
+                    if row is None:
+                        raise KeyError(lead_id)
+                    if str(row["state"]) not in self._LEAD_EDITABLE_STATES:
+                        return None
+                    sets = ", ".join(f"{col} = ?" for col in updates)
+                    conn.execute(
+                        f"UPDATE outbound_leads SET {sets}, updated_at_utc = ? WHERE id = ?",
+                        (*updates.values(), now, lead_id),
+                    )
+                    conn.commit()
+                    d = dict(
+                        conn.execute(
+                            "SELECT * FROM outbound_leads WHERE id = ?", (lead_id,)
+                        ).fetchone()
+                    )
+                    d["custom_vars"] = _safe_json_loads(str(d.get("custom_vars_json") or "{}"))
+                    d.pop("custom_vars_json", None)
+                    return d
+                finally:
+                    conn.close()
+
+        return await self._run(_sync)
+
     async def delete_lead(self, lead_id: str) -> None:
         """
         Hard delete a lead and all its attempts.

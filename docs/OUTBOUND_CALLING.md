@@ -108,6 +108,21 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
   authoritative metadata cannot be recovered or its stored custom_vars JSON is
   corrupt.
 
+### Updating a lead (`PATCH /api/outbound/leads/{lead_id}`)
+
+- `PATCH /api/outbound/leads/{lead_id}` updates `name`, `agent`, `timezone`,
+  `caller_id`, and `custom_vars` (replaced as a whole, not merged). Only
+  fields present in the request change; an explicit `null` clears the override
+  back to the campaign default. Returns `409` while the lead is actively being
+  dialed (`leased`/`dialing`/`amd_pending`/`in_progress`); state and attempt
+  counters are untouched — chain `POST /api/outbound/leads/{lead_id}/recycle`
+  to queue a new call.
+- Manual add (`POST /api/outbound/campaigns/{campaign_id}/leads`) reports an
+  existing number as `"duplicates": 1` and also returns
+  `"duplicate_lead_id"` — the existing lead's id. An automation re-dialing the
+  same number should PATCH the fresh `custom_vars` onto that id first, then
+  recycle it.
+
 ## Testing Checklist (New User)
 
 Use a local extension (e.g., `2765`) and an external number (E.164) to validate:
