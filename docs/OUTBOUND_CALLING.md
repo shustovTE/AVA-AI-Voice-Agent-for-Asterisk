@@ -92,6 +92,10 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
   and pre-call enrichment keep priority over same-named keys, values are used
   verbatim without truncation, and built-in placeholders inside a custom value
   resolve as well.
+- Post-call webhooks can reference the same keys: each `custom_vars` key is a
+  `{placeholder}` in the webhook `payload_template` (plus `{custom_vars_json}`
+  for the raw object), so a correlation id such as `{amo_lead_id}` travels
+  back to the automation that scheduled the call.
 - Nonempty values are additionally delivered to the selected Agent as a
   read-only `## Lead Context` JSON block (untruncated). The Agent editor's
   **Lead Context block** toggle turns this off per Agent — e.g. when the prompt

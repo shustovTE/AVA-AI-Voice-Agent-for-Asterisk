@@ -294,10 +294,11 @@ class PostCallContext:
     # Tool execution data
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # In-call tool executions
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # Data from pre-call tools
-    
+
     # Outbound-specific
     campaign_id: Optional[str] = None
     lead_id: Optional[str] = None
+    custom_vars: Dict[str, Any] = field(default_factory=dict)  # Outbound lead custom_vars
     
     # System access
     config: Any = None
@@ -331,12 +332,18 @@ class PostCallContext:
             "pre_call_results_json": json.dumps(self.pre_call_results),
             "campaign_id": self.campaign_id or "",
             "lead_id": self.lead_id or "",
+            "custom_vars_json": json.dumps(self.custom_vars),
         }
         # Flatten pre-call enrichment variables into individual placeholders
         # (e.g. {customer_name}) so post-call webhook bodies can reference them
         # directly, mirroring how the prompt and in-call paths expose them.
         # Built-in keys always win; a pre-call variable never clobbers them.
         for key, value in (self.pre_call_results or {}).items():
+            if key not in payload:
+                payload[key] = str(value) if value else ""
+        # Same for outbound lead custom_vars (e.g. {amo_lead_id} from a CRM):
+        # built-ins and pre-call enrichment keep priority over same-named keys.
+        for key, value in (self.custom_vars or {}).items():
             if key not in payload:
                 payload[key] = str(value) if value else ""
         return payload

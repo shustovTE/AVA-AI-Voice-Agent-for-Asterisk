@@ -20498,6 +20498,7 @@ class Engine:
                 pre_call_results=dict(getattr(session, 'pre_call_results', {}) or {}),
                 campaign_id=getattr(session, 'outbound_campaign_id', None),
                 lead_id=getattr(session, 'outbound_lead_id', None),
+                custom_vars=dict(getattr(session, 'outbound_custom_vars', {}) or {}),
                 config=self._tool_config_for_session(session),
                 summary_generator=self._post_call_summary_generator(),
             )
