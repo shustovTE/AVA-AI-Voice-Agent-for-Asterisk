@@ -89,6 +89,10 @@ class AgentIn(BaseModel):
     email_recipient: str | None = None
     email_from: str | None = None
     email_enabled: bool | None = None
+    # Append the outbound lead's custom_vars to the prompt as the read-only
+    # '## Lead Context' JSON block. NULL/None = default (on); False turns it
+    # off, e.g. when the prompt renders the same values via {var} placeholders.
+    lead_context_enabled: bool | None = None
 
     _check_emails = field_validator("email_recipient", "email_from")(
         _validate_optional_email)
@@ -128,6 +132,7 @@ class AgentPatch(BaseModel):
     email_recipient: str | None = None
     email_from: str | None = None
     email_enabled: bool | None = None
+    lead_context_enabled: bool | None = None
     is_active: bool | None = None
 
     _check_emails = field_validator("email_recipient", "email_from")(
@@ -180,6 +185,7 @@ class AgentOut(BaseModel):
     email_recipient: str | None = None
     email_from: str | None = None
     email_enabled: bool | None = None
+    lead_context_enabled: bool | None = None
 
 class AgentSummaryResponse(BaseModel):
     active_agents: int

@@ -307,23 +307,28 @@ class ElevenLabsAgentProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # Override first message with caller_name substituted
         # This bypasses ElevenLabs template rendering which fails if variable is in first message
         if context.get("greeting"):
-            # Substitute variables in greeting
+            # Substitute variables with plain replace instead of str.format():
+            # the engine has already rendered known template variables, and
+            # format() aborts wholesale on any leftover/unknown {placeholder}
+            # (KeyError) or literal braces in the text (ValueError), losing
+            # the caller_name/caller_id substitution with it.
             greeting = context["greeting"]
-            try:
-                greeting = greeting.format(caller_name=caller_name, caller_id=caller_id)
-            except (KeyError, ValueError) as e:
-                logger.warning(f"[elevenlabs] [{self._call_id}] Greeting format failed: {e}. Using as-is.")
+            greeting = (
+                greeting.replace("{caller_name}", str(caller_name))
+                .replace("{caller_id}", str(caller_id))
+            )
             conversation_override["agent"]["first_message"] = greeting
             logger.info(f"[elevenlabs] [{self._call_id}] Override first_message: {greeting[:50]}...")
         
         # Add custom system prompt if provided (overrides ElevenLabs dashboard prompt)
         if context.get("instructions"):
-            # Substitute variables in system prompt too
+            # Substitute variables in system prompt too (plain replace — see
+            # the greeting note above for why str.format() is unsafe here).
             prompt = context["instructions"]
-            try:
-                prompt = prompt.format(caller_name=caller_name, caller_id=caller_id)
-            except (KeyError, ValueError) as e:
-                logger.warning(f"[elevenlabs] [{self._call_id}] System prompt format failed: {e}. Using as-is.")
+            prompt = (
+                prompt.replace("{caller_name}", str(caller_name))
+                .replace("{caller_id}", str(caller_id))
+            )
             conversation_override["agent"]["prompt"] = {"prompt": prompt}
             logger.info(f"[elevenlabs] [{self._call_id}] Override system_prompt: {len(prompt)} chars")
         

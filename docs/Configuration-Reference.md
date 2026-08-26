@@ -337,17 +337,16 @@ See `docs/contributing/milestones/milestone-22-outbound-campaign-dialer.md` for 
 
 AAVA sends outbound channel variables in the ARI `POST /channels` JSON
 `variables` object. This includes Agent/provider routing, outbound correlation,
-FreePBX identity, AMD/consent controls, and the internal
-`AAVA_CUSTOM_VARS_JSON` lead-context value. Local-channel routes receive both
+FreePBX identity, and AMD/consent controls. Local-channel routes receive both
 ordinary and inherited variants so the metadata survives the `;1`/`;2`
 boundary.
 
-Lead `custom_vars` must serialize to at most 8,192 bytes. Nonempty context is
-reapplied and read back before the answered channel enters the AMD dialplan
-hop. A missing or mismatched value fails the attempt closed before provider
-startup. If the engine restarts while an originate is still ringing, it
-recovers the unfinished attempt and lead from SQLite before applying the same
-gate; unavailable authoritative metadata also fails closed. The value is
+Lead `custom_vars` never travel through channel variables and have no size
+limit: the engine keeps them in attempt metadata and the durable SQLite store
+and re-reads them by attempt id when the answered call returns to Stasis. If
+the engine restarts while an originate is still ringing, it recovers the
+unfinished attempt and lead from SQLite before starting the AI session;
+unavailable or corrupt authoritative metadata fails closed. The value is
 intentionally excluded from logs; use attempt, campaign, lead, and channel
 identifiers when troubleshooting.
 

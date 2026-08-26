@@ -100,6 +100,7 @@ interface LeadRow {
     phone_number: string;
     state: string;
     attempt_count: number;
+    custom_vars?: Record<string, unknown> | null;
     context_override?: string | null;
     last_outcome?: string | null;
     last_attempt_at_utc?: string | null;
@@ -1505,11 +1506,12 @@ const CallSchedulingPage = () => {
                     </div>
 
                     <div className="overflow-x-auto">
-                        <table className="min-w-[1500px] w-full text-sm">
+                        <table className="min-w-[1620px] w-full text-sm">
                             <thead className="bg-muted/30 text-muted-foreground">
                                 <tr className="text-left">
                                     <th className="py-2 px-3">Name</th>
                                     <th className="py-2 px-3">Number</th>
+                                    <th className="py-2 px-3">Variables</th>
                                     <th className="py-2 px-3">State</th>
                                     <th className="py-2 px-3">Agent</th>
                                     <th className="py-2 px-3">Provider</th>
@@ -1537,6 +1539,20 @@ const CallSchedulingPage = () => {
                                         <tr key={l.id} className="border-b border-border/50">
                                             <td className="py-2 px-3">{l.name || '-'}</td>
                                             <td className="py-2 px-3 font-mono">{l.phone_number}</td>
+                                            <td className="py-2 px-3 max-w-[220px]">
+                                                {l.custom_vars && Object.keys(l.custom_vars).length > 0 ? (
+                                                    <span
+                                                        className="block truncate font-mono text-xs cursor-help"
+                                                        title={JSON.stringify(l.custom_vars, null, 2)}
+                                                    >
+                                                        {Object.entries(l.custom_vars)
+                                                            .map(([k, v]) => `${k}=${String(v)}`)
+                                                            .join(' · ')}
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-muted-foreground">-</span>
+                                                )}
+                                            </td>
                                             <td className="py-2 px-3">{l.state}</td>
                                             <td className="py-2 px-3 font-mono">{effectiveAgent}</td>
                                             <td className="py-2 px-3 font-mono">{provider}</td>
@@ -1598,7 +1614,7 @@ const CallSchedulingPage = () => {
                                 })}
                                 {leads.length === 0 && (
                                     <tr>
-                                        <td colSpan={14} className="py-10 text-center text-sm text-muted-foreground">
+                                        <td colSpan={15} className="py-10 text-center text-sm text-muted-foreground">
                                             No leads yet. Use the campaign modal to import a CSV/Excel file or add a lead manually.
                                         </td>
                                     </tr>

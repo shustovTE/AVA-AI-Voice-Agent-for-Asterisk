@@ -139,18 +139,8 @@ def sanitize_secrets(logger, method_name, event_dict):
         if not isinstance(d, dict):
             return d
 
-        # ChannelVarSet encodes the variable name and value as sibling fields,
-        # so a key-only secret matcher cannot identify lead context. Apply the
-        # pair-aware check at every nesting level and normalize inherited
-        # Asterisk variable prefixes before matching.
-        variable_name = str(d.get("variable") or "").lstrip("_").upper()
-        
         sanitized = {}
         for key, value in d.items():
-            if variable_name == "AAVA_CUSTOM_VARS_JSON" and key == "value":
-                sanitized[key] = OUTBOUND_LEAD_CONTEXT_REDACTION
-                continue
-
             # Normalize key for comparison (remove separators, lowercase)
             key_normalized = str(key).lower().replace('_', '').replace('-', '')
             

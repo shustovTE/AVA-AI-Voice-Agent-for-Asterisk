@@ -25,7 +25,7 @@ async def test_originate_channel_sends_variables_in_json_body_without_mutating_i
     client.http_session = Mock()
     client.http_session.request.return_value = _Response()
     channel_vars = {
-        "AAVA_CUSTOM_VARS_JSON": '{"task":"confirm appointment"}',
+        "AAVA_LEAD_NAME": "Anna",
         "AI_AGENT": "sales",
     }
     original = dict(channel_vars)

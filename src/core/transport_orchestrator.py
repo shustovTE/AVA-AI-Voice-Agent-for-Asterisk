@@ -105,6 +105,9 @@ class ContextConfig:
     email_recipient: Optional[str] = None
     email_from: Optional[str] = None
     email_enabled: Optional[bool] = None
+    # Per-agent '## Lead Context' JSON block toggle for outbound custom_vars.
+    # Tri-state: None = default (append the block), False = skip it.
+    lead_context_enabled: Optional[bool] = None
     # Partial per-agent override of the global no_input policy. Missing fields
     # inherit their global value.
     no_input: Optional[Dict[str, Any]] = None

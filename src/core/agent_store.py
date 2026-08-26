@@ -131,6 +131,10 @@ class EngineAgentStore:
         email_from = r["email_from"] if "email_from" in cols else None
         email_enabled_raw = r["email_enabled"] if "email_enabled" in cols else None
         email_enabled = None if email_enabled_raw is None else bool(email_enabled_raw)
+        # Per-agent Lead Context block toggle: stored int (0/1) or NULL; NULL
+        # (legacy row / pre-migration DB) keeps the block enabled by default.
+        lead_context_raw = r["lead_context_enabled"] if "lead_context_enabled" in cols else None
+        lead_context_enabled = None if lead_context_raw is None else bool(lead_context_raw)
         try:
             hangup_policy = normalize_agent_hangup_policy(
                 json.loads(r["hangup_policy_json"])
@@ -155,6 +159,7 @@ class EngineAgentStore:
             email_recipient=email_recipient,
             email_from=email_from,
             email_enabled=email_enabled,
+            lead_context_enabled=lead_context_enabled,
             **kwargs)
 
     def default_slug(self) -> Optional[str]:

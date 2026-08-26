@@ -151,10 +151,6 @@ PIPELINE_STT_CHANNELS = 1
 PIPELINE_STT_BYTES_PER_SAMPLE = 2
 CONNECTION_AUDIO_HANDOFF_TIMEOUT_SECONDS = 10.0
 OUTBOUND_ATTEMPT_STALE_SECONDS_DEFAULT = 120.0
-# Keep lead context comfortably below practical ARI/dialplan payload limits.
-# The same canonical JSON is used for originate, post-answer confirmation, and
-# prompt hydration so the fail-closed comparison is deterministic.
-OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES = 8192
 # A human-first AMD preset. In particular, Asterisk's stock max-word default
 # of 3 classified the observed four-word human greeting as MACHINE.
 OUTBOUND_AMD_HUMAN_FIRST_DEFAULTS: Dict[str, int] = {
@@ -1806,71 +1802,32 @@ class Engine:
             if value:
                 setattr(session, attr, value)
 
-    @staticmethod
-    def _serialize_outbound_custom_vars(custom_vars: Any) -> str:
-        """Return bounded, canonical JSON for one lead's outbound context."""
-        if custom_vars is None:
-            custom_vars = {}
-        if not isinstance(custom_vars, dict):
-            raise ValueError("outbound custom_vars must be a JSON object")
-        try:
-            serialized = json.dumps(
-                custom_vars,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("outbound custom_vars must be JSON serializable") from exc
-        serialized_bytes = len(serialized.encode("utf-8"))
-        if serialized_bytes > OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES:
-            raise ValueError(
-                "outbound custom_vars exceed the "
-                f"{OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES}-byte serialized limit"
-            )
-        return serialized
+    async def _hydrate_outbound_custom_vars(self, session: CallSession) -> None:
+        """Populate session.outbound_custom_vars from attempt metadata.
 
-    async def _set_and_confirm_outbound_custom_vars(
-        self,
-        channel_id: str,
-        expected_json: str,
-    ) -> bool:
-        """Set and read back lead context without logging its sensitive value."""
-        try:
-            write_ok = await self.ari_client.set_channel_var(
-                channel_id,
-                "AAVA_CUSTOM_VARS_JSON",
-                expected_json,
-            )
-            response = await self.ari_client.send_command(
-                "GET",
-                f"channels/{channel_id}/variable",
-                params={"variable": "AAVA_CUSTOM_VARS_JSON"},
-                tolerate_statuses=[404],
-            )
-            actual = str(response.get("value") or "") if isinstance(response, dict) else ""
-            confirmed = actual == expected_json
-            if not confirmed:
+        Lead custom_vars never travel through Asterisk channel variables (no
+        size limits, no read-back dance): the in-memory attempt metadata is the
+        fast path, and the durable outbound store is the fallback for an engine
+        restart while the call was in the dialplan hop.
+        """
+        attempt_id = str(getattr(session, "outbound_attempt_id", "") or "").strip()
+        if not attempt_id:
+            return
+        meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+        custom_vars = meta.get("custom_vars") if isinstance(meta, dict) else None
+        if not isinstance(custom_vars, dict) or not custom_vars:
+            try:
+                runtime = await self.outbound_store.get_active_attempt_runtime_context(attempt_id)
+            except Exception:
                 logger.error(
-                    "Outbound custom_vars channel state could not be confirmed",
-                    channel_id=channel_id,
-                    write_confirmed=bool(write_ok),
-                    expected_bytes=len(expected_json.encode("utf-8")),
-                    observed_bytes=len(actual.encode("utf-8")),
+                    "Failed to hydrate outbound custom_vars from store",
+                    attempt_id=attempt_id,
+                    exc_info=True,
                 )
-            elif not write_ok:
-                logger.warning(
-                    "Outbound custom_vars write response was unsuccessful but read-back matched",
-                    channel_id=channel_id,
-                )
-            return confirmed
-        except Exception:
-            logger.error(
-                "Outbound custom_vars channel confirmation failed",
-                channel_id=channel_id,
-                exc_info=True,
-            )
-            return False
+                return
+            custom_vars = runtime.get("custom_vars") if isinstance(runtime, dict) else None
+        if isinstance(custom_vars, dict) and custom_vars:
+            session.outbound_custom_vars = custom_vars
 
     async def _reject_outbound_answered_attempt(
         self,
@@ -2957,9 +2914,6 @@ class Engine:
             dial_phone = phone.lstrip("+").strip()
 
         context_name, routing_method = self._outbound_agent_selector(campaign, lead)
-        custom_vars = lead.get("custom_vars")
-        if custom_vars is None:
-            custom_vars = {}
         lead_name = str(lead.get("name") or "").strip() or None
 
         # If an Agent declares a monolithic provider (e.g., google_live), honor it by setting
@@ -3037,42 +2991,10 @@ class Engine:
             channel_vars["AAVA_CONSENT_PLAYBACK"] = playback
         if amd_opts:
             channel_vars["AAVA_AMD_OPTS"] = amd_opts
-        try:
-            custom_vars_json = self._serialize_outbound_custom_vars(custom_vars)
-        except ValueError as exc:
-            error_message = str(exc)
-            logger.warning(
-                "Outbound originate rejected invalid custom_vars",
-                campaign_id=campaign_id,
-                lead_id=lead_id,
-                attempt_id=attempt_id,
-                error=error_message,
-            )
-            await self.outbound_store.finish_attempt(
-                attempt_id,
-                outcome="error",
-                error_message=error_message,
-            )
-            try:
-                await self.outbound_store.set_lead_state(
-                    lead_id,
-                    state="failed",
-                    last_outcome="error",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to persist invalid custom_vars lead state",
-                    campaign_id=campaign_id,
-                    lead_id=lead_id,
-                    attempt_id=attempt_id,
-                    exc_info=True,
-                )
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
-            return
-        channel_vars["AAVA_CUSTOM_VARS_JSON"] = custom_vars_json
-        meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
-        if isinstance(meta, dict):
-            meta["custom_vars_json"] = custom_vars_json
+        # Lead custom_vars deliberately stay OFF the channel: the engine already
+        # owns them (attempt metadata + durable outbound store) and re-reads
+        # them by attempt id when the call comes back to Stasis, so there is no
+        # size limit and nothing to confirm on the wire.
 
         # Local/ channels can create two halves (;1 / ;2). Ensure our outbound control vars
         # survive any Local channel boundary by also setting the inherited variants.
@@ -3091,7 +3013,6 @@ class Engine:
             "AAVA_CONSENT_TIMEOUT",
             "AAVA_CONSENT_PLAYBACK",
             "AAVA_AMD_OPTS",
-            "AAVA_CUSTOM_VARS_JSON",
             "AAVA_LEAD_NAME",
         ]
         for key in _inherit_keys:
@@ -3387,37 +3308,6 @@ class Engine:
                 lead_id=str(meta.get("lead_id") or ""),
                 exc_info=True,
             )
-
-        # Lead context is mandatory when supplied. Keep this confirmation
-        # independent from the other best-effort safety-net writes below: a
-        # correlation write failure must never skip the fail-closed gate.
-        custom_vars = (meta.get("custom_vars") or {}) if meta else {}
-        if custom_vars:
-            try:
-                expected_custom_vars_json = str(
-                    meta.get("custom_vars_json")
-                    or self._serialize_outbound_custom_vars(custom_vars)
-                )
-            except ValueError:
-                expected_custom_vars_json = ""
-            confirmed = (
-                bool(expected_custom_vars_json)
-                and await self._set_and_confirm_outbound_custom_vars(
-                    channel_id,
-                    expected_custom_vars_json,
-                )
-            )
-            if not confirmed:
-                error_message = (
-                    "outbound custom_vars could not be confirmed after answer"
-                )
-                await self._reject_outbound_answered_attempt(
-                    channel_id,
-                    attempt_id,
-                    meta,
-                    error_message,
-                )
-                return
 
         # Ensure correlation vars exist for the dialplan hop (FreePBX/local channels can drop vars).
         try:
@@ -6006,21 +5896,9 @@ class Engine:
                             if value:
                                 outbound_channel_vars[var_name] = value
                     self._apply_outbound_session_metadata(session, outbound_channel_vars)
-                    resp = await self.ari_client.send_command(
-                        "GET",
-                        f"channels/{caller_channel_id}/variable",
-                        params={"variable": "AAVA_CUSTOM_VARS_JSON"},
-                        tolerate_statuses=[404],
-                    )
-                    if isinstance(resp, dict):
-                        raw = (resp.get("value") or "").strip()
-                        if raw:
-                            try:
-                                data = json.loads(raw)
-                                if isinstance(data, dict):
-                                    session.outbound_custom_vars = data
-                            except Exception:
-                                pass
+                    # Lead custom_vars stay off the wire — hydrate them from the
+                    # attempt metadata / durable outbound store by attempt id.
+                    await self._hydrate_outbound_custom_vars(session)
                     # Improve call history readability: store outbound phone as caller_name too.
                     if session.caller_number and (session.caller_name or "").strip() in ("", self._outbound_extension_identity):
                         session.caller_name = f"Outbound {session.caller_number}"
@@ -7089,10 +6967,21 @@ class Engine:
         finally:
             self._ari_playback_waiters.pop(playback_id, None)
 
-    def _append_outbound_custom_vars_to_prompt(self, prompt: str, custom_vars: Dict[str, Any]) -> str:
-        """Append lead custom_vars as a read-only JSON block (no inline templating)."""
+    def _append_outbound_custom_vars_to_prompt(
+        self,
+        prompt: str,
+        custom_vars: Dict[str, Any],
+        context_config: Any = None,
+    ) -> str:
+        """Append lead custom_vars as a read-only JSON block (no inline templating).
+
+        Per-agent opt-out: an Agent saved with lead_context_enabled=False skips
+        the block — e.g. when its prompt already renders the same values via
+        {var} template substitution and the JSON block would only duplicate
+        them. A missing flag (legacy row, YAML context) keeps the block on.
+        """
         base = str(prompt or "")
-        if not custom_vars:
+        if not custom_vars or getattr(context_config, "lead_context_enabled", None) is False:
             return base
         try:
             sanitized: Dict[str, Any] = {}
@@ -7100,9 +6989,9 @@ class Engine:
                 key = str(k)[:64]
                 if not key:
                     continue
-                val = str(v)
-                # Keep it small and avoid prompt bloat.
-                sanitized[key] = val[:500]
+                # Values are kept verbatim; truncation here would silently
+                # corrupt long lead payloads (e.g. a full per-call prompt).
+                sanitized[key] = str(v)
             if not sanitized:
                 return base
             blob = json.dumps(sanitized, indent=2, sort_keys=True)
@@ -7141,6 +7030,10 @@ class Engine:
         - {current_time}: Current time HH:MM (24h)
         - {current_datetime_iso}: Current UTC datetime in ISO form
         - {today}: Human-readable date, e.g. "Friday, April 24, 2026"
+        - Outbound lead custom_vars: every custom_vars key of the current
+          outbound lead is a placeholder too (e.g. {task}). Built-in variables
+          and pre-call enrichment keep priority over same-named keys; values
+          are used verbatim, without truncation.
 
         The date/time placeholders matter for any prompt that involves
         scheduling — without them, the LLM can't reliably map "tomorrow",
@@ -7227,12 +7120,24 @@ class Engine:
                 flags=re.IGNORECASE,
             )
 
+        # Outbound lead custom_vars are template variables too: {task} renders
+        # the lead's custom_vars["task"]. Built-ins and pre-call enrichment
+        # keep priority; values are used verbatim, untruncated.
+        custom_vars_merged = False
+        outbound_custom_vars = getattr(session, "outbound_custom_vars", None) or {}
+        if isinstance(outbound_custom_vars, dict):
+            for key, value in outbound_custom_vars.items():
+                k = str(key)
+                if k and k not in substitutions:
+                    substitutions[k] = "" if value is None else str(value)
+                    custom_vars_merged = True
+
         if isinstance(extra_substitutions, dict):
             for key, value in extra_substitutions.items():
                 if value is None:
                     continue
                 substitutions[str(key)] = str(value)
-        
+
         def replace_match(match):
             key = match.group(1)
             # Try exact match first
@@ -7246,7 +7151,14 @@ class Engine:
         
         try:
             # Match both {word} and {word.subword} patterns
-            return re.sub(r'\{([\w.]+)\}', replace_match, text)
+            result = re.sub(r'\{([\w.]+)\}', replace_match, text)
+            if custom_vars_merged and result != text:
+                # One bounded extra pass so built-in placeholders inside a
+                # custom_vars value (e.g. "{caller_name}" in a lead-provided
+                # prompt) resolve as well. A single fixed re-pass keeps this
+                # deliberately loop-free.
+                result = re.sub(r'\{([\w.]+)\}', replace_match, result)
+            return result
         except Exception as e:
             logger.debug(
                 "Prompt template substitution failed, leaving unchanged",
@@ -14756,10 +14668,15 @@ class Engine:
                 if getattr(session, "is_outbound", False) and getattr(session, "outbound_custom_vars", None):
                     system_prompt = str(llm_options.get("system_prompt") or "")
                     if system_prompt.strip():
+                        ctx_cfg = None
+                        if getattr(session, "context_name", None):
+                            ctx_cfg = self.transport_orchestrator.get_context_config(
+                                session.context_name, getattr(session, "routing_method", None))
                         llm_options = dict(llm_options)
                         llm_options["system_prompt"] = self._append_outbound_custom_vars_to_prompt(
                             system_prompt,
                             getattr(session, "outbound_custom_vars", {}) or {},
+                            ctx_cfg,
                         )
             except Exception:
                 logger.debug("Outbound custom_vars injection failed (pipeline)", call_id=call_id, exc_info=True)
@@ -17279,6 +17196,7 @@ class Engine:
                                 prompt_to_apply = self._append_outbound_custom_vars_to_prompt(
                                     prompt_to_apply,
                                     getattr(session, "outbound_custom_vars", {}) or {},
+                                    context_config,
                                 )
                             session.provider_overrides["prompt"] = prompt_to_apply
                             logger.info(
@@ -19040,7 +18958,7 @@ class Engine:
                                     prompt_to_apply = self._apply_prompt_template_substitution(str(prompt_tpl), session)
                                     if getattr(session, "is_outbound", False) and getattr(session, "outbound_custom_vars", None):
                                         prompt_to_apply = self._append_outbound_custom_vars_to_prompt(
-                                            prompt_to_apply, getattr(session, "outbound_custom_vars", {}) or {}
+                                            prompt_to_apply, getattr(session, "outbound_custom_vars", {}) or {}, ctx_cfg
                                         )
                                     session.provider_overrides["prompt"] = prompt_to_apply
                                 await self._save_session(session)

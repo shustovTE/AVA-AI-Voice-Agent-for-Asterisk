@@ -43,6 +43,7 @@ export interface Agent {
     email_recipient?: string;
     email_from?: string;
     email_enabled?: boolean | null;
+    lead_context_enabled?: boolean | null;
 }
 
 interface AgentTemplate {
@@ -81,6 +82,8 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
     const [emailFrom, setEmailFrom] = useState('');
     // Tri-state as a select value: '' = inherit (null), 'enabled' = true, 'disabled' = false.
     const [emailEnabled, setEmailEnabled] = useState('');
+    // Outbound '## Lead Context' block toggle; a NULL/legacy row means "on".
+    const [leadContextEnabled, setLeadContextEnabled] = useState(true);
 
     // Tool/engine config — single source of truth, round-tripped losslessly via the helper.
     const [toolState, setToolState] = useState<AgentToolState>(() => parseAgentConfig(null));
@@ -150,6 +153,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
             setEmailEnabled(
                 agent.email_enabled == null ? '' : (agent.email_enabled ? 'enabled' : 'disabled'),
             );
+            setLeadContextEnabled(agent.lead_context_enabled !== false);
             setToolState(parseAgentConfig(agent));
         } else {
             setDisplayName('');
@@ -166,6 +170,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
             setEmailRecipient('');
             setEmailFrom('');
             setEmailEnabled('');
+            setLeadContextEnabled(true);
             setToolState(parseAgentConfig(null));
             setSelectedTemplate('');
         }
@@ -363,6 +368,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                 // Tri-state: '' means inherit — send explicit null (PATCH clears the column),
                 // never false. 'enabled' -> true, 'disabled' -> false.
                 email_enabled: emailEnabled === '' ? null : emailEnabled === 'enabled',
+                lead_context_enabled: leadContextEnabled,
             };
 
             if (isNew) {
@@ -694,6 +700,30 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                         rows={6}
                         placeholder="You are a helpful voice assistant…"
                     />
+                </div>
+
+                <div className="mb-4 flex items-center justify-between p-3 border border-border rounded-lg bg-card/50">
+                    <div>
+                        <div className="flex items-center gap-1.5">
+                            <label htmlFor="agent-lead-context-enabled" className="text-sm font-medium">
+                                Lead Context block
+                            </label>
+                            <HelpTooltip content="Outbound campaigns append the lead's custom variables to the prompt as a read-only '## Lead Context' JSON block. Custom variables are always available as {variable} placeholders in the prompt and greeting; turn the block off when the placeholders already cover them and the block would only duplicate data." />
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                            Append outbound lead custom variables after the prompt.
+                        </p>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                            id="agent-lead-context-enabled"
+                            type="checkbox"
+                            className="sr-only peer"
+                            checked={leadContextEnabled}
+                            onChange={(e) => setLeadContextEnabled(e.target.checked)}
+                        />
+                        <div className="w-9 h-5 bg-muted peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-ring rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-background after:border-border after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                    </label>
                 </div>
 
                 <div className="mb-4">

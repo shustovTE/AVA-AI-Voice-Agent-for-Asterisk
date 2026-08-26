@@ -172,48 +172,9 @@ class TestLogSanitization:
         assert 'REDACTED' in result['password']
         assert 'REDACTED' in result['pass']
 
-    @pytest.mark.parametrize(
-        "variable",
-        [
-            "AAVA_CUSTOM_VARS_JSON",
-            "_AAVA_CUSTOM_VARS_JSON",
-            "__AAVA_CUSTOM_VARS_JSON",
-        ],
-    )
-    def test_redacts_outbound_custom_vars_channel_events(self, variable):
-        """Direct and inherited lead-context channel values must not reach logs."""
-        raw_value = '{"account_id":"sensitive-lead-value"}'
-        event_dict = {
-            "event": "Channel variable set",
-            "variable": variable,
-            "value": raw_value,
-        }
-
-        result = sanitize_secrets(None, None, event_dict)
-
-        assert result["value"] == OUTBOUND_LEAD_CONTEXT_REDACTION
-        assert raw_value not in str(result)
-
-    def test_redacts_nested_outbound_custom_vars_channel_events(self):
-        """Pair-aware lead-context redaction applies inside nested event data."""
-        raw_value = '{"account_id":"nested-sensitive-lead-value"}'
-        event_dict = {
-            "event": "ARI event received",
-            "payload": {
-                "event": "ChannelVarSet",
-                "variable": "__aava_custom_vars_json",
-                "value": raw_value,
-            },
-        }
-
-        result = sanitize_secrets(None, None, event_dict)
-
-        assert result["payload"]["value"] == OUTBOUND_LEAD_CONTEXT_REDACTION
-        assert raw_value not in str(result)
-        assert event_dict["payload"]["value"] == raw_value
-
     def test_preserves_ordinary_channel_variable_values(self):
-        """Pair-aware redaction must not hide unrelated channel diagnostics."""
+        """Channel diagnostics keep their values (lead custom_vars never travel
+        through channel variables, so there is no pair-aware redaction)."""
         event_dict = {
             "event": "Channel variable set",
             "variable": "AAVA_ATTEMPT_ID",

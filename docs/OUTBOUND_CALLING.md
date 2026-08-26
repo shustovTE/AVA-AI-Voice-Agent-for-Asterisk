@@ -81,23 +81,32 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
 
 ### Per-lead context (`custom_vars`)
 
-- `custom_vars` must be a JSON object. AAVA serializes it canonically and limits
-  the complete serialized value to 8,192 bytes before dialing.
-- Nonempty values are delivered to the selected Agent as a read-only
-  `## Lead Context` JSON block. The Agent prompt may describe how fields such as
-  `task` or `account_id` should be used, but lead data does not override the
-  Agent's higher-priority safety and tool policies.
+- `custom_vars` must be a JSON object. It never travels through Asterisk
+  channel variables: the engine keeps it in attempt metadata and the durable
+  SQLite store and re-reads it by attempt id when the answered call returns to
+  Stasis, so there is **no size limit** on values.
+- Every `custom_vars` key is available as a `{var}` template placeholder in the
+  selected Agent's prompt and greeting (e.g. a lead with
+  `{"task": "confirm the visit"}` renders `Your task: {task}` as
+  `Your task: confirm the visit`). Built-in variables such as `{caller_name}`
+  and pre-call enrichment keep priority over same-named keys, values are used
+  verbatim without truncation, and built-in placeholders inside a custom value
+  resolve as well.
+- Nonempty values are additionally delivered to the selected Agent as a
+  read-only `## Lead Context` JSON block (untruncated). The Agent editor's
+  **Lead Context block** toggle turns this off per Agent — e.g. when the prompt
+  already renders the same values via `{var}` placeholders and the block would
+  only duplicate them. Lead data does not override the Agent's higher-priority
+  safety and tool policies.
 - Do not store credentials, authentication tokens, or other secrets in
-  `custom_vars`. The value is carried through an Asterisk channel variable and
-  is sent to the configured AI provider as prompt context.
-- AAVA verifies nonempty context again after answer and before the AMD hop. If
-  the exact value cannot be confirmed, the attempt fails closed with outcome
-  `error`, the lead moves to `failed`, and no AI session is started.
+  `custom_vars`. The value is sent to the configured AI provider as prompt
+  context, and the **Call Scheduling** leads table shows it in the
+  **Variables** column.
 - If an engine restart clears in-memory state while a call is still ringing,
   AAVA reloads the unfinished attempt and lead from SQLite. An answered call is
-  rejected if that authoritative metadata cannot be recovered.
-- Oversized or non-serializable context also fails before ARI origination. AAVA
-  records an actionable error without logging the context value.
+  rejected (fail closed, outcome `error`, lead `failed`, no AI session) if that
+  authoritative metadata cannot be recovered or its stored custom_vars JSON is
+  corrupt.
 
 ## Testing Checklist (New User)
 
@@ -107,11 +116,10 @@ Use a local extension (e.g., `2765`) and an external number (E.164) to validate:
 - Voicemail enabled: let it ring out or go to voicemail → voicemail drop plays; attempt outcome recorded.
 - HUMAN path: correct Agent/provider chosen; tools (e.g., `hangup_call`) work.
 - Lead context: add a distinctive non-sensitive value such as
-  `"validation_token":"issue613-7f3a"`, ask the Agent to repeat that field,
-  and compare the returned value exactly with the supplied token rather than
-  accepting a general behavior change as proof. Also confirm the attempt fails
-  rather than calling without context when `AAVA_CUSTOM_VARS_JSON` cannot be
-  restored.
+  `"validation_token":"issue613-7f3a"`, reference it in the Agent prompt as
+  `{validation_token}` (or ask the Agent to repeat the field from the Lead
+  Context block), and compare the returned value exactly with the supplied
+  token rather than accepting a general behavior change as proof.
 
 ## Where to Look When Something Breaks
 
