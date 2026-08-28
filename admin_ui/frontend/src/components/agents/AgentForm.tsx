@@ -956,6 +956,53 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                                 )}
                             </div>
                         )}
+                        <div className="flex items-center justify-between gap-4 pt-1">
+                            <div>
+                                <div className="flex items-center gap-1.5">
+                                    <label htmlFor="agent-hangup-on-farewell" className="text-sm font-medium">
+                                        Hang up on assistant farewell
+                                    </label>
+                                    <HelpTooltip content="Ends the call after the AGENT itself speaks one of the Assistant Farewell Markers at the end of an utterance (e.g. «До свидания»). The farewell audio finishes playing first. A safety net for providers whose platform-side agent does not reliably end the call itself." />
+                                </div>
+                                <p className="text-xs text-muted-foreground mt-1">
+                                    Off by default; matching only at the end of the agent's utterance.
+                                </p>
+                            </div>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input
+                                    id="agent-hangup-on-farewell"
+                                    type="checkbox"
+                                    className="sr-only peer"
+                                    checked={toolState.hangupOnAssistantFarewell}
+                                    onChange={(e) => setToolState((state) => ({
+                                        ...state,
+                                        hangupOnAssistantFarewell: e.target.checked,
+                                    }))}
+                                />
+                                <div className="w-9 h-5 bg-muted peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-ring rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-background after:border-border after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                            </label>
+                        </div>
+                        {toolState.hangupMarkerStrategy !== 'inherit' && toolState.hangupOnAssistantFarewell && (
+                            <div>
+                                <FormLabel
+                                    htmlFor="agent-hangup-farewell-markers"
+                                    tooltip="One phrase per line. Extend adds to the global farewell list, Replace makes this list authoritative. Leave empty to keep the global list («до свидания», «всего доброго», goodbye…)."
+                                >
+                                    Assistant Farewell Markers
+                                </FormLabel>
+                                <textarea
+                                    id="agent-hangup-farewell-markers"
+                                    value={toolState.hangupFarewellMarkers.join('\n')}
+                                    onChange={(e) => setToolState((state) => ({
+                                        ...state,
+                                        hangupFarewellMarkers: e.target.value.split('\n'),
+                                    }))}
+                                    rows={4}
+                                    placeholder={'до свидания\nвсего доброго'}
+                                    className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring resize-y"
+                                />
+                            </div>
+                        )}
                     </div>
                 </details>
             </div>

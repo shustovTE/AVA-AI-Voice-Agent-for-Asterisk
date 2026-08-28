@@ -92,6 +92,7 @@ from src.tools.telephony.hangup_policy import (
     resolve_effective_hangup_policy,
     resolve_hangup_policy,
     text_contains_end_call_intent,
+    text_ends_with_marker,
     text_is_short_polite_closing,
     normalize_marker_list,
 )
@@ -7642,15 +7643,74 @@ class Engine:
                 )
             raise
 
+    async def _maybe_hangup_on_assistant_farewell(
+        self,
+        call_id: str,
+        session: CallSession,
+        text: str,
+    ) -> None:
+        """Terminate after the agent's own farewell when the policy opts in.
+
+        Complements the hangup_call tool: providers whose platform-side agent
+        never calls the tool (e.g. ElevenLabs) still end deterministically
+        when the agent speaks a configured assistant_farewell marker. The
+        marker must appear in the trailing window of the utterance, so a
+        mid-sentence "goodbye" cannot drop the call. Termination reuses the
+        cleanup_after_tts flow — the farewell audio drains before the hangup,
+        with the terminal fallback bounding a missing audio-done event.
+        """
+        try:
+            if not text or getattr(session, "cleanup_after_tts", False):
+                return
+            policy = resolve_hangup_policy(
+                (self._tool_config_for_session(session).get("tools") or {})
+            )
+            if not policy.get("hangup_on_assistant_farewell"):
+                return
+            markers = (policy.get("markers") or {}).get("assistant_farewell") or []
+            if not text_ends_with_marker(text, markers):
+                return
+            session.cleanup_after_tts = True
+            await self.session_store.upsert_call(session)
+            logger.info(
+                "🔚 Assistant farewell marker matched - hanging up after audio",
+                call_id=call_id,
+                text_preview=text[:80],
+            )
+            self._schedule_terminal_fallback(
+                call_id,
+                reason="assistant_farewell_marker",
+                timeout_sec=15.0,
+                call_outcome="agent_hangup",
+            )
+        except Exception:
+            logger.debug(
+                "Assistant farewell hangup check failed",
+                call_id=call_id,
+                exc_info=True,
+            )
+
     @staticmethod
     def _is_pipeline_farewell_without_tool(
         user_text: str,
         assistant_text: str,
         hangup_policy: Dict[str, Any],
     ) -> bool:
-        """Require explicit caller end intent plus a spoken assistant farewell."""
+        """Require explicit caller end intent plus a spoken assistant farewell.
+
+        With the opt-in ``hangup_on_assistant_farewell`` policy flag the
+        assistant's own farewell (at the end of the utterance) is sufficient —
+        no caller end intent needed.
+        """
         markers = hangup_policy.get("markers") if isinstance(hangup_policy, dict) else {}
         markers = markers if isinstance(markers, dict) else {}
+        if isinstance(hangup_policy, dict) and hangup_policy.get("hangup_on_assistant_farewell"):
+            farewell_only = normalize_marker_list(
+                markers.get("assistant_farewell"),
+                DEFAULT_HANGUP_MARKERS["assistant_farewell"],
+            )
+            if text_ends_with_marker(assistant_text, farewell_only):
+                return True
         configured = normalize_marker_list(
             markers.get("end_call"), DEFAULT_HANGUP_MARKERS["end_call"]
         )
@@ -13911,6 +13971,8 @@ class Engine:
                     session.conversation_history.append(_ts_msg("assistant", text))
                     await self.session_store.upsert_call(session)
                     logger.debug("Added agent transcript to history", call_id=call_id, text_preview=text[:50])
+                    # Opt-in assistant-farewell hangup (per-agent hangup policy).
+                    await self._maybe_hangup_on_assistant_farewell(call_id, session, text)
             
             else:
                 # Log control/JSON events at debug for now

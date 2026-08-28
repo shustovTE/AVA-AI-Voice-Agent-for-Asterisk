@@ -3,13 +3,16 @@ import json
 import pytest
 
 from src.tools.telephony.hangup_policy import (
+    DEFAULT_HANGUP_MARKERS,
     HangupPolicyConfigError,
     dump_agent_hangup_policy,
     normalize_agent_hangup_policy,
+    normalize_hangup_policy,
     resolve_effective_hangup_policy,
     resolve_hangup_policy,
     text_contains_marker,
     text_contains_end_call_intent,
+    text_ends_with_marker,
     text_is_short_polite_closing,
 )
 
@@ -115,3 +118,86 @@ def test_short_polite_closing_detection_rejects_long_mid_call_phrases():
     assert not text_is_short_polite_closing("No thank you, but please tell me about pricing")
     assert not text_is_short_polite_closing("No, thank you")
     assert not text_is_short_polite_closing("No thanks")
+
+
+def test_normalize_policy_defaults_assistant_farewell_hangup_off():
+    policy = normalize_hangup_policy({})
+    assert policy["hangup_on_assistant_farewell"] is False
+
+    enabled = normalize_hangup_policy({"hangup_on_assistant_farewell": True})
+    assert enabled["hangup_on_assistant_farewell"] is True
+
+
+def test_agent_policy_flag_survives_inherit_and_dump():
+    normalized = normalize_agent_hangup_policy(
+        {"hangup_on_assistant_farewell": True}
+    )
+    assert normalized == {"hangup_on_assistant_farewell": True}
+
+    dumped = dump_agent_hangup_policy({"hangup_on_assistant_farewell": True})
+    assert dumped == '{"hangup_on_assistant_farewell":true}'
+
+    resolved = resolve_effective_hangup_policy({}, dumped)
+    assert resolved["policy"]["hangup_on_assistant_farewell"] is True
+
+
+def test_agent_policy_extends_assistant_farewell_markers():
+    resolved = resolve_effective_hangup_policy(
+        {},
+        {
+            "strategy": "extend",
+            "end_call": ["положи трубку"],
+            "assistant_farewell": ["Всего доброго, до связи"],
+            "hangup_on_assistant_farewell": True,
+        },
+    )
+    farewell = resolved["policy"]["markers"]["assistant_farewell"]
+    assert "всего доброго, до связи" in farewell
+    assert "goodbye" in farewell  # global list preserved on extend
+    assert resolved["policy"]["hangup_on_assistant_farewell"] is True
+
+
+def test_agent_policy_replace_makes_farewell_list_authoritative():
+    resolved = resolve_effective_hangup_policy(
+        {},
+        {
+            "strategy": "replace",
+            "end_call": ["положи трубку"],
+            "assistant_farewell": ["до свидания"],
+        },
+    )
+    assert resolved["policy"]["markers"]["assistant_farewell"] == ["до свидания"]
+
+
+def test_agent_policy_rejects_farewell_markers_with_inherit():
+    with pytest.raises(HangupPolicyConfigError):
+        normalize_agent_hangup_policy(
+            {"strategy": "inherit", "assistant_farewell": ["до свидания"]}
+        )
+    with pytest.raises(HangupPolicyConfigError):
+        normalize_agent_hangup_policy({"hangup_on_assistant_farewell": "yes"})
+
+
+def test_default_assistant_farewell_markers_include_russian_phrases():
+    farewell = DEFAULT_HANGUP_MARKERS["assistant_farewell"]
+    assert "до свидания" in farewell
+    assert "всего доброго" in farewell
+
+
+def test_text_ends_with_marker_matches_only_the_utterance_tail():
+    markers = ["до свидания"]
+
+    assert text_ends_with_marker(
+        "Понял вас, извините за беспокойство. До свидания.", markers
+    )
+    # A short polite tail after the farewell still counts (trailing window).
+    assert text_ends_with_marker(
+        "Спасибо за разговор. До свидания. Хорошего дня.", markers
+    )
+    # Mid-sentence mention far from the end must not trigger.
+    assert not text_ends_with_marker(
+        "До свидания скажу в самом конце, а пока давайте обсудим смету и сроки ремонта",
+        markers,
+    )
+    assert not text_ends_with_marker("", markers)
+    assert not text_ends_with_marker("Обычная реплика о ремонте", markers)

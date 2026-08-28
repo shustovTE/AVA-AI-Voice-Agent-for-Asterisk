@@ -125,6 +125,19 @@ Under **Agents → Edit Agent → Tools → Hangup Guardrail**, choose how the A
 
 Enter one normalized phrase per line. Very short or single-word markers can match ordinary conversation, so the UI warns about them; use distinctive phrases where possible and test both expected and false-positive utterances. Saving an Agent affects new calls only. Active calls keep the effective marker snapshot they started with.
 
+**Hang up on assistant farewell** (same section, off by default): when enabled,
+AAVA ends the call after the **Agent itself** speaks an *Assistant Farewell
+Marker* («до свидания», «всего доброго», goodbye…) at the end of an utterance.
+The farewell audio finishes playing before the hangup (the standard
+`cleanup_after_tts` drain, with the bounded terminal fallback), and a marker
+mentioned mid-sentence does not trigger. With strategy *extend*/*replace* the
+Agent can add or replace the farewell marker list; empty keeps the global
+list. This is a deterministic safety net for providers whose platform-side
+agent does not reliably end the call itself (e.g. ElevenLabs); it also lets
+the modular pipeline path hang up on the agent's farewell without requiring
+caller end intent. Pair it with a prompt rule such as "при завершении звонка
+всегда говори «До свидания»".
+
 The Agent row stores this nullable first-class value in `hangup_policy_json`. Legacy YAML imports may use the equivalent form:
 
 ```yaml
