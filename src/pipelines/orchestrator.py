@@ -28,6 +28,7 @@ from ..config import (
     LocalProviderConfig,
     MiniMaxLLMProviderConfig,
     OpenAIProviderConfig,
+    split_openai_passthrough_fields,
     TelnyxLLMProviderConfig,
 )
 from ..logging_config import get_logger
@@ -169,6 +170,24 @@ def _extract_role(component_key: str) -> str:
             f"Example: 'local_stt', 'openai_llm', 'deepgram_tts'"
         )
     return parts[1]
+
+
+def _with_openai_passthrough(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect vendor fields from a provider block into ``extra_body``.
+
+    A provider block is the operator's description of one endpoint, so a key
+    the engine has no meaning for is meant for that endpoint. Collecting them
+    here keeps the typed config (which drops unknown keys) as the single
+    definition of what the engine itself consumes. An explicit ``extra_body``
+    entry wins over a bare key of the same name.
+    """
+    payload = dict(raw or {})
+    explicit = payload.get("extra_body")
+    explicit = dict(explicit) if isinstance(explicit, dict) else {}
+    passthrough = split_openai_passthrough_fields(payload)
+    if passthrough or explicit:
+        payload["extra_body"] = {**passthrough, **explicit}
+    return payload
 
 
 def _extract_provider(component_key: str) -> Optional[str]:
@@ -910,7 +929,9 @@ class PipelineOrchestrator:
                     )
                     if not payload["api_key"]:
                         continue
-                    factory = self._make_openai_llm_factory(OpenAIProviderConfig(**payload))
+                    factory = self._make_openai_llm_factory(
+                        OpenAIProviderConfig(**_with_openai_passthrough(payload))
+                    )
                 elif provider_type == "ollama":
                     factory = self._make_ollama_llm_factory(payload)
                 elif provider_type == "local":
@@ -1449,7 +1470,7 @@ class PipelineOrchestrator:
         )
 
         try:
-            config = OpenAIProviderConfig(**merged)
+            config = OpenAIProviderConfig(**_with_openai_passthrough(merged))
         except Exception as exc:
             logger.warning(
                 "Failed to hydrate OpenAI provider config for pipelines",

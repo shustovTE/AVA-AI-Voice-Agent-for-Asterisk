@@ -259,6 +259,63 @@ class DeepgramProviderConfig(BaseModel):
         return self
 
 
+# Provider-block keys the engine consumes itself but that are not fields of
+# OpenAIProviderConfig: routing//identity metadata and legacy aliases the
+# adapters resolve. Everything here stays on this side of the wire.
+_OPENAI_ENGINE_ONLY_KEYS = frozenset(
+    {
+        "type",
+        "kind",
+        "name",
+        "display_name",
+        "customer",
+        "enabled",
+        "capabilities",
+        "base_url",
+        "model",
+        "timeout_sec",
+        "connect_timeout_sec",
+        "mid_call_reconnect_timeout_sec",
+        "ws_url",
+        "chunk_ms",
+        "stt_backend",
+        "tool_call_policy",
+        "tool_gateway_enabled",
+    }
+)
+
+# Markers of a credential. A provider block may name one anything, so match by
+# shape rather than by an exhaustive list. "token" is matched as a whole word
+# or suffix only: `max_tokens` is a request parameter, `auth_token` is not.
+_OPENAI_SECRET_KEY_MARKERS = ("api_key", "secret", "password", "credential")
+
+
+def _looks_like_credential(key: str) -> bool:
+    lowered = str(key).lower()
+    if any(marker in lowered for marker in _OPENAI_SECRET_KEY_MARKERS):
+        return True
+    return lowered == "token" or lowered.endswith("_token")
+
+
+def split_openai_passthrough_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the provider-block keys that belong in the API request body.
+
+    Anything the engine understands (a field of :class:`OpenAIProviderConfig`
+    or an engine-only key above) stays home; whatever is left is an endpoint
+    parameter the operator wrote for the vendor, and is forwarded verbatim.
+    Credentials are never forwarded, whatever they are called.
+    """
+    known = set(OpenAIProviderConfig.model_fields) | _OPENAI_ENGINE_ONLY_KEYS
+    passthrough: Dict[str, Any] = {}
+    for key, value in (raw or {}).items():
+        if key in known or value is None:
+            continue
+        if _looks_like_credential(key):
+            continue
+        passthrough[key] = value
+    return passthrough
+
+
 class OpenAIProviderConfig(BaseModel):
     """# Milestone7: Canonical defaults for OpenAI pipeline adapters."""
     api_key: Optional[str] = None

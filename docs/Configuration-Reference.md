@@ -566,7 +566,7 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
 - `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
 
-`extra_body` (LLM only) forwards vendor-specific Chat Completions fields verbatim in the request body, for endpoint parameters that have no first-class option. Other provider keys never reach the request: the payload carries `model`, `messages`, `temperature`, `max_tokens`, whatever `extra_body` holds, and the tool/stream fields the engine manages. A stray key elsewhere in the provider block (`CACHE_KEY: prompt-1`) is dropped without reaching the endpoint.
+**Vendor fields (LLM).** A provider block describes one endpoint, so any key the engine has no meaning for is treated as a parameter for that endpoint and is forwarded verbatim in the Chat Completions body. Write the vendor's own parameter name directly in the block:
 
 ```yaml
 providers:
@@ -574,11 +574,15 @@ providers:
     type: openai
     chat_base_url: https://api.mistral.ai/v1
     chat_model: mistral-small-latest
-    extra_body:
-      prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
+    prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
+    safe_prompt: true
 ```
 
-It is read from the provider block, from a pipeline's `options.llm`, and from runtime options, shallow-merged in that order, so a pipeline can override one field without repeating the rest. Keys the engine owns (`model`, `messages`, `stream`, `tools`, `tool_choice`) are ignored with a warning. Every request that carries forwarded fields logs their names (not their values) as `Forwarding extra_body fields to the LLM`, so what reaches the endpoint stays visible in the engine log.
+Three groups never leave the engine: fields of the typed provider config (`chat_base_url`, `chat_model`, `response_timeout_sec`, `voice`, …), routing and identity metadata (`type`, `name`, `enabled`, `capabilities`, `base_url`, `model`, `timeout_sec`, …), and anything shaped like a credential (a key containing `api_key`, `secret`, `password` or `credential`, or named `token` / ending in `_token`). `max_tokens` is a request parameter, not a credential, and is forwarded.
+
+The flip side is that a typo now reaches the endpoint, and an API that rejects unknown parameters will fail the request. Every call that carries forwarded fields logs their names (never their values) as `Forwarding extra_body fields to the LLM`, so check that line first when an endpoint starts returning 400.
+
+Keys the engine owns in the request itself (`model`, `messages`, `stream`, `tools`, `tool_choice`) cannot be overridden and are ignored with a warning. An explicit `extra_body:` mapping is still supported, in the provider block, in a pipeline's `options.llm`, or in runtime options, shallow-merged in that order; it wins over a bare key of the same name and is the only way to set a field per pipeline rather than per provider.
 
 For prompt caching (`prompt_cache_key` on OpenAI and Mistral, where cached input tokens bill at a fraction of the normal rate), pick a value that stays the same across calls sharing a system prompt and bump it when that prompt changes. A per-call value defeats the cache, and the key must not contain secrets or personal data.
 

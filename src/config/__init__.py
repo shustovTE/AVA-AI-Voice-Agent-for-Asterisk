@@ -33,6 +33,7 @@ AudioSocketConfig = _parent_config.AudioSocketConfig
 LocalProviderConfig = _parent_config.LocalProviderConfig
 DeepgramProviderConfig = _parent_config.DeepgramProviderConfig
 OpenAIProviderConfig = _parent_config.OpenAIProviderConfig
+split_openai_passthrough_fields = _parent_config.split_openai_passthrough_fields
 TelnyxLLMProviderConfig = _parent_config.TelnyxLLMProviderConfig
 MiniMaxLLMProviderConfig = _parent_config.MiniMaxLLMProviderConfig
 GoogleProviderConfig = _parent_config.GoogleProviderConfig
@@ -68,6 +69,7 @@ __all__ = [
     'LocalProviderConfig',
     'DeepgramProviderConfig',
     'OpenAIProviderConfig',
+    'split_openai_passthrough_fields',
     'TelnyxLLMProviderConfig',
     'MiniMaxLLMProviderConfig',
     'GoogleProviderConfig',
