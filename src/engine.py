@@ -186,6 +186,99 @@ def _resolve_pipeline_streaming_overlap(
     return global_enabled, "global"
 
 
+class EndOfTurnPolicy:
+    """Decide when accumulated STT results become one LLM turn.
+
+    Streaming STT returns a result at every phrase boundary, so phrase count is
+    no signal at all about whether the caller has finished. The turn ends on
+    silence and nothing else: every new result restarts the window, and the turn
+    starts once the caller has been quiet for ``end_of_turn_silence_ms``. A bare
+    "yes" is therefore answered as promptly as a paragraph.
+
+    The superseded ``aggregation_*`` options are still read so deployed configs
+    keep working: the two window options are converted from seconds, and the
+    word/character thresholds are reported in :attr:`ignored_options` for the
+    caller to log, since length no longer decides anything.
+    """
+
+    DEFAULT_SILENCE_MS = 700
+    # Superseded: a silence window in seconds, most recent first.
+    LEGACY_SILENCE_KEYS = ("aggregation_silence_sec", "aggregation_timeout_sec")
+    LEGACY_MAX_WAIT_KEYS = ("aggregation_max_wait_sec",)
+    # Superseded and no longer consulted at all.
+    RETIRED_KEYS = (
+        "aggregation_min_words",
+        "aggregation_min_chars",
+        "aggregation_wait_for_silence",
+    )
+
+    __slots__ = ("silence_ms", "max_wait_ms", "ignored_options", "legacy_options")
+
+    def __init__(self, options: Any = None) -> None:
+        opts = options if isinstance(options, dict) else {}
+        legacy: List[str] = []
+
+        silence_ms = self._as_float(opts.get("end_of_turn_silence_ms"), None)
+        if silence_ms is None:
+            silence_ms = self._legacy_ms(opts, self.LEGACY_SILENCE_KEYS, legacy)
+        if silence_ms is None:
+            silence_ms = float(self.DEFAULT_SILENCE_MS)
+        self.silence_ms = max(0.0, silence_ms)
+
+        # 0 disables the cap, which is the default: cutting a monologue short is
+        # the very behaviour the silence window exists to prevent.
+        max_wait_ms = self._as_float(opts.get("end_of_turn_max_wait_ms"), None)
+        if max_wait_ms is None:
+            max_wait_ms = self._legacy_ms(opts, self.LEGACY_MAX_WAIT_KEYS, legacy)
+        self.max_wait_ms = max(0.0, max_wait_ms or 0.0)
+
+        self.legacy_options = tuple(legacy)
+        self.ignored_options = tuple(
+            key for key in self.RETIRED_KEYS if opts.get(key) is not None
+        )
+
+    @classmethod
+    def _legacy_ms(
+        cls, opts: Dict[str, Any], keys: Tuple[str, ...], seen: List[str]
+    ) -> Optional[float]:
+        """Read the first present legacy key, converting seconds to ms."""
+        for key in keys:
+            seconds = cls._as_float(opts.get(key), None)
+            if seconds is None:
+                continue
+            seen.append(key)
+            return seconds * 1000.0
+        return None
+
+    @staticmethod
+    def _as_float(value: Any, default: Optional[float]) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @property
+    def silence_sec(self) -> float:
+        return self.silence_ms / 1000.0
+
+    @property
+    def max_wait_sec(self) -> float:
+        return self.max_wait_ms / 1000.0
+
+    def flush_delay(self, elapsed: Optional[float] = None) -> float:
+        """Return how long to wait for another result before running the turn.
+
+        ``elapsed`` is the time in seconds since the caller's first pending
+        result, used only to honour ``end_of_turn_max_wait_ms``.
+        """
+        delay = self.silence_sec
+        if self.max_wait_ms > 0 and elapsed is not None:
+            delay = min(delay, self.max_wait_sec - elapsed)
+        return max(0.0, delay)
+
+
 def _outbound_attempt_stale_seconds() -> float:
     """Return one validated stale-attempt timeout for startup and runtime cleanup."""
     raw = str(
@@ -15235,21 +15328,30 @@ class Engine:
 
             async def dialog_worker() -> None:
                 pending_segments: List[str] = []
-                flush_task: Optional[asyncio.Task] = None
-                accumulation_timeout = float(
-                    (pipeline.llm_options or {}).get("aggregation_timeout_sec", 2.0)
+                # The turn deadline is polled by the consumer loop rather than
+                # armed as its own task: run_turn must stay on this task so that
+                # call cleanup cancelling the worker also cancels an in-flight
+                # LLM request.
+                pending_started_at: Optional[float] = None
+                pending_deadline: Optional[float] = None
+                end_of_turn = EndOfTurnPolicy(pipeline.llm_options)
+                logger.info(
+                    "Pipeline end-of-turn policy resolved",
+                    call_id=call_id,
+                    silence_ms=end_of_turn.silence_ms,
+                    max_wait_ms=end_of_turn.max_wait_ms or None,
+                    legacy_options=list(end_of_turn.legacy_options) or None,
                 )
+                if end_of_turn.ignored_options:
+                    logger.warning(
+                        "Ignoring superseded transcript aggregation options",
+                        call_id=call_id,
+                        options=list(end_of_turn.ignored_options),
+                        replacement="end_of_turn_silence_ms",
+                    )
                 # Track conversation history to include prior messages
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
-
-                async def cancel_flush() -> None:
-                    nonlocal flush_task
-                    if flush_task and not flush_task.done():
-                        current = asyncio.current_task()
-                        if flush_task is not current:
-                            flush_task.cancel()
-                    flush_task = None
 
                 async def run_turn(transcript_text: str) -> None:
                     nonlocal conversation_history
@@ -16493,82 +16595,74 @@ class Engine:
                                             exc_info=True,
                                         )
 
-                async def maybe_respond(force: bool, from_flush: bool = False) -> None:
-                    nonlocal pending_segments, flush_task
-                    if not pending_segments:
-                        if from_flush:
-                            flush_task = None
-                        else:
-                            await cancel_flush()
-                        return
+                async def flush_pending() -> None:
+                    """Hand everything the caller has said so far to the LLM."""
+                    nonlocal pending_segments, pending_started_at, pending_deadline
                     aggregated = " ".join(pending_segments).strip()
-                    if not aggregated:
-                        pending_segments.clear()
-                        if from_flush:
-                            flush_task = None
-                        else:
-                            await cancel_flush()
-                        return
-                    words = len([w for w in aggregated.split() if w])
-                    chars = len(aggregated.replace(" ", ""))
-                    
-                    try:
-                        min_words = max(1, int((pipeline.llm_options or {}).get("aggregation_min_words", 3)))
-                    except (ValueError, TypeError):
-                        min_words = 3
-                    try:
-                        min_chars = max(1, int((pipeline.llm_options or {}).get("aggregation_min_chars", 12)))
-                    except (ValueError, TypeError):
-                        min_chars = 12
-                    threshold_met = words >= min_words or chars >= min_chars
-                    
-                    if not threshold_met:
-                        if not force:
-                            logger.debug(
-                                "Accumulating transcript before LLM",
-                                call_id=call_id,
-                                preview=aggregated[:80],
-                                chars=chars,
-                                words=words,
-                            )
-                            return
-                    if from_flush:
-                        flush_task = None
-                    else:
-                        await cancel_flush()
-                    await run_turn(aggregated)
+                    segments = len(pending_segments)
                     pending_segments.clear()
+                    pending_deadline = None
+                    started_at, pending_started_at = pending_started_at, None
+                    if not aggregated:
+                        return
+                    logger.info(
+                        "Caller turn ended on silence",
+                        call_id=call_id,
+                        segments=segments,
+                        waited_sec=round(time.monotonic() - started_at, 3)
+                        if started_at is not None
+                        else None,
+                        preview=aggregated[:80],
+                    )
+                    await run_turn(aggregated)
 
-                async def schedule_flush() -> None:
-                    nonlocal flush_task
-                    await cancel_flush()
-
-                    async def _flush() -> None:
-                        try:
-                            await asyncio.sleep(accumulation_timeout)
-                            await maybe_respond(force=True, from_flush=True)
-                        except asyncio.CancelledError:
-                            pass
-
-                    flush_task = asyncio.create_task(_flush())
+                def arm_deadline() -> None:
+                    """(Re)start the silence window that must elapse before the turn."""
+                    nonlocal pending_deadline
+                    now = time.monotonic()
+                    elapsed = (
+                        now - pending_started_at
+                        if pending_started_at is not None
+                        else None
+                    )
+                    pending_deadline = now + end_of_turn.flush_delay(elapsed)
 
                 try:
                     while True:
-                        transcript = await transcript_queue.get()
+                        if pending_segments and pending_deadline is not None:
+                            timeout = max(0.0, pending_deadline - time.monotonic())
+                            try:
+                                transcript = await asyncio.wait_for(
+                                    transcript_queue.get(), timeout=timeout
+                                )
+                            except asyncio.TimeoutError:
+                                # The caller stopped talking: release the turn.
+                                await flush_pending()
+                                continue
+                        else:
+                            transcript = await transcript_queue.get()
                         if transcript is None:
-                            await maybe_respond(force=True)
+                            await flush_pending()
                             break
                         normalized = (transcript or "").strip()
                         if not normalized:
-                            if pending_segments and flush_task is None:
-                                await schedule_flush()
+                            # An empty result is not speech, so it must not
+                            # push the deadline out.
                             continue
                         await self._no_input_note_activity(call_id, "pipeline:transcript")
                         await self._no_input_note_processing(call_id, True)
                         pending_segments.append(normalized)
-                        await maybe_respond(force=False)
-                        if pending_segments:
-                            await schedule_flush()
+                        if pending_started_at is None:
+                            pending_started_at = time.monotonic()
+                        # Restart the silence window; the turn starts only once
+                        # the caller actually stops talking.
+                        arm_deadline()
+                        logger.debug(
+                            "Waiting for caller silence before LLM turn",
+                            call_id=call_id,
+                            segments=len(pending_segments),
+                            silence_ms=end_of_turn.silence_ms,
+                        )
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -16579,8 +16673,6 @@ class Engine:
                         exc_info=True,
                     )
                     raise
-                finally:
-                    await cancel_flush()
 
             async def dialog_supervisor() -> None:
                 restart_count = 0

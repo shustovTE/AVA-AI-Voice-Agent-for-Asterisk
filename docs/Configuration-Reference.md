@@ -61,6 +61,33 @@ Admin UI for clarity but are not independently negotiable. Conflicting legacy
 values are normalized at runtime and logged. Audio Profiles continue to control
 wire/full-agent negotiation and do not change the modular STT bus format.
 
+### Pipeline End of Turn (caller turn-taking)
+
+Streaming modular STT returns a result at every phrase boundary, so the number
+of results says nothing about whether the caller has finished a sentence. The
+caller's turn therefore ends on silence: each new result restarts a window, and
+the accumulated text goes to the LLM once the caller has been quiet for it.
+
+- `pipelines.<name>.options.llm.end_of_turn_silence_ms`: silence that ends the
+  caller's turn. Defaults to `700`. Raise it (900-1200) when callers are cut off
+  working through a long sentence; lower it (400-600) for snappier replies. `0`
+  answers every STT result immediately.
+- `pipelines.<name>.options.llm.end_of_turn_max_wait_ms`: optional hard cap
+  measured from the caller's first pending result, so someone who never pauses
+  still gets an answer. Unset or `0` disables the cap, which is the default.
+
+Length no longer decides anything, so a one-word "yes" is answered as promptly
+as a paragraph. Every turn is logged as `Caller turn ended on silence` with the
+number of merged results and how long the caller was given.
+
+Superseded options in existing configs keep working with a warning:
+`aggregation_silence_sec` and `aggregation_timeout_sec` are read as the silence
+window and `aggregation_max_wait_sec` as the cap, all converted from seconds.
+`aggregation_min_words`, `aggregation_min_chars`, and
+`aggregation_wait_for_silence` are ignored and logged once per call as
+`Ignoring superseded transcript aggregation options` — the word and character
+thresholds are what answered callers mid-sentence.
+
 ### Golden Baselines
 See the validated configurations in `config/`:
 - `ai-agent.golden-openai.yaml` - OpenAI Realtime (monolithic, fastest)

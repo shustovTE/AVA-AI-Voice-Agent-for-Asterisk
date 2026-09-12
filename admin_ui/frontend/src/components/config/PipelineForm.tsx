@@ -35,7 +35,7 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     const [statusLoading, setStatusLoading] = useState(false);
     const [showAdvancedSTT, setShowAdvancedSTT] = useState(false);
     const [showLlmExpert, setShowLlmExpert] = useState<boolean>(
-        () => config?.options?.llm?.tools_enabled !== undefined || Boolean(config?.options?.llm?.realtime_model) || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined
+        () => config?.options?.llm?.tools_enabled !== undefined || Boolean(config?.options?.llm?.realtime_model)
     );
     const [showSttExpert, setShowSttExpert] = useState<boolean>(
         () => (Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
@@ -70,10 +70,10 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     }, [config]);
 
     useEffect(() => {
-        if (config?.options?.llm?.tools_enabled !== undefined || config?.options?.llm?.realtime_model || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined) {
+        if (config?.options?.llm?.tools_enabled !== undefined || config?.options?.llm?.realtime_model) {
             setShowLlmExpert(true);
         }
-    }, [config?.options?.llm?.tools_enabled, config?.options?.llm?.realtime_model, config?.options?.llm?.aggregation_min_words, config?.options?.llm?.aggregation_min_chars]);
+    }, [config?.options?.llm?.tools_enabled, config?.options?.llm?.realtime_model]);
 
     useEffect(() => {
         if ((Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
@@ -433,6 +433,46 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
             </div>
 
             <div className="space-y-4 border-t border-border pt-6">
+                <div className="space-y-3 border border-border rounded-lg p-4">
+                    <div>
+                        <h4 className="text-sm font-medium text-foreground">End of Turn</h4>
+                        <p className="text-xs text-muted-foreground">
+                            Streaming STT returns a result at every phrase boundary, so the caller's turn ends on silence. Every new result restarts the window, which keeps a long sentence one turn instead of answering the caller partway through it.
+                        </p>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <FormInput
+                            label="Silence Window (ms)"
+                            type="number"
+                            min={0}
+                            step={50}
+                            value={localConfig.options?.llm?.end_of_turn_silence_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_silence_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_silence_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="700"
+                            tooltip="How long the caller must be quiet before the turn is answered. Raise it when callers are cut off mid-sentence; lower it for snappier replies. 0 answers every result immediately."
+                        />
+                        <FormInput
+                            label="Max Wait (ms)"
+                            type="number"
+                            min={0}
+                            step={500}
+                            value={localConfig.options?.llm?.end_of_turn_max_wait_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_max_wait_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_max_wait_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="Off"
+                            tooltip="Hard cap measured from the caller's first result, so someone who never pauses still gets an answer. Empty or 0 disables the cap, which is the default."
+                        />
+                    </div>
+                </div>
                 {(isOpenAILlm || isOllamaLlm) && (
                     <div className="space-y-3 border border-amber-300/40 rounded-lg p-4 bg-amber-500/5">
                         <FormSwitch
@@ -465,38 +505,6 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                     disabled={!showLlmExpert}
                                 />
                             )}
-                            <FormInput
-                                label="LLM Min Words Threshold"
-                                type="number"
-                                min={1}
-                                step={1}
-                                value={localConfig.options?.llm?.aggregation_min_words ?? ''}
-                                onChange={(e) => {
-                                    const raw = e.target.value;
-                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_words: undefined }); return; }
-                                    const parsed = parseInt(raw, 10);
-                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_words: Math.max(1, parsed) }); }
-                                }}
-                                placeholder="Auto"
-                                tooltip="Minimum words to wait before sending transcript to LLM."
-                                disabled={!showLlmExpert}
-                            />
-                            <FormInput
-                                label="LLM Min Chars Threshold"
-                                type="number"
-                                min={1}
-                                step={1}
-                                value={localConfig.options?.llm?.aggregation_min_chars ?? ''}
-                                onChange={(e) => {
-                                    const raw = e.target.value;
-                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_chars: undefined }); return; }
-                                    const parsed = parseInt(raw, 10);
-                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_chars: Math.max(1, parsed) }); }
-                                }}
-                                placeholder="Auto"
-                                tooltip="Minimum characters to wait before sending transcript to LLM."
-                                disabled={!showLlmExpert}
-                            />
                         </div>
                         <div className="mt-2 border-t border-amber-300/30 pt-3 space-y-3">
                             <p className="text-xs text-muted-foreground">
