@@ -266,11 +266,12 @@ class OpenAIProviderConfig(BaseModel):
     api_key_env: Optional[str] = None
     organization: Optional[str] = None
     project: Optional[str] = None
-    # Prompt-caching hint forwarded as the `prompt_cache_key` body field on
-    # Chat Completions (OpenAI, Mistral). Keep it stable across calls that
-    # share a system prompt and bump it when that prompt changes; an empty
-    # value sends no field at all. Never put secrets or personal data here.
-    prompt_cache_key: Optional[str] = None
+    # Vendor-specific Chat Completions fields forwarded verbatim in the request
+    # body (e.g. `prompt_cache_key` for OpenAI/Mistral prompt caching, or
+    # `chat_template_kwargs` for a vLLM chat template). The engine logs the key
+    # names it forwards, and never lets one override a field it owns itself
+    # (model, messages, stream, tools, tool_choice).
+    extra_body: Dict[str, Any] = Field(default_factory=dict)
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)

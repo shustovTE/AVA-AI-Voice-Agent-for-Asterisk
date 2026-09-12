@@ -566,7 +566,7 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
 - `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
 
-`prompt_cache_key` (LLM only) enables prompt caching on endpoints that support it (OpenAI, Mistral), where cached input tokens are billed at a fraction of the normal rate. Caching is opt-in on both: leave the key empty and the request body is unchanged. Set it on the provider block, or per pipeline in `options.llm`:
+`extra_body` (LLM only) forwards vendor-specific Chat Completions fields verbatim in the request body, for endpoint parameters that have no first-class option. Other provider keys never reach the request: the payload carries `model`, `messages`, `temperature`, `max_tokens`, whatever `extra_body` holds, and the tool/stream fields the engine manages. A stray key elsewhere in the provider block (`CACHE_KEY: prompt-1`) is dropped without reaching the endpoint.
 
 ```yaml
 providers:
@@ -574,10 +574,13 @@ providers:
     type: openai
     chat_base_url: https://api.mistral.ai/v1
     chat_model: mistral-small-latest
-    prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
+    extra_body:
+      prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
 ```
 
-Choose a value that stays the same across calls sharing a system prompt (an agent or context name), and bump it when you change that prompt. A per-call value defeats the cache, and the key must not contain secrets or personal data. No other provider keys reach the request: the payload carries `model`, `messages`, `temperature`, `max_tokens`, this key when set, and the tool/stream fields the engine manages.
+It is read from the provider block, from a pipeline's `options.llm`, and from runtime options, shallow-merged in that order, so a pipeline can override one field without repeating the rest. Keys the engine owns (`model`, `messages`, `stream`, `tools`, `tool_choice`) are ignored with a warning. Every request that carries forwarded fields logs their names (not their values) as `Forwarding extra_body fields to the LLM`, so what reaches the endpoint stays visible in the engine log.
+
+For prompt caching (`prompt_cache_key` on OpenAI and Mistral, where cached input tokens bill at a fraction of the normal rate), pick a value that stays the same across calls sharing a system prompt and bump it when that prompt changes. A per-call value defeats the cache, and the key must not contain secrets or personal data.
 
 Requirements:
 
