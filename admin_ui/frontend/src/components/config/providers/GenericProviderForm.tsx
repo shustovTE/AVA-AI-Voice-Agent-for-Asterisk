@@ -277,7 +277,10 @@ const GenericProviderForm: React.FC<GenericProviderFormProps> = ({ config, onCha
                 }
             });
 
-            onChange(newConfig);
+            // Signal the removal explicitly: the parent treats `undefined` as
+            // "drop this key", and only then can a save avoid resurrecting it
+            // from the provider block it merges over.
+            onChange({ ...newConfig, [fieldToRemove.key]: undefined });
         }
     };
 
