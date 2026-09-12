@@ -497,6 +497,10 @@ class ElevenLabsProviderConfig(BaseModel):
     # Audio settings
     output_format: str = Field(default="ulaw_8000")  # ulaw_8000, mp3_44100, pcm_16000, etc.
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    # Play audio as it arrives from /text-to-speech/{voice}/stream instead of
+    # waiting for the whole sentence. Ignored when the requested output_format
+    # needs resampling to the call's transport rate.
+    stream: bool = Field(default=True)
     # Voice settings
     stability: float = Field(default=0.5)
     similarity_boost: float = Field(default=0.75)

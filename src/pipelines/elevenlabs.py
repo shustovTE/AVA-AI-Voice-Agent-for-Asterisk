@@ -25,6 +25,15 @@ from .base import TTSComponent
 
 logger = get_logger(__name__)
 
+# Output formats the adapter knows how to decode, mapped to the sample rate
+# ElevenLabs returns them at.
+_OUTPUT_FORMAT_SAMPLE_RATES = {
+    "ulaw_8000": 8000,
+    "pcm_16000": 16000,
+    "pcm_24000": 24000,
+}
+_MULAW_OUTPUT_FORMATS = {"ulaw_8000"}
+
 
 class ElevenLabsTTSAdapter(TTSComponent):
     """
@@ -128,11 +137,27 @@ class ElevenLabsTTSAdapter(TTSComponent):
             output_format = "pcm_16000"
         
         request_id = f"11labs-tts-{uuid.uuid4().hex[:12]}"
-        
+
+        source_rate = _OUTPUT_FORMAT_SAMPLE_RATES.get(output_format)
+        if source_rate is None:
+            raise RuntimeError(
+                f"Unsupported ElevenLabs TTS output format: {output_format}"
+            )
+
+        # Stream only when the API already returns the call's transport rate.
+        # resample_audio() keeps no state between invocations, so resampling
+        # chunk by chunk would add an artifact at every chunk boundary; those
+        # calls keep the buffered path below.
+        use_stream = (
+            bool(merged.get("stream", True)) and source_rate == target_sample_rate
+        )
+
         # Build API URL
         # https://elevenlabs.io/docs/api-reference/text-to-speech
         base_url = merged.get("base_url", self._provider_config.base_url)
         url = f"{base_url}/text-to-speech/{voice_id}"
+        if use_stream:
+            url = f"{url}/stream"
         
         # Voice settings
         voice_settings = {
@@ -166,6 +191,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
             voice_id=voice_id,
             model_id=model_id,
             output_format=output_format,
+            streamed=use_stream,
         )
         
         started_at = time.perf_counter()
@@ -183,24 +209,29 @@ class ElevenLabsTTSAdapter(TTSComponent):
                     )
                     response.raise_for_status()
                 
+                if use_stream:
+                    async for frame in self._iter_streamed_frames(
+                        response,
+                        call_id=call_id,
+                        request_id=request_id,
+                        started_at=started_at,
+                        output_format=output_format,
+                        target_encoding=target_encoding,
+                        target_sample_rate=target_sample_rate,
+                        chunk_ms=int(merged.get("chunk_size_ms", 20)),
+                    ):
+                        yield frame
+                    return
+
                 # Read the full audio response
                 raw_audio = await response.read()
                 latency_ms = (time.perf_counter() - started_at) * 1000.0
-                
-                source_rate: Optional[int]
-                if output_format == "ulaw_8000":
-                    pcm_audio = mulaw_to_pcm16le(raw_audio)
-                    source_rate = 8000
-                elif output_format == "pcm_16000":
-                    pcm_audio = raw_audio
-                    source_rate = 16000
-                elif output_format == "pcm_24000":
-                    pcm_audio = raw_audio
-                    source_rate = 24000
-                else:
-                    raise RuntimeError(
-                        f"Unsupported ElevenLabs TTS output format: {output_format}"
-                    )
+
+                pcm_audio = (
+                    mulaw_to_pcm16le(raw_audio)
+                    if output_format in _MULAW_OUTPUT_FORMATS
+                    else raw_audio
+                )
 
                 if source_rate != target_sample_rate:
                     pcm_audio, _ = resample_audio(
@@ -222,6 +253,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
                     output_bytes=len(converted),
                     target_encoding=target_encoding,
                     target_sample_rate=target_sample_rate,
+                    streamed=False,
                 )
                 
                 # Yield in chunks for streaming playback
@@ -240,6 +272,90 @@ class ElevenLabsTTSAdapter(TTSComponent):
                 error=str(exc),
             )
             raise
+
+    async def _iter_streamed_frames(
+        self,
+        response: aiohttp.ClientResponse,
+        *,
+        call_id: str,
+        request_id: str,
+        started_at: float,
+        output_format: str,
+        target_encoding: str,
+        target_sample_rate: int,
+        chunk_ms: int,
+    ) -> AsyncIterator[bytes]:
+        """Emit playback frames while the response body is still arriving.
+
+        Both conversions used here (μ-law decode and target encoding) are
+        per-sample and stateless, so converting each network chunk on its own
+        produces the same bytes as converting the whole response at once. The
+        caller only selects this path when no resampling is required.
+        """
+        frame_bytes = self._frame_size_bytes(
+            target_encoding, target_sample_rate, chunk_ms
+        )
+        source_is_mulaw = output_format in _MULAW_OUTPUT_FORMATS
+        pending = b""
+        partial_sample = b""
+        raw_bytes = 0
+        output_bytes = 0
+        first_audio_ms: Optional[float] = None
+
+        async for raw in response.content.iter_any():
+            if not raw:
+                continue
+            raw_bytes += len(raw)
+            if source_is_mulaw:
+                pcm_audio = mulaw_to_pcm16le(raw)
+            else:
+                # A PCM16 sample can straddle a chunk boundary; hold the odd
+                # trailing byte back for the next chunk.
+                buffered = partial_sample + raw
+                aligned = len(buffered) - (len(buffered) % 2)
+                partial_sample = buffered[aligned:]
+                pcm_audio = buffered[:aligned]
+            if not pcm_audio:
+                continue
+
+            converted = convert_pcm16le_to_target_format(pcm_audio, target_encoding)
+            if not converted:
+                continue
+
+            if first_audio_ms is None:
+                first_audio_ms = (time.perf_counter() - started_at) * 1000.0
+                logger.info(
+                    "ElevenLabs TTS first audio chunk",
+                    call_id=call_id,
+                    request_id=request_id,
+                    first_audio_ms=round(first_audio_ms, 2),
+                )
+
+            pending += converted
+            while len(pending) >= frame_bytes:
+                frame = pending[:frame_bytes]
+                pending = pending[frame_bytes:]
+                output_bytes += len(frame)
+                yield frame
+
+        if pending:
+            output_bytes += len(pending)
+            yield pending
+
+        logger.info(
+            "ElevenLabs TTS synthesis completed",
+            call_id=call_id,
+            request_id=request_id,
+            latency_ms=round((time.perf_counter() - started_at) * 1000.0, 2),
+            first_audio_ms=(
+                round(first_audio_ms, 2) if first_audio_ms is not None else None
+            ),
+            raw_bytes=raw_bytes,
+            output_bytes=output_bytes,
+            target_encoding=target_encoding,
+            target_sample_rate=target_sample_rate,
+            streamed=True,
+        )
 
     async def _ensure_session(self) -> None:
         """Ensure HTTP session exists."""
@@ -286,6 +402,10 @@ class ElevenLabsTTSAdapter(TTSComponent):
                 self._pipeline_defaults.get("use_speaker_boost", self._provider_config.use_speaker_boost)),
             "chunk_size_ms": runtime_options.get("chunk_size_ms",
                 self._pipeline_defaults.get("chunk_size_ms", 20)),
+            "stream": runtime_options.get("stream",
+                self._pipeline_defaults.get(
+                    "stream", getattr(self._provider_config, "stream", True)
+                )),
             "output_resampler": runtime_options.get(
                 "output_resampler",
                 self._pipeline_defaults.get(
@@ -298,6 +418,19 @@ class ElevenLabsTTSAdapter(TTSComponent):
         )[0]
         return merged
 
+    def _frame_size_bytes(
+        self,
+        encoding: str,
+        sample_rate: int,
+        chunk_ms: int,
+    ) -> int:
+        """Bytes carried by one playback frame in the transport encoding."""
+        bytes_per_sample = 1 if encoding.lower() in {"ulaw", "mulaw", "mu-law"} else 2
+        return max(
+            bytes_per_sample,
+            int(sample_rate * (chunk_ms / 1000.0) * bytes_per_sample),
+        )
+
     def _chunk_audio(
         self,
         audio: bytes,
@@ -306,11 +439,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
         chunk_ms: int = 20,
     ) -> list:
         """Split encoded audio into transport-sized playback chunks."""
-        bytes_per_sample = 1 if encoding.lower() in {"ulaw", "mulaw", "mu-law"} else 2
-        chunk_size = max(
-            bytes_per_sample,
-            int(sample_rate * (chunk_ms / 1000.0) * bytes_per_sample),
-        )
+        chunk_size = self._frame_size_bytes(encoding, sample_rate, chunk_ms)
         
         chunks = []
         for i in range(0, len(audio), chunk_size):

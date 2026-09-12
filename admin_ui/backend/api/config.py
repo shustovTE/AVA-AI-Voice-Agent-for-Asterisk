@@ -619,6 +619,76 @@ def _safe_base_url(user_url: str, fallback: str) -> str:
     return _SAFE_BASE_URLS.get(host, fallback)
 
 
+def _sanitized_http_url(user_url: str) -> str:
+    """Rebuild an operator-configured http(s) URL from its parsed components.
+
+    Returns "" when the value cannot serve as a verification target.  The
+    result is assembled from urlparse() fields rather than passed through, and
+    carries no credentials, query or fragment, so a probe can only reach the
+    scheme/host/port/path the operator configured.
+    """
+    try:
+        parsed = urlparse(str(user_url or "").strip())
+    except Exception:
+        return ""
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    host = (parsed.hostname or "").lower()
+    if not host or parsed.username or parsed.password:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    netloc = f"{host}:{int(port)}" if port else host
+    path = (parsed.path or "").rstrip("/")
+    return f"{parsed.scheme}://{netloc}{path}"
+
+
+def _saved_provider_base_host(provider_key: str) -> str:
+    """Host of the chat/base URL stored on disk for *provider_key*."""
+    if not provider_key:
+        return ""
+    try:
+        providers = (_read_merged_config_dict() or {}).get("providers") or {}
+    except Exception:
+        return ""
+    if not isinstance(providers, dict):
+        return ""
+    block = providers.get(provider_key)
+    if not isinstance(block, dict):
+        for key, value in providers.items():
+            if str(key).lower() == provider_key.lower() and isinstance(value, dict):
+                block = value
+                break
+    if not isinstance(block, dict):
+        return ""
+    configured = block.get("chat_base_url") or block.get("base_url") or ""
+    return _url_host(str(configured))
+
+
+def _verification_base_url(user_url: str, fallback: str, provider_key: str = "") -> str:
+    """Resolve the base URL a provider verification request may call.
+
+    Known vendor hosts keep their hardcoded canonical URL.  Self-hosted
+    OpenAI-compatible endpoints (vLLM, LiteLLM, llama.cpp, ...) are absent from
+    that table; silently probing the vendor instead both leaks the self-hosted
+    token to a third party and reports a meaningless 401.  Such a host is
+    accepted only when it matches the provider block the operator already saved
+    on disk, so a request body alone can never steer the probe at an arbitrary
+    address.  An empty return means the caller must not send credentials
+    anywhere.
+    """
+    host = _url_host(user_url)
+    if host in _SAFE_BASE_URLS:
+        return _SAFE_BASE_URLS[host]
+    if not str(user_url or "").strip():
+        return fallback
+    if not host or host != _saved_provider_base_host(provider_key):
+        return ""
+    return _sanitized_http_url(user_url)
+
+
 def _rotate_backups(base_path: str) -> None:
     """
     A11: Keep only the last MAX_BACKUPS backup files.
@@ -1812,7 +1882,10 @@ async def test_provider_connection(request: ProviderTestRequest):
             elif isinstance(item, str):
                 # Match ${VAR} or ${VAR:-default} or ${VAR:=default}
                 # Capture group 1: Var name, Group 2: Default value (optional)
-                pattern = r'\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?:[:=-]([^}]*))?\}'
+                # `:-` / `:=` / `-` / `=` introduce the default; the old
+                # class swallowed only one of the two separator characters, so
+                # ${VAR:-http://x} defaulted to "-http://x".
+                pattern = r'\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::?[-=]([^}]*))?\}'
                 
                 def replace(match):
                     var_name = match.group(1)
@@ -1864,12 +1937,39 @@ async def test_provider_connection(request: ProviderTestRequest):
             import websockets
             import json
             
-            # Get WebSocket URL from either base_url or ws_url
-            ws_url = provider_config.get('base_url') or provider_config.get('ws_url') or 'ws://127.0.0.1:8765'
-            # Handle env var format
-            if '${' in ws_url:
-                ws_url = 'ws://127.0.0.1:8765'  # Default fallback
-            
+            # Get WebSocket URL from either base_url or ws_url.
+            # substitute_env_vars() above already expanded ${LOCAL_WS_URL:-...};
+            # a leftover placeholder means nothing resolved, so prefer the
+            # operator's own .env values over a hardcoded loopback guess (the
+            # Admin UI container's loopback is not the host's).
+            ws_url = str(
+                provider_config.get('base_url') or provider_config.get('ws_url') or ''
+            ).strip()
+            if not ws_url or '${' in ws_url or not ws_url.startswith(('ws://', 'wss://')):
+                ws_url = (
+                    get_env_key('HEALTH_CHECK_LOCAL_AI_URL')
+                    or get_env_key('LOCAL_WS_URL')
+                    or 'ws://127.0.0.1:8765'
+                )
+
+            # local-ai-server rejects every message before auth once
+            # LOCAL_WS_AUTH_TOKEN is set, so the probe has to authenticate the
+            # same way the engine and the Models page do. Without this the
+            # server answers `authentication_required` and the probe reported
+            # a healthy server as "status invalid".
+            auth_token = str(provider_config.get('auth_token') or '').strip()
+            if not auth_token:
+                auth_token = (
+                    get_env_key('LOCAL_WS_AUTH_TOKEN')
+                    or os.getenv('LOCAL_WS_AUTH_TOKEN', '')
+                ).strip()
+
+            declared_caps = [
+                str(cap).strip().lower()
+                for cap in (provider_config.get('capabilities') or [])
+                if str(cap).strip()
+            ]
+
             try:
                 def _fallback_ws_url(url: str) -> str:
                     """
@@ -1885,6 +1985,19 @@ async def test_provider_connection(request: ProviderTestRequest):
 
                 async def _try_connect(url: str):
                     async with websockets.connect(url, open_timeout=5.0) as ws:
+                        if auth_token:
+                            await ws.send(
+                                json.dumps({"type": "auth", "auth_token": auth_token})
+                            )
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                            auth_data = json.loads(raw)
+                            if (
+                                auth_data.get("type") != "auth_response"
+                                or auth_data.get("status") != "ok"
+                            ):
+                                raise PermissionError(
+                                    str(auth_data.get("message") or "auth rejected")
+                                )
                         # Send status request to check models
                         await ws.send(json.dumps({"type": "status"}))
                         response = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -1894,6 +2007,8 @@ async def test_provider_connection(request: ProviderTestRequest):
                 try:
                     data = await _try_connect(ws_url)
                     effective_url = ws_url
+                except PermissionError:
+                    raise
                 except Exception as e:
                     alt = _fallback_ws_url(ws_url)
                     if alt != ws_url:
@@ -1917,12 +2032,43 @@ async def test_provider_connection(request: ProviderTestRequest):
                     status_parts.append(f"LLM: {llm_model} ✓" if llm_loaded else "LLM: not loaded")
                     status_parts.append(f"TTS: {tts_backend} ✓" if tts_loaded else "TTS: not loaded")
 
-                    all_loaded = stt_loaded and llm_loaded and tts_loaded
+                    # A modular provider owns only the capabilities it declares
+                    # (providers.local_stt -> ["stt"]), and LOCAL_AI_MODE=minimal
+                    # deliberately skips the LLM preload. Demanding all three
+                    # reported a working server as failed.
+                    loaded = {"stt": stt_loaded, "llm": llm_loaded, "tts": tts_loaded}
+                    required = [cap for cap in declared_caps if cap in loaded]
+                    if not required:
+                        required = ["stt", "llm", "tts"]
+                    runtime_mode = str(
+                        (data.get("config") or {}).get("runtime_mode") or ""
+                    ).strip().lower()
+                    if runtime_mode == "minimal":
+                        required = [role for role in required if role != "llm"]
+                    missing = [role for role in required if not loaded[role]]
+
+                    if missing:
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Local AI Server connected ({effective_url}) but "
+                                f"{', '.join(role.upper() for role in missing)} not loaded. "
+                                f"{' | '.join(status_parts)}"
+                            ),
+                        }
                     return {
-                        "success": all_loaded,
+                        "success": True,
                         "message": f"Local AI Server connected ({effective_url}). {' | '.join(status_parts)}",
                     }
                 return {"success": False, "message": "Local AI Server responded but status invalid"}
+            except PermissionError as exc:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Local AI Server rejected the auth token ({exc}). Check "
+                        "LOCAL_WS_AUTH_TOKEN in .env and auth_token on this provider."
+                    ),
+                }
             except Exception as e:
                 logger.debug("Local AI Server validation failed", error=str(e), exc_info=True)
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
@@ -2049,9 +2195,25 @@ async def test_provider_connection(request: ProviderTestRequest):
         # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.) - validate /models
         # ============================================================
         if provider_type == 'openai':
-            chat_base_url = _safe_base_url(
-                provider_config.get('chat_base_url') or '', 'https://api.openai.com/v1'
+            configured_chat_base = (
+                provider_config.get('chat_base_url')
+                or provider_config.get('base_url')
+                or ''
             )
+            chat_base_url = _verification_base_url(
+                configured_chat_base,
+                'https://api.openai.com/v1',
+                provider_key=request.name,
+            )
+            if not chat_base_url:
+                return {
+                    "success": False,
+                    "message": (
+                        "Cannot verify this endpoint: chat_base_url must be an "
+                        "http(s) URL, and a self-hosted host is only probed once "
+                        "the provider is saved with that same host."
+                    ),
+                }
             api_key = provider_config.get('api_key')
             if not api_key:
                 inferred_env = None

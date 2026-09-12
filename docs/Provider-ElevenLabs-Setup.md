@@ -551,6 +551,7 @@ providers:
     voice_id: "21m00Tcm4TlvDq8ikWAM"   # Rachel (warm, professional)
     model_id: "eleven_turbo_v2_5"        # Fast, high-quality
     output_format: "ulaw_8000"           # Telephony-optimized
+    stream: true                         # Play audio as it arrives
     stability: 0.5
     similarity_boost: 0.75
     style: 0.0
@@ -561,6 +562,7 @@ providers:
 - **`voice_id`**: Choose from the [ElevenLabs Voice Library](https://elevenlabs.io/voice-library). Default is Rachel (`21m00Tcm4TlvDq8ikWAM`).
 - **`model_id`**: `eleven_turbo_v2_5` offers the best balance of speed and quality for telephony.
 - **`output_format`**: Must be `ulaw_8000` for telephony. ElevenLabs returns μ-law encoded audio at 8 kHz.
+- **`stream`**: Default `true`. Requests `/text-to-speech/{voice_id}/stream` and starts playback on the first bytes instead of waiting for the whole sentence, which removes the synthesis time of each sentence from the reply latency. Set `false` to go back to the buffered request. The setting is ignored (and the buffered path used) when the requested `output_format` needs resampling to the call's transport rate, because the resampler keeps no state between chunks.
 
 ### Pipeline Configuration
 
