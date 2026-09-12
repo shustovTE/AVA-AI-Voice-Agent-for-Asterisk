@@ -566,20 +566,6 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
 - `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
 
-`extra_body` (LLM only) forwards vendor-specific Chat Completions fields verbatim in the request body, for endpoints whose extras have no first-class option. It is read from the provider block, from a pipeline's `options.llm`, or from runtime options, shallow-merged in that order, so a pipeline can override one key without repeating the rest. Keys the engine owns (`model`, `messages`, `stream`, `tools`, `tool_choice`) are ignored with a warning.
-
-```yaml
-providers:
-  native_llm:
-    type: openai
-    chat_base_url: https://api.mistral.ai/v1
-    chat_model: mistral-small-latest
-    extra_body:
-      prompt_cache_key: receptionist-v1   # OpenAI / Mistral prompt caching
-```
-
-Pick a `prompt_cache_key` that is stable across calls for the same system prompt (the agent or context name, plus a version you bump when the prompt changes). A per-call value defeats the cache, and the key must not contain secrets or personal data.
-
 Requirements:
 
 - `OPENAI_API_KEY` must be set in the environment.

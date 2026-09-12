@@ -266,11 +266,6 @@ class OpenAIProviderConfig(BaseModel):
     api_key_env: Optional[str] = None
     organization: Optional[str] = None
     project: Optional[str] = None
-    # Vendor-specific Chat Completions fields forwarded verbatim in the request
-    # body (e.g. `prompt_cache_key` for OpenAI/Mistral prompt caching, or
-    # `chat_template_kwargs` for a vLLM chat template). Keys the engine owns
-    # (model, messages, stream, tools, tool_choice) are never overridden.
-    extra_body: Dict[str, Any] = Field(default_factory=dict)
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)

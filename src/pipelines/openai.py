@@ -86,18 +86,6 @@ def _make_ws_headers(options: Dict[str, Any]) -> Iterable[tuple[str, str]]:
     return headers
 
 
-# Request-body fields the engine sets itself; an extra_body entry for one of
-# these would silently break streaming, tool calls or the conversation history.
-_ENGINE_OWNED_PAYLOAD_KEYS = frozenset(
-    {"model", "messages", "stream", "tools", "tool_choice"}
-)
-
-
-def _as_dict(value: Any) -> Dict[str, Any]:
-    """Return *value* when it is a mapping, else an empty dict."""
-    return dict(value) if isinstance(value, dict) else {}
-
-
 def _make_http_headers(options: Dict[str, Any]) -> Dict[str, str]:
     headers = {
         "Authorization": f"Bearer {options['api_key']}",
@@ -840,13 +828,6 @@ class OpenAILLMAdapter(LLMComponent):
                 "api_version",
                 self._pipeline_defaults.get("api_version", getattr(self._provider_defaults, "api_version", "ga")),
             ),
-            # Shallow-merged so a pipeline can add or override a single vendor
-            # field without repeating the provider's whole block.
-            "extra_body": {
-                **_as_dict(getattr(self._provider_defaults, "extra_body", None)),
-                **_as_dict(self._pipeline_defaults.get("extra_body")),
-                **_as_dict(runtime_options.get("extra_body")),
-            },
         }
 
         # If a pipeline swap left provider-specific LLM settings behind (e.g., Groq base_url + llama model),
@@ -896,15 +877,6 @@ class OpenAILLMAdapter(LLMComponent):
             payload["temperature"] = merged["temperature"]
         if merged.get("max_tokens") is not None:
             payload["max_tokens"] = merged["max_tokens"]
-        for key, value in _as_dict(merged.get("extra_body")).items():
-            if key in _ENGINE_OWNED_PAYLOAD_KEYS:
-                logger.warning(
-                    "Ignoring extra_body key owned by the engine",
-                    component=self.component_key,
-                    key=key,
-                )
-                continue
-            payload[key] = value
         return payload
 
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:
