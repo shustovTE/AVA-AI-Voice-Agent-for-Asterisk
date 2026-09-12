@@ -828,6 +828,13 @@ class OpenAILLMAdapter(LLMComponent):
                 "api_version",
                 self._pipeline_defaults.get("api_version", getattr(self._provider_defaults, "api_version", "ga")),
             ),
+            "prompt_cache_key": runtime_options.get(
+                "prompt_cache_key",
+                self._pipeline_defaults.get(
+                    "prompt_cache_key",
+                    getattr(self._provider_defaults, "prompt_cache_key", None),
+                ),
+            ),
         }
 
         # If a pipeline swap left provider-specific LLM settings behind (e.g., Groq base_url + llama model),
@@ -877,6 +884,11 @@ class OpenAILLMAdapter(LLMComponent):
             payload["temperature"] = merged["temperature"]
         if merged.get("max_tokens") is not None:
             payload["max_tokens"] = merged["max_tokens"]
+        # Prompt caching is opt-in on both OpenAI and Mistral: no key, no field,
+        # so an unconfigured deployment sends exactly what it sent before.
+        cache_key = str(merged.get("prompt_cache_key") or "").strip()
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
         return payload
 
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:

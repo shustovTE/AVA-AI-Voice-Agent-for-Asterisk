@@ -266,6 +266,11 @@ class OpenAIProviderConfig(BaseModel):
     api_key_env: Optional[str] = None
     organization: Optional[str] = None
     project: Optional[str] = None
+    # Prompt-caching hint forwarded as the `prompt_cache_key` body field on
+    # Chat Completions (OpenAI, Mistral). Keep it stable across calls that
+    # share a system prompt and bump it when that prompt changes; an empty
+    # value sends no field at all. Never put secrets or personal data here.
+    prompt_cache_key: Optional[str] = None
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)

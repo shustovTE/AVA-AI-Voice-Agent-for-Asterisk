@@ -566,6 +566,19 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
 - `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
 
+`prompt_cache_key` (LLM only) enables prompt caching on endpoints that support it (OpenAI, Mistral), where cached input tokens are billed at a fraction of the normal rate. Caching is opt-in on both: leave the key empty and the request body is unchanged. Set it on the provider block, or per pipeline in `options.llm`:
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://api.mistral.ai/v1
+    chat_model: mistral-small-latest
+    prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
+```
+
+Choose a value that stays the same across calls sharing a system prompt (an agent or context name), and bump it when you change that prompt. A per-call value defeats the cache, and the key must not contain secrets or personal data. No other provider keys reach the request: the payload carries `model`, `messages`, `temperature`, `max_tokens`, this key when set, and the tool/stream fields the engine manages.
+
 Requirements:
 
 - `OPENAI_API_KEY` must be set in the environment.
