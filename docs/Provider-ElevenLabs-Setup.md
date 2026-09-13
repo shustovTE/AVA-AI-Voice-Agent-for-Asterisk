@@ -564,6 +564,44 @@ providers:
 - **`output_format`**: Must be `ulaw_8000` for telephony. ElevenLabs returns μ-law encoded audio at 8 kHz.
 - **`stream`**: Default `true`. Requests `/text-to-speech/{voice_id}/stream` and starts playback on the first bytes instead of waiting for the whole sentence, which removes the synthesis time of each sentence from the reply latency. Set `false` to go back to the buffered request. The setting is ignored (and the buffered path used) when the requested `output_format` needs resampling to the call's transport rate, because the resampler keeps no state between chunks.
 
+### Routing ElevenLabs Through a Proxy
+
+Both settings are optional and apply to this adapter alone, so a deployment can
+keep the engine, the models and Asterisk on the direct path and send only the
+one remote leg through a tunnel.
+
+```yaml
+providers:
+  elevenlabs_tts:
+    proxy: "http://xray:8080"      # empty or absent = direct connection
+    keepalive_timeout_sec: 120     # absent = aiohttp's 15 s default
+```
+
+- **`proxy`**: an HTTP proxy URL, for example a local Xray or 3x-ui HTTP
+  inbound on the container network. HTTPS is tunnelled through it with
+  `CONNECT`. Only `http://` and `https://` are accepted: aiohttp has no SOCKS
+  support of its own, and a `socks5://` value is rejected at startup rather
+  than failing later inside a call. Credentials may be written inline
+  (`http://user:pass@host:port`); they are moved into a `Proxy-Authorization`
+  header and never logged, but they do sit in the config file like any other
+  setting, so an inbound without auth on a private container network avoids
+  keeping a password there. A malformed value fails the adapter instead of
+  quietly connecting directly, so traffic meant for the tunnel cannot leak out
+  the default route.
+- **`keepalive_timeout_sec`**: how long an idle connection to ElevenLabs is
+  kept for reuse. Audio is streamed a sentence at a time over one session per
+  call, so when the connection is dropped between sentences the next one pays a
+  fresh TLS handshake, and through a proxy that costs several extra round
+  trips. A window that outlasts a caller's pause (60-180 s) removes that from
+  the middle of a conversation. The first sentence of each call still
+  handshakes, which lands on the greeting where it matters least.
+
+Both keys are also accepted per pipeline under `options.tts`, where they
+override the provider block. The Admin UI exposes them under **Network
+Routing** in the ElevenLabs provider editor (TTS Engine mode). The provider
+connection test in the Admin UI does not go through the proxy, so it can report
+an error while calls work.
+
 ### Pipeline Configuration
 
 Reference `elevenlabs_tts` as the TTS component in your pipeline:

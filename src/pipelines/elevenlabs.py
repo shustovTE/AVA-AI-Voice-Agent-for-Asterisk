@@ -13,9 +13,11 @@ from ..audio.resampler import (
     resample_audio,
     resolve_output_resampler_policy,
 )
+import base64
 import time
 import uuid
-from typing import Any, AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -33,6 +35,51 @@ _OUTPUT_FORMAT_SAMPLE_RATES = {
     "pcm_24000": 24000,
 }
 _MULAW_OUTPUT_FORMATS = {"ulaw_8000"}
+
+# aiohttp tunnels HTTPS through an HTTP proxy with CONNECT. It has no SOCKS
+# support of its own, so a socks:// URL must be rejected with a usable message
+# rather than failing later inside the request.
+_SUPPORTED_PROXY_SCHEMES = {"http", "https"}
+
+
+def sanitize_proxy_url(proxy: str) -> str:
+    """Return the proxy URL without credentials, safe to log."""
+    parts = urlsplit(proxy)
+    if not parts.username and not parts.password:
+        return proxy
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def split_proxy_credentials(
+    proxy: Optional[str],
+) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+    """Separate a proxy URL from any credentials written into it.
+
+    aiohttp deprecated its ``proxy_auth`` argument, so inline credentials become
+    a ``Proxy-Authorization`` header instead. Returns ``(None, None)`` when no
+    proxy is configured.
+    """
+    cleaned = (proxy or "").strip()
+    if not cleaned:
+        return None, None
+    parts = urlsplit(cleaned)
+    if parts.scheme not in _SUPPORTED_PROXY_SCHEMES:
+        raise ValueError(
+            f"Unsupported ElevenLabs proxy scheme {parts.scheme!r}: aiohttp speaks "
+            "only http:// and https://. Expose an HTTP inbound on the proxy, or "
+            "install aiohttp-socks and route at the network level instead."
+        )
+    if not parts.hostname:
+        raise ValueError(f"ElevenLabs proxy URL has no host: {cleaned!r}")
+    if not parts.username and not parts.password:
+        return cleaned, None
+    token = base64.b64encode(
+        f"{unquote(parts.username or '')}:{unquote(parts.password or '')}".encode("utf-8")
+    ).decode("ascii")
+    return sanitize_proxy_url(cleaned), {"Proxy-Authorization": f"Basic {token}"}
 
 
 class ElevenLabsTTSAdapter(TTSComponent):
@@ -63,6 +110,35 @@ class ElevenLabsTTSAdapter(TTSComponent):
         self._pipeline_defaults = options or {}
         self._session_factory = session_factory
         self._session: Optional[aiohttp.ClientSession] = None
+        # Proxy and connection reuse describe the transport, not one utterance,
+        # so they are resolved once here rather than per synthesize() call. A
+        # malformed proxy raises now: silently going direct would leak traffic
+        # the operator asked to be tunnelled.
+        self._proxy_url, self._proxy_headers = split_proxy_credentials(
+            self._setting("proxy")
+        )
+        self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+
+    def _setting(self, key: str) -> Any:
+        """Read one transport setting: pipeline options override the provider."""
+        if key in self._pipeline_defaults:
+            return self._pipeline_defaults[key]
+        return getattr(self._provider_config, key, None)
+
+    def _resolve_keepalive_timeout(self) -> Optional[float]:
+        raw = self._setting("keepalive_timeout_sec")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring unparsable ElevenLabs keepalive_timeout_sec",
+                component=self.component_key,
+                value=repr(raw),
+            )
+            return None
+        return value if value > 0 else None
 
     async def start(self) -> None:
         """Initialize the adapter."""
@@ -197,7 +273,14 @@ class ElevenLabsTTSAdapter(TTSComponent):
         started_at = time.perf_counter()
         
         try:
-            async with self._session.post(url, json=payload, headers=headers, params=params) as response:
+            async with self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                params=params,
+                proxy=self._proxy_url,
+                proxy_headers=self._proxy_headers,
+            ) as response:
                 if response.status >= 400:
                     body = await response.text()
                     logger.error(
@@ -361,8 +444,23 @@ class ElevenLabsTTSAdapter(TTSComponent):
         """Ensure HTTP session exists."""
         if self._session and not self._session.closed:
             return
-        factory = self._session_factory or aiohttp.ClientSession
-        self._session = factory()
+        if self._session_factory is not None:
+            self._session = self._session_factory()
+            return
+        connector = (
+            aiohttp.TCPConnector(keepalive_timeout=self._keepalive_timeout_sec)
+            if self._keepalive_timeout_sec is not None
+            else None
+        )
+        self._session = aiohttp.ClientSession(connector=connector)
+        if self._proxy_url:
+            logger.info(
+                "ElevenLabs TTS routed through a proxy",
+                component=self.component_key,
+                proxy=self._proxy_url,
+                proxy_authenticated=self._proxy_headers is not None,
+                keepalive_timeout_sec=self._keepalive_timeout_sec,
+            )
 
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Merge runtime options with defaults."""

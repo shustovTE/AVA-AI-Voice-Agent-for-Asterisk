@@ -60,8 +60,16 @@ class _FakeHttpSession:
         self.requests = []
         self.closed = False
 
-    def post(self, url, json=None, headers=None, params=None):
-        self.requests.append({"url": url, "params": params, "json": json})
+    def post(self, url, json=None, headers=None, params=None, proxy=None, proxy_headers=None):
+        self.requests.append(
+            {
+                "url": url,
+                "params": params,
+                "json": json,
+                "proxy": proxy,
+                "proxy_headers": proxy_headers,
+            }
+        )
         return self.response
 
     async def close(self):

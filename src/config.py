@@ -571,6 +571,14 @@ class ElevenLabsProviderConfig(BaseModel):
     use_speaker_boost: bool = Field(default=True)
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
+    # Optional HTTP proxy for ElevenLabs requests only, so one foreign leg can
+    # be routed out through a tunnel while every other component stays direct.
+    # Credentials may be written into the URL: http://user:pass@host:port
+    proxy: Optional[str] = None
+    # How long an idle upstream connection is kept for reuse. Through a proxy a
+    # dropped connection costs a full TLS handshake mid-conversation, so a
+    # window longer than aiohttp's 15 s default is usually worth it.
+    keepalive_timeout_sec: Optional[float] = None
 
 
 class CambAiProviderConfig(BaseModel):
