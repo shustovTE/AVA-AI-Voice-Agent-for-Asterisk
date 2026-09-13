@@ -200,6 +200,17 @@ class EndOfTurnPolicy:
     starts once the caller has been quiet for ``end_of_turn_silence_ms``. A bare
     "yes" is therefore answered as promptly as a paragraph.
 
+    A streaming recognizer only emits a result after its own silence gate, so a
+    window measured from the result can never bridge a caller who pauses and
+    goes on: the continuation's result arrives only after they pause again.
+    With ``end_of_turn_source`` set to ``talk_detect`` (the default ``auto``
+    picks it whenever Asterisk TALK_DETECT is enabled for the pipeline) the turn
+    is instead held while Asterisk reports the caller talking and released a
+    short grace after it reports them quiet, so the silence that ends a turn is
+    measured from the caller's last sound by the same detector that drives
+    barge-in. ``pipelines.<name>`` then tunes it through
+    ``barge_in.pipeline_talk_detect_silence_ms``.
+
     The superseded ``aggregation_*`` options are still read so deployed configs
     keep working: the two window options are converted from seconds, and the
     word/character thresholds are reported in :attr:`ignored_options` for the
@@ -207,6 +218,9 @@ class EndOfTurnPolicy:
     """
 
     DEFAULT_SILENCE_MS = 700
+    DEFAULT_TALK_DETECT_GRACE_MS = 250
+    DEFAULT_TALK_DETECT_HOLD_MS = 8000
+    SOURCES = ("auto", "talk_detect", "final")
     # Superseded: a silence window in seconds, most recent first.
     LEGACY_SILENCE_KEYS = ("aggregation_silence_sec", "aggregation_timeout_sec")
     LEGACY_MAX_WAIT_KEYS = ("aggregation_max_wait_sec",)
@@ -217,7 +231,15 @@ class EndOfTurnPolicy:
         "aggregation_wait_for_silence",
     )
 
-    __slots__ = ("silence_ms", "max_wait_ms", "ignored_options", "legacy_options")
+    __slots__ = (
+        "silence_ms",
+        "max_wait_ms",
+        "source",
+        "talk_detect_grace_ms",
+        "talk_detect_hold_ms",
+        "ignored_options",
+        "legacy_options",
+    )
 
     def __init__(self, options: Any = None) -> None:
         opts = options if isinstance(options, dict) else {}
@@ -236,6 +258,24 @@ class EndOfTurnPolicy:
         if max_wait_ms is None:
             max_wait_ms = self._legacy_ms(opts, self.LEGACY_MAX_WAIT_KEYS, legacy)
         self.max_wait_ms = max(0.0, max_wait_ms or 0.0)
+
+        source = str(opts.get("end_of_turn_source") or "auto").strip().lower()
+        self.source = source if source in self.SOURCES else "auto"
+        # Grace after Asterisk reports the caller quiet (or after a result that
+        # lands while they already are), long enough for a result that is about
+        # to arrive to join the turn, short enough not to be felt.
+        grace_ms = self._as_float(opts.get("end_of_turn_talk_detect_grace_ms"), None)
+        if grace_ms is None:
+            grace_ms = float(self.DEFAULT_TALK_DETECT_GRACE_MS)
+        self.talk_detect_grace_ms = max(0.0, grace_ms)
+        # How long a pending result is held while Asterisk keeps reporting
+        # speech without any newer result. A ChannelTalkingFinished is not
+        # guaranteed to arrive, and a caller still talking produces results
+        # every phrase, so a long quiet hold means the end event was lost.
+        hold_ms = self._as_float(opts.get("end_of_turn_talk_detect_hold_ms"), None)
+        if hold_ms is None:
+            hold_ms = float(self.DEFAULT_TALK_DETECT_HOLD_MS)
+        self.talk_detect_hold_ms = max(0.0, hold_ms)
 
         self.legacy_options = tuple(legacy)
         self.ignored_options = tuple(
@@ -271,6 +311,22 @@ class EndOfTurnPolicy:
     @property
     def max_wait_sec(self) -> float:
         return self.max_wait_ms / 1000.0
+
+    @property
+    def talk_detect_grace_sec(self) -> float:
+        return self.talk_detect_grace_ms / 1000.0
+
+    @property
+    def talk_detect_hold_sec(self) -> float:
+        return self.talk_detect_hold_ms / 1000.0
+
+    def uses_talk_detect(self, talk_detect_enabled: bool) -> bool:
+        """Report whether Asterisk talk detection decides the end of turn."""
+        if self.source == "final":
+            return False
+        if self.source == "talk_detect":
+            return True
+        return bool(talk_detect_enabled)
 
     def flush_delay(self, elapsed: Optional[float] = None) -> float:
         """Return how long to wait for another result before running the turn.
@@ -701,6 +757,12 @@ class Engine:
         # Silence budget per call while gated, and how much of it is spent.
         self._pipeline_gated_silence_ms: Dict[str, float] = {}
         self._pipeline_gated_silence_used_ms: Dict[str, float] = {}
+        # Asterisk talk-detect state per pipeline call, and the event that wakes
+        # the dialog worker when it changes, so the end of a turn is decided by
+        # the caller's last sound rather than by the recognizer's last result.
+        self._pipeline_caller_talking: Dict[str, bool] = {}
+        self._pipeline_caller_talk_changed_at: Dict[str, float] = {}
+        self._pipeline_turn_wakeup: Dict[str, asyncio.Event] = {}
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -8987,6 +9049,7 @@ class Engine:
             # While listening, TALK_DETECT is direct evidence that the caller is
             # present even though there is no playback to interrupt.
             if bool(getattr(session, "audio_capture_enabled", True)) and not bool(getattr(session, "tts_playing", False)):
+                self._note_pipeline_caller_talking(call_id, True)
                 await self._no_input_note_input_state(call_id, True, "asterisk:talk_detect")
                 return
 
@@ -9023,6 +9086,7 @@ class Engine:
             if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
                 return
 
+            self._note_pipeline_caller_talking(call_id, True)
             await self._no_input_note_activity(call_id, "asterisk:talk_detect_barge_in")
 
             # The event may have entered this handler while playback was gated
@@ -9089,6 +9153,7 @@ class Engine:
                 return
             call_id = session.call_id
             logger.debug("TalkDetect finished", call_id=call_id, channel_id=channel_id)
+            self._note_pipeline_caller_talking(call_id, False)
             await self._no_input_note_input_state(call_id, False, "asterisk:talk_detect")
             
             # Explicitly flush STT adapters that support early flushing via TalkDetect
@@ -9538,6 +9603,9 @@ class Engine:
             self._resample_state_pipeline16k.pop(call_id, None)
             self._pipeline_gated_silence_ms.pop(call_id, None)
             self._pipeline_gated_silence_used_ms.pop(call_id, None)
+            self._pipeline_caller_talking.pop(call_id, None)
+            self._pipeline_caller_talk_changed_at.pop(call_id, None)
+            self._pipeline_turn_wakeup.pop(call_id, None)
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -11354,6 +11422,24 @@ class Engine:
             return ok
         except Exception:
             return False
+
+    def _note_pipeline_caller_talking(self, call_id: str, talking: bool) -> None:
+        """Record Asterisk's talk-detect state and wake the dialog worker.
+
+        Tolerates an engine built without __init__ (tests construct handlers
+        that way), so a talk event can never break the watchdog path it shares.
+        """
+        talking_map = getattr(self, "_pipeline_caller_talking", None)
+        if talking_map is None:
+            talking_map = self._pipeline_caller_talking = {}
+        changed_map = getattr(self, "_pipeline_caller_talk_changed_at", None)
+        if changed_map is None:
+            changed_map = self._pipeline_caller_talk_changed_at = {}
+        talking_map[call_id] = bool(talking)
+        changed_map[call_id] = time.monotonic()
+        event = (getattr(self, "_pipeline_turn_wakeup", None) or {}).get(call_id)
+        if event is not None:
+            event.set()
 
     def _feed_pipeline_silence(self, call_id: str, pcm_bytes: bytes, pcm_rate: int) -> None:
         """Replace a gated frame with silence instead of dropping it.
@@ -15407,10 +15493,16 @@ class Engine:
                 pending_started_at: Optional[float] = None
                 pending_deadline: Optional[float] = None
                 end_of_turn = EndOfTurnPolicy(pipeline.llm_options)
+                wakeup = asyncio.Event()
+                self._pipeline_turn_wakeup[call_id] = wakeup
+                last_final_at: Optional[float] = None
                 logger.info(
                     "Pipeline end-of-turn policy resolved",
                     call_id=call_id,
+                    source=end_of_turn.source,
                     silence_ms=end_of_turn.silence_ms,
+                    talk_detect_grace_ms=end_of_turn.talk_detect_grace_ms,
+                    talk_detect_hold_ms=end_of_turn.talk_detect_hold_ms,
                     max_wait_ms=end_of_turn.max_wait_ms or None,
                     legacy_options=list(end_of_turn.legacy_options) or None,
                 )
@@ -16691,19 +16783,30 @@ class Engine:
                                             exc_info=True,
                                         )
 
+                def talk_detect_driven() -> bool:
+                    """Whether Asterisk talk detection decides the end of this turn."""
+                    try:
+                        td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
+                        enabled = bool(td.get("enabled", False))
+                    except Exception:
+                        enabled = False
+                    return end_of_turn.uses_talk_detect(enabled)
+
                 async def flush_pending() -> None:
                     """Hand everything the caller has said so far to the LLM."""
-                    nonlocal pending_segments, pending_started_at, pending_deadline
+                    nonlocal pending_segments, pending_started_at, pending_deadline, last_final_at
                     aggregated = " ".join(pending_segments).strip()
                     segments = len(pending_segments)
                     pending_segments.clear()
                     pending_deadline = None
+                    last_final_at = None
                     started_at, pending_started_at = pending_started_at, None
                     if not aggregated:
                         return
                     logger.info(
                         "Caller turn ended on silence",
                         call_id=call_id,
+                        source="talk_detect" if talk_detect_driven() else "final",
                         segments=segments,
                         waited_sec=round(time.monotonic() - started_at, 3)
                         if started_at is not None
@@ -16715,31 +16818,63 @@ class Engine:
                     )
                     await run_turn(aggregated)
 
-                def arm_deadline() -> None:
-                    """(Re)start the silence window that must elapse before the turn."""
-                    nonlocal pending_deadline
-                    now = time.monotonic()
-                    elapsed = (
-                        now - pending_started_at
-                        if pending_started_at is not None
-                        else None
-                    )
-                    pending_deadline = now + end_of_turn.flush_delay(elapsed)
+                def reevaluate() -> None:
+                    """Recompute when the pending text may become a turn.
 
+                    Driven by talk detection the turn is held while Asterisk
+                    reports the caller talking and released a short grace after
+                    it reports them quiet. Otherwise the legacy window since the
+                    last result applies.
+                    """
+                    nonlocal pending_deadline
+                    if not pending_segments:
+                        pending_deadline = None
+                        return
+                    now = time.monotonic()
+                    if talk_detect_driven():
+                        talking = self._pipeline_caller_talking.get(call_id, False)
+                        changed_at = self._pipeline_caller_talk_changed_at.get(call_id, 0.0)
+                        anchor = last_final_at if last_final_at is not None else now
+                        if talking:
+                            deadline = anchor + end_of_turn.talk_detect_hold_sec
+                        else:
+                            deadline = max(anchor, changed_at) + end_of_turn.talk_detect_grace_sec
+                    else:
+                        deadline = now + end_of_turn.silence_sec
+                    if end_of_turn.max_wait_ms > 0 and pending_started_at is not None:
+                        deadline = min(deadline, pending_started_at + end_of_turn.max_wait_sec)
+                    pending_deadline = deadline
+
+                get_task: Optional[asyncio.Task] = None
                 try:
                     while True:
+                        if get_task is None:
+                            get_task = asyncio.ensure_future(transcript_queue.get())
+                        timeout = None
                         if pending_segments and pending_deadline is not None:
                             timeout = max(0.0, pending_deadline - time.monotonic())
-                            try:
-                                transcript = await asyncio.wait_for(
-                                    transcript_queue.get(), timeout=timeout
-                                )
-                            except asyncio.TimeoutError:
-                                # The caller stopped talking: release the turn.
-                                await flush_pending()
-                                continue
+                        wake_task = asyncio.ensure_future(wakeup.wait())
+                        done, _ = await asyncio.wait(
+                            {get_task, wake_task},
+                            timeout=timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if wake_task in done:
+                            wakeup.clear()
                         else:
-                            transcript = await transcript_queue.get()
+                            wake_task.cancel()
+                        if get_task in done:
+                            transcript = get_task.result()
+                            get_task = None
+                        elif wake_task in done:
+                            # The caller started or stopped talking.
+                            if talk_detect_driven():
+                                reevaluate()
+                            continue
+                        else:
+                            # Quiet for long enough: release the turn.
+                            await flush_pending()
+                            continue
                         if transcript is None:
                             await flush_pending()
                             break
@@ -16751,16 +16886,19 @@ class Engine:
                         await self._no_input_note_activity(call_id, "pipeline:transcript")
                         await self._no_input_note_processing(call_id, True)
                         pending_segments.append(normalized)
+                        last_final_at = time.monotonic()
                         if pending_started_at is None:
-                            pending_started_at = time.monotonic()
-                        # Restart the silence window; the turn starts only once
-                        # the caller actually stops talking.
-                        arm_deadline()
+                            pending_started_at = last_final_at
+                        reevaluate()
                         logger.debug(
                             "Waiting for caller silence before LLM turn",
                             call_id=call_id,
                             segments=len(pending_segments),
-                            silence_ms=end_of_turn.silence_ms,
+                            source="talk_detect" if talk_detect_driven() else "final",
+                            caller_talking=self._pipeline_caller_talking.get(call_id, False),
+                            deadline_in_ms=round((pending_deadline - time.monotonic()) * 1000)
+                            if pending_deadline is not None
+                            else None,
                         )
                 except asyncio.CancelledError:
                     pass
@@ -16772,6 +16910,11 @@ class Engine:
                         exc_info=True,
                     )
                     raise
+                finally:
+                    if get_task is not None and not get_task.done():
+                        get_task.cancel()
+                    if self._pipeline_turn_wakeup.get(call_id) is wakeup:
+                        self._pipeline_turn_wakeup.pop(call_id, None)
 
             async def dialog_supervisor() -> None:
                 restart_count = 0

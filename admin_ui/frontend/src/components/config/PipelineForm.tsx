@@ -437,7 +437,7 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                     <div>
                         <h4 className="text-sm font-medium text-foreground">End of Turn</h4>
                         <p className="text-xs text-muted-foreground">
-                            Streaming STT returns a result at every phrase boundary, so the caller's turn ends on silence. Every new result restarts the window, which keeps a long sentence one turn instead of answering the caller partway through it.
+                            Streaming STT returns a result only after its own silence gate, so a window measured from the result cannot bridge a caller who pauses and goes on. With Asterisk TALK_DETECT enabled for the pipeline, the same events that drive barge-in decide the end of the turn: it is held while Asterisk hears the caller and released a short grace after they go quiet, so the silence that ends a turn is tuned under Barge-In as the talk-detect silence.
                         </p>
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -470,6 +470,41 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                             }}
                             placeholder="Off"
                             tooltip="Hard cap measured from the caller's first result, so someone who never pauses still gets an answer. Empty or 0 disables the cap, which is the default."
+                        />
+                        <FormSelect
+                            label="End of Turn Source"
+                            value={localConfig.options?.llm?.end_of_turn_source ?? ''}
+                            onChange={(e) => {
+                                const v = String(e.target.value || '');
+                                if (!v) {
+                                    const next = { ...(localConfig.options?.llm || {}) };
+                                    delete next.end_of_turn_source;
+                                    setRoleOptions('llm', next);
+                                    return;
+                                }
+                                updateRoleOptions('llm', { end_of_turn_source: v });
+                            }}
+                            tooltip="Auto follows the pipeline's TALK_DETECT flag: Asterisk talk detection when it is enabled, the silence window after each result otherwise. Pin either explicitly."
+                            options={[
+                                { value: '', label: 'Auto (default)' },
+                                { value: 'talk_detect', label: 'Asterisk talk detection' },
+                                { value: 'final', label: 'Silence window after each result' },
+                            ]}
+                        />
+                        <FormInput
+                            label="Talk-Detect Grace (ms)"
+                            type="number"
+                            min={0}
+                            step={50}
+                            value={localConfig.options?.llm?.end_of_turn_talk_detect_grace_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="250"
+                            tooltip="Grace after Asterisk reports the caller quiet, or after a result that lands while they already are. Long enough for a result that is about to arrive to join the turn, short enough not to be felt. Only used when talk detection decides the end of turn."
                         />
                     </div>
                 </div>

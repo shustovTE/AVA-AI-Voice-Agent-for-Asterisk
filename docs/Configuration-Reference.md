@@ -76,6 +76,33 @@ the accumulated text goes to the LLM once the caller has been quiet for it.
   measured from the caller's first pending result, so someone who never pauses
   still gets an answer. Unset or `0` disables the cap, which is the default.
 
+A window measured from the recognizer's result has a blind spot: a streaming
+recognizer emits a result only after its own silence gate (T-one holds 600 ms),
+so a caller who pauses and then goes on can never be bridged — the
+continuation's result arrives only after they pause again. With Asterisk
+`TALK_DETECT` enabled for the pipeline (`barge_in.pipeline_talk_detect_enabled`),
+the same events that trigger barge-in decide the end of the turn instead: the
+turn is held while Asterisk reports the caller talking and released a short
+grace after it reports them quiet, so the silence that ends a turn is measured
+from the caller's last sound. The silence itself is then tuned with
+`barge_in.pipeline_talk_detect_silence_ms` (800-1000 ms suits a caller who
+thinks aloud; every value is also the latency before an answer).
+
+- `pipelines.<name>.options.llm.end_of_turn_source`: `auto` (default; talk
+  detection whenever it is enabled for the pipeline, the result window
+  otherwise), `talk_detect`, or `final` to pin the result window.
+- `pipelines.<name>.options.llm.end_of_turn_talk_detect_grace_ms`: grace after
+  Asterisk reports the caller quiet, or after a result that lands while they
+  already are. Defaults to `250`: long enough for a result that is about to
+  arrive to join the turn, short enough not to be felt.
+- `pipelines.<name>.options.llm.end_of_turn_talk_detect_hold_ms`: how long a
+  pending result is held while Asterisk keeps reporting speech without any
+  newer result. Defaults to `8000`. A `ChannelTalkingFinished` is not
+  guaranteed to arrive, and a caller still talking produces a result every
+  phrase, so a long quiet hold means the end event was lost.
+
+Every `Caller turn ended on silence` line reports which `source` decided it.
+
 Length no longer decides anything, so a one-word "yes" is answered as promptly
 as a paragraph. Every turn is logged as `Caller turn ended on silence` with the
 number of merged results and how long the caller was given.
