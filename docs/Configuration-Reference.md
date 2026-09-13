@@ -149,6 +149,19 @@ window and `aggregation_max_wait_sec` as the cap, all converted from seconds.
 `Ignoring superseded transcript aggregation options` — the word and character
 thresholds are what answered callers mid-sentence.
 
+### Pipeline Reply Length
+
+A reply that stops mid-sentence or mid-word without any barge-in in the log
+was cut by the LLM's token limit, not by turn-taking: the endpoint returns
+`finish_reason: length` and the engine speaks what it got. Every
+OpenAI-compatible LLM adapter (`openai`, `native_llm`, Mistral, Groq and the
+other Chat Completions endpoints) now logs `LLM reply cut by max_tokens` with
+the `max_tokens` in force and the length of the cut reply, and `finish_reason`
+on every completed request. Raise `pipelines.<name>.options.llm.max_tokens`
+(the sample config ships `200`, which is short for a Russian reply with a list
+in it), or have the prompt ask for shorter, list-free answers, which also read
+better through TTS.
+
 ### Pipeline Gated Audio
 
 While the agent speaks, the caller's frames are withheld so the agent cannot

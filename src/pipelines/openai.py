@@ -555,12 +555,15 @@ class OpenAILLMAdapter(LLMComponent):
                     message = choices[0].get("message") or {}
                     content = message.get("content", "")
                     tool_calls = message.get("tool_calls") or []
+                    finish_reason = choices[0].get("finish_reason")
+                    self._note_finish_reason(call_id, finish_reason, payload, len(content or ""))
                     
                     # Log response
                     log_ctx = {
                         "call_id": call_id,
                         "model": payload.get("model"),
                         "preview": (content or "")[:80],
+                        "finish_reason": finish_reason,
                     }
                     if tool_calls:
                         log_ctx["tool_calls"] = len(tool_calls)
@@ -711,6 +714,8 @@ class OpenAILLMAdapter(LLMComponent):
 
         # Accumulate tool call deltas across chunks
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
+        finish_reason: Optional[str] = None
+        generated_chars = 0
 
         try:
             async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
@@ -730,9 +735,12 @@ class OpenAILLMAdapter(LLMComponent):
                         chunk = json.loads(data_str)
                         choices = chunk.get("choices", [])
                         if choices:
+                            if choices[0].get("finish_reason"):
+                                finish_reason = str(choices[0]["finish_reason"])
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
+                                generated_chars += len(content)
                                 yield content
 
                             # Accumulate tool call deltas
@@ -755,6 +763,8 @@ class OpenAILLMAdapter(LLMComponent):
                                     entry["arguments"] += func["arguments"]
                     except json.JSONDecodeError:
                         continue
+
+            self._note_finish_reason(call_id, finish_reason, payload, generated_chars)
 
             # Parse accumulated tool calls
             if _tool_call_accum:
@@ -786,6 +796,36 @@ class OpenAILLMAdapter(LLMComponent):
             )
         except aiohttp.ClientError as e:
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
+
+    @staticmethod
+    def _note_finish_reason(
+        call_id: str, finish_reason: Optional[str], payload: Dict[str, Any], chars: int
+    ) -> None:
+        """Make a reply the endpoint cut short visible.
+
+        A reply that stops on ``max_tokens`` is spoken to the caller as it
+        is, ending mid-sentence or mid-word, and nothing else in the call
+        distinguishes that from a deliberate short answer. It is the only
+        finish reason worth a warning: a natural stop and a tool call are
+        the normal outcomes.
+        """
+        if finish_reason == "length":
+            logger.warning(
+                "LLM reply cut by max_tokens",
+                call_id=call_id,
+                model=payload.get("model"),
+                max_tokens=payload.get("max_tokens"),
+                chars=chars,
+                hint="raise max_tokens in the pipeline's LLM options or the provider block, or ask the prompt for shorter replies",
+            )
+            return
+        if finish_reason not in (None, "stop", "tool_calls", "function_call"):
+            logger.info(
+                "LLM reply ended early",
+                call_id=call_id,
+                finish_reason=finish_reason,
+                chars=chars,
+            )
 
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:

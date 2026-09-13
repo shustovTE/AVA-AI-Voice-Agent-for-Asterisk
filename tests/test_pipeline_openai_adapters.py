@@ -9,6 +9,7 @@ import pytest
 
 from src.audio.resampler import convert_pcm16le_to_target_format
 from src.config import AppConfig, OpenAIProviderConfig
+from src.pipelines import openai as openai_module
 from src.pipelines.openai import OpenAISTTAdapter, OpenAILLMAdapter, OpenAITTSAdapter
 from src.pipelines.orchestrator import PipelineOrchestrator
 from src.tools.base import ToolPhase
@@ -342,3 +343,120 @@ async def test_pipeline_orchestrator_registers_openai_adapters():
     assert isinstance(resolution.llm_adapter, OpenAILLMAdapter)
     assert isinstance(resolution.tts_adapter, OpenAITTSAdapter)
     assert resolution.tts_options["format"]["encoding"] == "mulaw"
+
+
+class _LinesStream:
+    """An SSE body: yields the given lines as the aiohttp content iterator would."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
+
+
+def _sse(chunk: dict) -> bytes:
+    return ("data: " + json.dumps(chunk) + "\n").encode("utf-8")
+
+
+def _capture_logs(monkeypatch, level: str):
+    calls = []
+    monkeypatch.setattr(
+        openai_module.logger, level, lambda event, **kw: calls.append((event, kw))
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_warns_when_the_reply_is_cut_by_max_tokens(monkeypatch):
+    """A reply that stops on max_tokens is spoken mid-sentence; the log must say so."""
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    lines = [
+        _sse({"choices": [{"delta": {"content": "Если "}, "finish_reason": None}]}),
+        _sse({"choices": [{"delta": {"content": "хотите"}, "finish_reason": None}]}),
+        _sse({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+        b"data: [DONE]\n",
+    ]
+    fake_session = _FakeStreamingSession(_LinesStream(lines))
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False, "max_tokens": 200},
+        session_factory=lambda: fake_session,
+    )
+    warnings = _capture_logs(monkeypatch, "warning")
+
+    await adapter.start()
+    chunks = [chunk async for chunk in adapter.generate_stream("call-1", "hello", {}, {})]
+
+    assert "".join(chunks) == "Если хотите"
+    cut = [kw for event, kw in warnings if event == "LLM reply cut by max_tokens"]
+    assert len(cut) == 1
+    assert cut[0]["max_tokens"] == 200
+    assert cut[0]["chars"] == len("Если хотите")
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_stays_quiet_on_a_natural_stop(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    lines = [
+        _sse({"choices": [{"delta": {"content": "Готово."}, "finish_reason": None}]}),
+        _sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        b"data: [DONE]\n",
+    ]
+    fake_session = _FakeStreamingSession(_LinesStream(lines))
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+    warnings = _capture_logs(monkeypatch, "warning")
+
+    await adapter.start()
+    chunks = [chunk async for chunk in adapter.generate_stream("call-1", "hello", {}, {})]
+
+    assert "".join(chunks) == "Готово."
+    assert not [kw for event, kw in warnings if event == "LLM reply cut by max_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_generate_warns_when_the_reply_is_cut_by_max_tokens(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps(
+        {
+            "choices": [
+                {"message": {"content": "входная дверь, ме"}, "finish_reason": "length"}
+            ]
+        }
+    ).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False, "max_tokens": 150},
+        session_factory=lambda: fake_session,
+    )
+    warnings = _capture_logs(monkeypatch, "warning")
+    infos = _capture_logs(monkeypatch, "info")
+
+    await adapter.start()
+    response = await adapter.generate("call-1", "hello", {}, {})
+
+    assert response.text == "входная дверь, ме"
+    cut = [kw for event, kw in warnings if event == "LLM reply cut by max_tokens"]
+    assert len(cut) == 1
+    assert cut[0]["max_tokens"] == 150
+    received = [kw for event, kw in infos if event == "OpenAI chat completion received"]
+    assert received and received[0]["finish_reason"] == "length"
