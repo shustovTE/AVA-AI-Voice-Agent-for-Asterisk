@@ -418,6 +418,89 @@ const VADPage = () => {
             </ConfigSection>
 
             <ConfigSection
+                title="Smart Turn (pipelines)"
+                description="The semantic layer above Silero VAD: when the caller goes quiet, Smart Turn v3 scores their audio for whether the turn is complete. An incomplete verdict holds the turn a while longer so a caller who is thinking is not answered mid-thought."
+            >
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormSwitch
+                                label="Enable Smart Turn"
+                                description="Judge every Silero stop with Smart Turn v3.2 (ONNX, CPU, about 50 ms)."
+                                tooltip="Needs Silero VAD enabled: it runs on Silero's stop events and on the caller audio Silero already sees. Audio-native (prosody and content, no transcript), 23 languages including Russian. Off, turns end on Silero alone."
+                                checked={vadConfig.smart_turn_enabled ?? false}
+                                onChange={(e) => updateVADConfig('smart_turn_enabled', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Completion Threshold"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.smart_turn_threshold ?? 0.5}
+                                onChange={(e) => updateVADConfig('smart_turn_threshold', parseFloat(e.target.value))}
+                                tooltip="Probability of completion at or above which the turn is released at once (0–1). Lower answers sooner and risks cutting a thinking caller; higher waits more often."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Model Path"
+                                type="text"
+                                value={vadConfig.smart_turn_model_path ?? 'models/turn/smart-turn-v3.2-cpu.onnx'}
+                                onChange={(e) => updateVADConfig('smart_turn_model_path', e.target.value)}
+                                tooltip="Path of the Smart Turn ONNX file inside the engine container; ./models is mounted at /app/models. scripts/fetch_smart_turn.sh downloads the pinned release there."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormSwitch
+                                label="Auto-Download Model"
+                                description="Fetch the pinned model on first start when the file is missing."
+                                tooltip="Downloads Smart Turn v3.2 (about 8 MB) from the pipecat-ai release on Hugging Face and verifies its SHA-256. Turn off on hosts without outbound access and run scripts/fetch_smart_turn.sh instead."
+                                checked={vadConfig.smart_turn_auto_download ?? true}
+                                onChange={(e) => updateVADConfig('smart_turn_auto_download', e.target.checked)}
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Incomplete Hold (ms)"
+                                type="number"
+                                min="0"
+                                step="250"
+                                value={vadConfig.smart_turn_incomplete_hold_ms ?? 3000}
+                                onChange={(e) => updateVADConfig('smart_turn_incomplete_hold_ms', parseInt(e.target.value))}
+                                tooltip="How long an incomplete verdict may hold the turn past the Silero stop. If the caller goes on, the next stop is judged again on the whole turn; if not, the turn is released when this runs out."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormInput
+                                label="Trailing Silence (ms)"
+                                type="number"
+                                min="0"
+                                step="50"
+                                value={vadConfig.smart_turn_trailing_silence_ms ?? 200}
+                                onChange={(e) => updateVADConfig('smart_turn_trailing_silence_ms', parseInt(e.target.value))}
+                                tooltip="How much of the silence after the caller's last speech the model is shown. The reference integration ends the audio about 200 ms after speech; the rest of the Silero stop window is trimmed."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormInput
+                                label="Verdict Timeout (ms)"
+                                type="number"
+                                min="0"
+                                step="50"
+                                value={vadConfig.smart_turn_timeout_ms ?? 500}
+                                onChange={(e) => updateVADConfig('smart_turn_timeout_ms', parseInt(e.target.value))}
+                                tooltip="How long the turn waits for a verdict at most. Inference takes tens of milliseconds; the bound only matters on an overloaded host."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
+            <ConfigSection
                 title="Caller Inactivity"
                 description="Check that a silent inbound caller is still present, then end abandoned calls cleanly."
             >

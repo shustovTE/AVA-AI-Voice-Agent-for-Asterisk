@@ -104,7 +104,9 @@ thinks aloud; every value is also the latency before an answer).
   phrase, so a long quiet hold means the end event was lost.
 
 With Silero VAD enabled (see [Silero VAD](#silero-vad-pipelines) below) the
-engine's own neural detector takes that role: the turn is held while Silero
+engine's own neural detector takes that role, and with
+[Smart Turn](#smart-turn-pipelines) on top an incomplete thought holds the
+turn beyond the stop: the turn is held while Silero
 reports the caller talking and released `end_of_turn_talk_detect_grace_ms`
 after it reports them quiet, so the pause a caller may take is
 `vad.silero_stop_ms` plus that grace. Because the detector runs in the engine,
@@ -668,6 +670,56 @@ providers are not affected.
 Every call logs `Silero VAD tracking caller speech` at start; each end of
 speech logs `Silero VAD: caller quiet` at debug level with whether a finalize
 burst was sent and whether a result is still expected.
+
+### Smart Turn (pipelines)
+
+A voice-activity detector knows that the caller's sound stopped, not whether
+their thought did: «я хочу…» followed by a pause reads exactly like «да».
+[Smart Turn v3](https://github.com/pipecat-ai/smart-turn) (pipecat-ai,
+BSD-2) is an audio-native turn detector, a Whisper Tiny encoder with a linear
+head (8M parameters, 8 MB int8 ONNX) that scores the caller's own audio for
+whether the turn is complete from prosody and content rather than from a
+transcript, for 23 languages including Russian, in about 50 ms on one CPU
+core. The engine runs it in-process, on the caller audio Silero VAD already
+sees, whenever Silero reports the caller quiet; feature extraction is a numpy
+re-implementation of the Whisper front end validated against
+`transformers`, so nothing beyond `onnxruntime` is needed.
+
+The verdict slots into the end-of-turn policy: `complete` (probability at or
+above `vad.smart_turn_threshold`) changes nothing, the turn is released after
+the grace as before; `incomplete` holds it up to
+`vad.smart_turn_incomplete_hold_ms` past the stop, and a caller who goes on
+is judged again on the whole turn at the next stop, as in the Pipecat
+reference integration. A verdict still being computed holds the turn at most
+`vad.smart_turn_timeout_ms`. The recognizer is finalized at the stop either
+way, so the transcript is ready the moment the turn is released.
+
+- `vad.smart_turn_enabled`: `true`/`false` (default `false`). Requires
+  `vad.silero_enabled`; without Silero it stays off with an error at start.
+- `vad.smart_turn_model_path`: path of the ONNX file inside the engine
+  container (default `models/turn/smart-turn-v3.2-cpu.onnx`).
+- `vad.smart_turn_auto_download`: fetch the pinned v3.2 CPU build (SHA-256
+  verified) from the pipecat-ai Hugging Face release on first start when the
+  file is missing (default `true`); `scripts/fetch_smart_turn.sh` does the
+  same from the host.
+- `vad.smart_turn_threshold`: completion probability that releases the turn
+  at once (default `0.5`).
+- `vad.smart_turn_incomplete_hold_ms`: how long an incomplete verdict may
+  hold the turn past the Silero stop (default `3000`).
+- `vad.smart_turn_trailing_silence_ms`: how much of the silence after the
+  caller's last speech the model is shown (default `200`); the rest of the
+  Silero stop window is trimmed, matching the reference integration's VAD.
+- `vad.smart_turn_timeout_ms`: how long the turn waits for a verdict at most
+  (default `500`).
+- `vad.smart_turn_threads`: CPU threads for one inference (default `1`).
+
+Every judged stop logs `Smart Turn verdict` with `complete`, `probability`,
+`audio_ms` and `inference_ms`, and `Caller turn ended on silence` carries
+`turn_verdict` (`complete`, `incomplete` when the hold ran out, `pending`
+when the timeout did) and `turn_probability`. Telephony audio is 8 kHz
+upsampled with a proper low-pass to the model's 16 kHz; the model was trained
+on wideband speech, so judge its accuracy on your own recordings before
+raising the hold, and lower `vad.silero_stop_ms` only once it earns trust.
 
 ## Caller inactivity (`no_input`)
 

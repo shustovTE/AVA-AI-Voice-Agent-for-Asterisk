@@ -20,16 +20,15 @@ needed.
 
 from __future__ import annotations
 
-import hashlib
 import os
-import tempfile
 import threading
 import time
-import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import structlog
+
+from . import model_fetch
 
 try:  # pragma: no cover - exercised through the availability flag
     import onnxruntime as _onnxruntime  # pyright: ignore[reportMissingImports]
@@ -281,11 +280,7 @@ class SileroCallerTracker:
 
 
 def sha256_of_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return model_fetch.sha256_of_file(path)
 
 
 def download_model(
@@ -297,40 +292,14 @@ def download_model(
     opener: Optional[Callable[..., Any]] = None,
 ) -> str:
     """Fetch the pinned model into ``path`` atomically, verifying its SHA-256."""
-    url = url or SILERO_VAD_MODEL_URL
-    sha256 = sha256 or SILERO_VAD_MODEL_SHA256
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    try:
-        os.makedirs(directory, exist_ok=True)
-    except OSError as exc:
-        raise SileroVadError(
-            f"cannot create {directory} for the Silero VAD model: {exc}"
-        ) from exc
-    open_url = opener or urllib.request.urlopen
-    fd, temp_path = tempfile.mkstemp(prefix=".silero_vad.", suffix=".part", dir=directory)
-    try:
-        digest = hashlib.sha256()
-        with os.fdopen(fd, "wb") as out:
-            with open_url(url, timeout=timeout) as response:
-                for block in iter(lambda: response.read(1 << 16), b""):
-                    out.write(block)
-                    digest.update(block)
-        actual = digest.hexdigest()
-        if actual != sha256:
-            raise SileroVadError(
-                f"Silero VAD download from {url} has sha256 {actual}, expected {sha256}"
-            )
-        os.replace(temp_path, path)
-    except SileroVadError:
-        raise
-    except Exception as exc:
-        raise SileroVadError(f"Silero VAD download from {url} failed: {exc}") from exc
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-    return path
+    return model_fetch.download_file(
+        path,
+        url=url or SILERO_VAD_MODEL_URL,
+        sha256=sha256 or SILERO_VAD_MODEL_SHA256,
+        timeout=timeout,
+        opener=opener,
+        error=SileroVadError,
+    )
 
 
 def ensure_model_file(
@@ -346,32 +315,18 @@ def ensure_model_file(
     deployment can drop in a different Silero build on purpose; the mismatch
     is logged because a truncated copy would otherwise be hard to tell apart.
     """
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        try:
-            actual = sha256_of_file(path)
-        except OSError as exc:
-            raise SileroVadError(f"cannot read the Silero VAD model at {path}: {exc}") from exc
-        if actual != SILERO_VAD_MODEL_SHA256:
-            logger.warning(
-                "Silero VAD model file is not the pinned release",
-                path=path,
-                sha256=actual,
-                pinned_version=SILERO_VAD_VERSION,
-                pinned_sha256=SILERO_VAD_MODEL_SHA256,
-            )
-        return path
-    if not auto_download:
-        raise SileroVadError(
-            f"Silero VAD model not found at {path}; run {FETCH_SCRIPT} or set "
-            "vad.silero_auto_download: true"
-        )
-    logger.info(
-        "Fetching the Silero VAD model",
-        path=path,
+    return model_fetch.ensure_file(
+        path,
         url=SILERO_VAD_MODEL_URL,
+        sha256=SILERO_VAD_MODEL_SHA256,
         version=SILERO_VAD_VERSION,
+        auto_download=auto_download,
+        timeout=timeout,
+        opener=opener,
+        fetch_hint=f"run {FETCH_SCRIPT} or set vad.silero_auto_download: true",
+        error=SileroVadError,
+        label="Silero VAD model",
     )
-    return download_model(path, timeout=timeout, opener=opener)
 
 
 _MODEL_CACHE: Dict[str, SileroVadModel] = {}

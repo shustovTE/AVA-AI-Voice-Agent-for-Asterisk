@@ -87,6 +87,15 @@ from .core.silero_vad import (
     ensure_model_file as ensure_silero_model_file,
     load_model as load_silero_model,
 )
+from .core.smart_turn import (
+    DEFAULT_MODEL_PATH as SMART_TURN_DEFAULT_MODEL_PATH,
+    SMART_TURN_VERSION,
+    SmartTurnError,
+    SmartTurnModel,
+    TurnAudioBuffer,
+    ensure_model_file as ensure_smart_turn_model_file,
+    load_model as load_smart_turn_model,
+)
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
@@ -821,6 +830,14 @@ class Engine:
         self._silero_trackers: Dict[str, SileroCallerTracker] = {}
         self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
         self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
+        # Smart Turn: the shared model (loaded in start()), the caller's
+        # recent audio per pipeline call, and per call the verdict for the
+        # current stop or the analysis still running for it.
+        self._smart_turn_model: Optional[SmartTurnModel] = None
+        self._turn_audio: Dict[str, TurnAudioBuffer] = {}
+        self._pipeline_turn_verdict: Dict[str, Dict[str, Any]] = {}
+        self._pipeline_turn_verdict_pending: Dict[str, Dict[str, Any]] = {}
+        self._smart_turn_settings: Dict[str, Any] = self._read_smart_turn_settings(config)
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -1119,8 +1136,9 @@ class Engine:
         # 1) Load providers first (low risk)
         await self._load_providers()
 
-        # Silero VAD, when enabled, before the first call can need it.
+        # Silero VAD and Smart Turn, when enabled, before the first call can need them.
         await self._init_silero_vad()
+        await self._init_smart_turn()
         
         # Initialize tool calling system
         try:
@@ -9672,6 +9690,9 @@ class Engine:
             self._pipeline_last_final_at.pop(call_id, None)
             self._silero_trackers.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
+            self._turn_audio.pop(call_id, None)
+            self._pipeline_turn_verdict.pop(call_id, None)
+            self._pipeline_turn_verdict_pending.pop(call_id, None)
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -11618,6 +11639,9 @@ class Engine:
                 rate = PIPELINE_STT_SAMPLE_RATE_HZ
             except (TypeError, ValueError, IndexError, ZeroDivisionError):
                 return
+        buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+        if buffer is not None:
+            buffer.append(pcm16, rate)
         try:
             events = tracker.feed(pcm16, rate)
         except Exception:
@@ -11635,6 +11659,9 @@ class Engine:
         """The caller started talking: hold the turn, wake the watchdog, barge in."""
         call_id = session.call_id
         self._note_pipeline_caller_talking(call_id, True, source="vad")
+        # The caller went on: whatever Smart Turn said about the last stop no
+        # longer applies, and the next stop is judged on the whole turn.
+        self._discard_turn_verdict(call_id)
         listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
             getattr(session, "tts_playing", False)
         )
@@ -11715,8 +11742,10 @@ class Engine:
             finalize_requested = self._request_pipeline_stt_finalize(call_id, expect_result=expect_result)
         self._note_pipeline_caller_talking(call_id, False, source="vad")
         await self._no_input_note_input_state(call_id, False, "engine:silero_vad")
+        analysis_requested = self._schedule_turn_analysis(call_id)
         logger.debug(
             "Silero VAD: caller quiet",
+            smart_turn=analysis_requested,
             call_id=call_id,
             source=source,
             segment_ms=round(tracker.segment_ms),
@@ -11760,6 +11789,186 @@ class Engine:
         expected = getattr(self, "_pipeline_stt_final_expected_at", None)
         if expected:
             expected.pop(call_id, None)
+
+    # ------------------------------------------------------------------
+    # Smart Turn: is the caller done, or only pausing?
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_smart_turn_settings(config: Any) -> Dict[str, Any]:
+        vad_cfg = getattr(config, "vad", None)
+
+        def _get(name: str, default: Any) -> Any:
+            value = getattr(vad_cfg, name, None) if vad_cfg is not None else None
+            return default if value is None else value
+
+        return {
+            "enabled": bool(_get("smart_turn_enabled", False)),
+            "model_path": str(
+                _get("smart_turn_model_path", SMART_TURN_DEFAULT_MODEL_PATH) or SMART_TURN_DEFAULT_MODEL_PATH
+            ),
+            "auto_download": bool(_get("smart_turn_auto_download", True)),
+            "threshold": float(_get("smart_turn_threshold", 0.5)),
+            "incomplete_hold_ms": int(_get("smart_turn_incomplete_hold_ms", 3000)),
+            "trailing_silence_ms": int(_get("smart_turn_trailing_silence_ms", 200)),
+            "timeout_ms": int(_get("smart_turn_timeout_ms", 500)),
+            "threads": int(_get("smart_turn_threads", 1)),
+        }
+
+    def _smart_turn_config(self) -> Dict[str, Any]:
+        settings = getattr(self, "_smart_turn_settings", None)
+        if not settings:
+            settings = self._smart_turn_settings = self._read_smart_turn_settings(getattr(self, "config", None))
+        return settings
+
+    async def _init_smart_turn(self) -> None:
+        """Load the Smart Turn model when ``vad.smart_turn_enabled``.
+
+        It rides on Silero VAD for the stop events and the audio, so without
+        Silero it stays off with an error rather than a silent no-op.
+        """
+        settings = self._smart_turn_config()
+        if not settings["enabled"]:
+            return
+        if getattr(self, "_silero_model", None) is None:
+            logger.error(
+                "Smart Turn needs Silero VAD; enable vad.silero_enabled (and check its model loaded)",
+            )
+            return
+        path = settings["model_path"]
+        try:
+            resolved = await asyncio.to_thread(
+                ensure_smart_turn_model_file, path, auto_download=settings["auto_download"]
+            )
+            self._smart_turn_model = await asyncio.to_thread(
+                load_smart_turn_model, resolved, threads=settings["threads"]
+            )
+        except SmartTurnError as exc:
+            self._smart_turn_model = None
+            logger.error("Smart Turn unavailable; turns end on Silero VAD alone", error=str(exc), path=path)
+            return
+        except Exception:
+            self._smart_turn_model = None
+            logger.error("Smart Turn failed to load", path=path, exc_info=True)
+            return
+        logger.info(
+            "Smart Turn enabled",
+            version=SMART_TURN_VERSION,
+            path=resolved,
+            threshold=settings["threshold"],
+            incomplete_hold_ms=settings["incomplete_hold_ms"],
+            trailing_silence_ms=settings["trailing_silence_ms"],
+            timeout_ms=settings["timeout_ms"],
+        )
+
+    def _smart_turn_active(self, call_id: str) -> bool:
+        """Whether Smart Turn judges this call's turns."""
+        if getattr(self, "_smart_turn_model", None) is None:
+            return False
+        buffers = getattr(self, "_turn_audio", None)
+        return bool(buffers) and call_id in buffers
+
+    def _discard_turn_verdict(self, call_id: str) -> None:
+        (getattr(self, "_pipeline_turn_verdict", None) or {}).pop(call_id, None)
+        (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).pop(call_id, None)
+
+    def _take_turn_verdict(self, call_id: str) -> Optional[Dict[str, Any]]:
+        """Consume the verdict of the turn being released; the next turn's audio starts afresh."""
+        verdict = (getattr(self, "_pipeline_turn_verdict", None) or {}).pop(call_id, None)
+        was_pending = (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).pop(call_id, None) is not None
+        buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+        if buffer is not None:
+            buffer.clear()
+        if verdict is not None:
+            return {
+                "label": "complete" if verdict.get("complete") else "incomplete",
+                "probability": verdict.get("probability"),
+            }
+        if was_pending:
+            return {"label": "pending", "probability": None}
+        return None
+
+    def _schedule_turn_analysis(self, call_id: str) -> bool:
+        """The caller stopped: have Smart Turn judge the turn so far.
+
+        Runs only when Silero VAD decides the turn, on the audio since the
+        last release, trimmed so the model sees ``smart_turn_trailing_silence_ms``
+        of the silence after the caller's last speech.
+        """
+        if not self._smart_turn_active(call_id):
+            return False
+        if (getattr(self, "_pipeline_turn_source", None) or {}).get(call_id, "vad") != "vad":
+            return False
+        buffer = self._turn_audio.get(call_id)
+        if buffer is None or buffer.duration_ms <= 0:
+            return False
+        settings = self._smart_turn_config()
+        trim_ms = max(0.0, float(self._silero_config()["stop_ms"]) - float(settings["trailing_silence_ms"]))
+        pcm, rate = buffer.snapshot(trim_trailing_ms=trim_ms)
+        if not pcm:
+            return False
+        stop_at = self._pipeline_caller_talk_changed_at.get(call_id, time.monotonic())
+        self._pipeline_turn_verdict.pop(call_id, None)
+        self._pipeline_turn_verdict_pending[call_id] = {"at": stop_at, "since": time.monotonic()}
+        self._fire_and_forget_for_call(
+            call_id,
+            self._analyze_caller_turn(call_id, stop_at, pcm, rate),
+            name=f"smart-turn-{call_id}",
+        )
+        return True
+
+    async def _analyze_caller_turn(self, call_id: str, stop_at: float, pcm: bytes, sample_rate: int) -> None:
+        model = getattr(self, "_smart_turn_model", None)
+        if model is None:
+            return
+        settings = self._smart_turn_config()
+        try:
+            result = await asyncio.to_thread(model.predict, pcm, sample_rate)
+        except Exception:
+            logger.warning("Smart Turn inference failed", call_id=call_id, exc_info=True)
+            result = None
+        pending = self._pipeline_turn_verdict_pending.get(call_id)
+        if pending is None or pending.get("at") != stop_at:
+            # The caller went on, or the turn was released meanwhile.
+            return
+        self._pipeline_turn_verdict_pending.pop(call_id, None)
+        if result is not None:
+            probability = float(result["probability"])
+            complete = probability >= float(settings["threshold"])
+            self._pipeline_turn_verdict[call_id] = {
+                "at": stop_at,
+                "probability": probability,
+                "complete": complete,
+            }
+            logger.info(
+                "Smart Turn verdict",
+                call_id=call_id,
+                complete=complete,
+                probability=round(probability, 3),
+                audio_ms=round(float(result.get("audio_ms", 0.0))),
+                inference_ms=round(float(result.get("inference_ms", 0.0)), 1),
+                waited_ms=round((time.monotonic() - float(pending.get("since", stop_at))) * 1000),
+            )
+        event = (getattr(self, "_pipeline_turn_wakeup", None) or {}).get(call_id)
+        if event is not None:
+            event.set()
+
+    def _apply_turn_verdict(self, call_id: str, stop_at: float, deadline: float) -> float:
+        """Stretch a release deadline by Smart Turn's view of this stop.
+
+        An incomplete verdict holds the turn ``smart_turn_incomplete_hold_ms``
+        past the stop; a verdict still being computed holds it up to
+        ``smart_turn_timeout_ms``; a complete verdict, or none, changes nothing.
+        """
+        settings = self._smart_turn_config()
+        verdict = (getattr(self, "_pipeline_turn_verdict", None) or {}).get(call_id)
+        if verdict is not None and verdict.get("at") == stop_at:
+            if not verdict.get("complete", True):
+                return max(deadline, stop_at + float(settings["incomplete_hold_ms"]) / 1000.0)
+            return deadline
+        pending = (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).get(call_id)
+        if pending is not None and pending.get("at") == stop_at:
+            return max(deadline, float(pending.get("since", stop_at)) + float(settings["timeout_ms"]) / 1000.0)
+        return deadline
 
     def _note_pipeline_caller_talking(
         self, call_id: str, talking: bool, source: str = "talk_detect"
@@ -15160,6 +15369,14 @@ class Engine:
                     stop_ms=self._silero_config()["stop_ms"],
                     stt_finalize_ms=self._silero_config()["stt_finalize_ms"],
                 )
+                if self._smart_turn_model is not None:
+                    self._turn_audio[call_id] = TurnAudioBuffer()
+                    logger.info(
+                        "Smart Turn judging caller turns",
+                        call_id=call_id,
+                        threshold=self._smart_turn_config()["threshold"],
+                        incomplete_hold_ms=self._smart_turn_config()["incomplete_hold_ms"],
+                    )
         # Pipelines: enable Asterisk talk detection so barge-in can trigger even when
         # ExternalMedia RTP delivery is paused/altered during channel playback.
         try:
@@ -15874,6 +16091,7 @@ class Engine:
                     talk_detect_hold_ms=end_of_turn.talk_detect_hold_ms,
                     vad_final_wait_ms=end_of_turn.vad_final_wait_ms,
                     silero_vad=self._silero_vad_active(call_id),
+                    smart_turn=self._smart_turn_active(call_id),
                     max_wait_ms=end_of_turn.max_wait_ms or None,
                     legacy_options=list(end_of_turn.legacy_options) or None,
                 )
@@ -17197,10 +17415,15 @@ class Engine:
                     quiet_since = None
                     if source in ("vad", "talk_detect") and not self._pipeline_caller_talking.get(call_id, False):
                         quiet_since = self._pipeline_caller_talk_changed_at.get(call_id)
+                    verdict = self._take_turn_verdict(call_id)
                     logger.info(
                         "Caller turn ended on silence",
                         call_id=call_id,
                         source=source,
+                        turn_verdict=verdict.get("label") if verdict else None,
+                        turn_probability=round(verdict["probability"], 3)
+                        if verdict and verdict.get("probability") is not None
+                        else None,
                         segments=segments,
                         waited_sec=round(now - started_at, 3)
                         if started_at is not None
@@ -17240,6 +17463,10 @@ class Engine:
                         expected_at = self._pipeline_stt_final_expected_at.get(call_id)
                         if expected_at is not None:
                             deadline = max(deadline, expected_at + end_of_turn.vad_final_wait_sec)
+                        # Smart Turn: an incomplete verdict on this very stop
+                        # holds the turn; one still computing holds it briefly.
+                        if not talking:
+                            deadline = self._apply_turn_verdict(call_id, changed_at, deadline)
                     else:
                         deadline = now + end_of_turn.silence_sec
                     if end_of_turn.max_wait_ms > 0 and pending_started_at is not None:

@@ -1018,6 +1018,26 @@ class VADConfig(BaseModel):
     # Let Silero speech during agent playback trigger barge-in.
     silero_barge_in: bool = Field(default=True)
 
+    # Smart Turn v3 (pipecat-ai/smart-turn): the semantic layer above Silero
+    # VAD. When Silero reports the caller quiet, the model scores the caller's
+    # own audio for whether the turn is complete; an incomplete verdict holds
+    # the turn up to smart_turn_incomplete_hold_ms in case the caller goes on.
+    # Needs vad.silero_enabled; the model is fetched into
+    # smart_turn_model_path on first start when smart_turn_auto_download is true.
+    smart_turn_enabled: bool = Field(default=False)
+    smart_turn_model_path: str = Field(default="models/turn/smart-turn-v3.2-cpu.onnx")
+    smart_turn_auto_download: bool = Field(default=True)
+    # Probability of completion at or above which the turn is released at once.
+    smart_turn_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # How long an incomplete verdict may hold the turn beyond the Silero stop.
+    smart_turn_incomplete_hold_ms: int = Field(default=3000, ge=0)
+    # How much of the trailing silence the model is shown after the last speech.
+    smart_turn_trailing_silence_ms: int = Field(default=200, ge=0)
+    # How long the turn waits for a verdict before proceeding without one.
+    smart_turn_timeout_ms: int = Field(default=500, ge=0)
+    # CPU threads for one inference; one is enough for a 50 ms model.
+    smart_turn_threads: int = Field(default=1, ge=1)
+
 
 class NoInputConfig(BaseModel):
     """Provider-independent caller inactivity policy.
