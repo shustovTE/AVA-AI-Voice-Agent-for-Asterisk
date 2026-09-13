@@ -124,7 +124,18 @@ longer touch the end of turn, so the two cannot disagree about it.
 
 Every `Caller turn ended on silence` line reports which `source` decided it
 (`vad`, `talk_detect` or `final`), and `Pipeline end-of-turn policy resolved`
-at call start reports whether Silero is tracking the call.
+at call start reports whether Silero is tracking the call. The line's
+`waited_sec` spans the whole turn from its first result, so read the wait a
+caller actually felt from `quiet_ms` (how long the detector had reported them
+quiet when the turn was released: the stop window plus the grace, plus any
+wait for a result) and `since_result_ms` (the time since the last result).
+
+Which fields apply depends on the resolved source, and the pipeline editor
+greys out the rest: `end_of_turn_silence_ms` only ends a turn measured from
+results (`final`); the grace and `end_of_turn_vad_final_wait_ms` only follow
+a detector. The pause a caller may take is never set here with a detector in
+charge: it is `vad.silero_stop_ms` for Silero VAD and
+`barge_in.pipeline_talk_detect_silence_ms` for talk detection.
 
 Length no longer decides anything, so a one-word "yes" is answered as promptly
 as a paragraph. Every turn is logged as `Caller turn ended on silence` with the

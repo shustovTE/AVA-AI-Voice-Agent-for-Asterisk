@@ -17185,18 +17185,28 @@ class Engine:
                     segments = len(pending_segments)
                     pending_segments.clear()
                     pending_deadline = None
-                    last_final_at = None
+                    last_final, last_final_at = last_final_at, None
                     started_at, pending_started_at = pending_started_at, None
                     if not aggregated:
                         return
+                    now = time.monotonic()
+                    source = turn_source()
+                    # How long the caller had been quiet by the detector's
+                    # account: the wait a caller feels, unlike waited_sec,
+                    # which spans the whole turn from its first result.
+                    quiet_since = None
+                    if source in ("vad", "talk_detect") and not self._pipeline_caller_talking.get(call_id, False):
+                        quiet_since = self._pipeline_caller_talk_changed_at.get(call_id)
                     logger.info(
                         "Caller turn ended on silence",
                         call_id=call_id,
-                        source=turn_source(),
+                        source=source,
                         segments=segments,
-                        waited_sec=round(time.monotonic() - started_at, 3)
+                        waited_sec=round(now - started_at, 3)
                         if started_at is not None
                         else None,
+                        quiet_ms=round((now - quiet_since) * 1000) if quiet_since else None,
+                        since_result_ms=round((now - last_final) * 1000) if last_final is not None else None,
                         chars=len(aggregated),
                         preview=aggregated[:80],
                         # The ending is what end-of-turn tuning needs to see.

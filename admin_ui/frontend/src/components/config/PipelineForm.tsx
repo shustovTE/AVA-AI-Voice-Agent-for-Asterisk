@@ -226,6 +226,12 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     const isOpenAIStt = sttKey.includes('openai');
     const isLocalStt = sttKey.includes('local');
     const isOpenAILlm = llmKey.includes('openai');
+    // Which end-of-turn fields apply depends on the resolved source: the
+    // silence window only ends a turn measured from results ("final"), the
+    // grace and the result wait only follow a speech detector.
+    const endOfTurnSource = String(localConfig.options?.llm?.end_of_turn_source ?? '');
+    const endOfTurnDetector = endOfTurnSource === 'vad' || endOfTurnSource === 'talk_detect';
+    const endOfTurnFinal = endOfTurnSource === 'final';
     const isOpenAITts = ttsKey.includes('openai');
     const isGroqStt = sttKey.includes('groq');
     const isGroqTts = ttsKey.includes('groq');
@@ -437,8 +443,13 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                     <div>
                         <h4 className="text-sm font-medium text-foreground">End of Turn</h4>
                         <p className="text-xs text-muted-foreground">
-                            Streaming STT returns a result only after its own silence gate, so a window measured from the result cannot bridge a caller who pauses and goes on. With Asterisk TALK_DETECT enabled for the pipeline, the same events that drive barge-in decide the end of the turn: it is held while Asterisk hears the caller and released a short grace after they go quiet, so the silence that ends a turn is tuned under Barge-In as the talk-detect silence.
+                            Streaming STT returns a result only after its own silence gate, so a window measured from the result cannot bridge a caller who pauses and goes on. A speech detector can decide the turn instead: it is held while the detector hears the caller and released a short grace after they go quiet. The pause a caller may take is then the detector's own stop window, tuned where the detector lives: Silero VAD on the VAD page (Stop ms), Asterisk TALK_DETECT under Barge-In (talk-detect silence). The silence window below only applies without a detector.
                         </p>
+                        {endOfTurnSource === '' && (
+                            <p className="text-xs text-muted-foreground">
+                                Auto: Silero VAD when it is enabled on the VAD page, else Asterisk talk detection when TALK_DETECT is enabled for pipelines, else the silence window. Every <code>Caller turn ended on silence</code> log line names the source that decided it.
+                            </p>
+                        )}
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <FormInput
@@ -454,7 +465,8 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                 if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_silence_ms: Math.max(0, parsed) }); }
                             }}
                             placeholder="700"
-                            tooltip="How long the caller must be quiet before the turn is answered. Raise it when callers are cut off mid-sentence; lower it for snappier replies. 0 answers every result immediately."
+                            tooltip="Without a speech detector: how long after the last STT result the turn is answered. Raise it when callers are cut off mid-sentence; lower it for snappier replies. 0 answers every result immediately. Not used while Silero VAD or talk detection decides the turn; tune their stop window instead."
+                            disabled={endOfTurnDetector}
                         />
                         <FormInput
                             label="Max Wait (ms)"
@@ -493,10 +505,11 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                             ]}
                         />
                         <FormInput
-                            label="Talk-Detect Grace (ms)"
+                            label="Quiet Grace (ms)"
                             type="number"
                             min={0}
                             step={50}
+                            disabled={endOfTurnFinal}
                             value={localConfig.options?.llm?.end_of_turn_talk_detect_grace_ms ?? ''}
                             onChange={(e) => {
                                 const raw = e.target.value;
@@ -505,13 +518,14 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                 if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: Math.max(0, parsed) }); }
                             }}
                             placeholder="250"
-                            tooltip="Grace after the detector (Silero VAD or Asterisk talk detection) reports the caller quiet, or after a result that lands while they already are. Long enough for a result that is about to arrive to join the turn, short enough not to be felt. Only used when a detector decides the end of turn."
+                            tooltip="Added after the detector (Silero VAD or Asterisk talk detection) reports the caller quiet, or after a result that lands while they already are. It is not the pause itself: the pause is the detector's stop window, and this grace lets a result that is about to arrive join the turn. Keep it short enough not to be felt. Only used when a detector decides the end of turn."
                         />
                         <FormInput
                             label="VAD Result Wait (ms)"
                             type="number"
                             min={0}
                             step={100}
+                            disabled={endOfTurnFinal || endOfTurnSource === 'talk_detect'}
                             value={localConfig.options?.llm?.end_of_turn_vad_final_wait_ms ?? ''}
                             onChange={(e) => {
                                 const raw = e.target.value;
@@ -520,7 +534,7 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                 if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_vad_final_wait_ms: Math.max(0, parsed) }); }
                             }}
                             placeholder="1000"
-                            tooltip="With Silero VAD the recognizer is told to finalize the moment the caller stops; the turn waits up to this long for that result to arrive before answering without it. The result normally lands well inside the bound."
+                            tooltip="Upper bound only: with Silero VAD the recognizer is told to finalize the moment the caller stops, and the turn waits up to this long for that result before answering without it. The result normally lands within a recognizer round trip, so this adds no delay in the normal case."
                         />
                     </div>
                 </div>
