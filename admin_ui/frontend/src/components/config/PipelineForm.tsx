@@ -484,9 +484,10 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                 }
                                 updateRoleOptions('llm', { end_of_turn_source: v });
                             }}
-                            tooltip="Auto follows the pipeline's TALK_DETECT flag: Asterisk talk detection when it is enabled, the silence window after each result otherwise. Pin either explicitly."
+                            tooltip="Auto takes the first detector available: Silero VAD when it is enabled on the VAD page, Asterisk talk detection when TALK_DETECT is enabled for pipelines, the silence window after each result otherwise. Pin one explicitly; a pinned Silero VAD without the model loaded falls back the same way."
                             options={[
                                 { value: '', label: 'Auto (default)' },
+                                { value: 'vad', label: 'Silero VAD (engine)' },
                                 { value: 'talk_detect', label: 'Asterisk talk detection' },
                                 { value: 'final', label: 'Silence window after each result' },
                             ]}
@@ -504,7 +505,22 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                 if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: Math.max(0, parsed) }); }
                             }}
                             placeholder="250"
-                            tooltip="Grace after Asterisk reports the caller quiet, or after a result that lands while they already are. Long enough for a result that is about to arrive to join the turn, short enough not to be felt. Only used when talk detection decides the end of turn."
+                            tooltip="Grace after the detector (Silero VAD or Asterisk talk detection) reports the caller quiet, or after a result that lands while they already are. Long enough for a result that is about to arrive to join the turn, short enough not to be felt. Only used when a detector decides the end of turn."
+                        />
+                        <FormInput
+                            label="VAD Result Wait (ms)"
+                            type="number"
+                            min={0}
+                            step={100}
+                            value={localConfig.options?.llm?.end_of_turn_vad_final_wait_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_vad_final_wait_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_vad_final_wait_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="1000"
+                            tooltip="With Silero VAD the recognizer is told to finalize the moment the caller stops; the turn waits up to this long for that result to arrive before answering without it. The result normally lands well inside the bound."
                         />
                     </div>
                 </div>

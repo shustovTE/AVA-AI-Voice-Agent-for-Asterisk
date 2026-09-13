@@ -77,6 +77,16 @@ from .providers.elevenlabs_agent import ElevenLabsAgentProvider
 from .providers.elevenlabs_config import ElevenLabsAgentConfig
 from .core import SessionStore, PlaybackManager, ConversationCoordinator
 from .core.vad_manager import EnhancedVADManager, VADResult
+from .core.silero_vad import (
+    DEFAULT_MODEL_PATH as SILERO_DEFAULT_MODEL_PATH,
+    SILERO_VAD_VERSION,
+    SUPPORTED_SAMPLE_RATES as SILERO_SAMPLE_RATES,
+    SileroCallerTracker,
+    SileroVadError,
+    SileroVadModel,
+    ensure_model_file as ensure_silero_model_file,
+    load_model as load_silero_model,
+)
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
@@ -211,6 +221,13 @@ class EndOfTurnPolicy:
     barge-in. ``pipelines.<name>`` then tunes it through
     ``barge_in.pipeline_talk_detect_silence_ms``.
 
+    With Silero VAD enabled (``vad.silero_enabled``) the engine's own neural
+    detector plays that role instead: ``auto`` prefers it over talk detection,
+    ``vad`` pins it, and the same grace and hold apply to its start and stop.
+    Because the engine also tells the recognizer to finalize the moment Silero
+    reports the caller quiet, the turn additionally waits up to
+    ``end_of_turn_vad_final_wait_ms`` for that result to arrive.
+
     The superseded ``aggregation_*`` options are still read so deployed configs
     keep working: the two window options are converted from seconds, and the
     word/character thresholds are reported in :attr:`ignored_options` for the
@@ -220,7 +237,8 @@ class EndOfTurnPolicy:
     DEFAULT_SILENCE_MS = 700
     DEFAULT_TALK_DETECT_GRACE_MS = 250
     DEFAULT_TALK_DETECT_HOLD_MS = 8000
-    SOURCES = ("auto", "talk_detect", "final")
+    DEFAULT_VAD_FINAL_WAIT_MS = 1000
+    SOURCES = ("auto", "vad", "talk_detect", "final")
     # Superseded: a silence window in seconds, most recent first.
     LEGACY_SILENCE_KEYS = ("aggregation_silence_sec", "aggregation_timeout_sec")
     LEGACY_MAX_WAIT_KEYS = ("aggregation_max_wait_sec",)
@@ -237,6 +255,7 @@ class EndOfTurnPolicy:
         "source",
         "talk_detect_grace_ms",
         "talk_detect_hold_ms",
+        "vad_final_wait_ms",
         "ignored_options",
         "legacy_options",
     )
@@ -276,6 +295,13 @@ class EndOfTurnPolicy:
         if hold_ms is None:
             hold_ms = float(self.DEFAULT_TALK_DETECT_HOLD_MS)
         self.talk_detect_hold_ms = max(0.0, hold_ms)
+        # How long a turn waits for the result the recognizer was told to
+        # produce when Silero reported the caller quiet. The result normally
+        # lands well inside this; the bound only matters when it never comes.
+        final_wait_ms = self._as_float(opts.get("end_of_turn_vad_final_wait_ms"), None)
+        if final_wait_ms is None:
+            final_wait_ms = float(self.DEFAULT_VAD_FINAL_WAIT_MS)
+        self.vad_final_wait_ms = max(0.0, final_wait_ms)
 
         self.legacy_options = tuple(legacy)
         self.ignored_options = tuple(
@@ -320,13 +346,30 @@ class EndOfTurnPolicy:
     def talk_detect_hold_sec(self) -> float:
         return self.talk_detect_hold_ms / 1000.0
 
+    @property
+    def vad_final_wait_sec(self) -> float:
+        return self.vad_final_wait_ms / 1000.0
+
+    def resolve_source(self, talk_detect_enabled: bool, vad_enabled: bool = False) -> str:
+        """Name the detector that decides the end of turn for a call.
+
+        ``vad`` is Silero VAD tracking the call, ``talk_detect`` Asterisk talk
+        detection, ``final`` the silence window after each result. ``auto``
+        takes the first that is available in that order; a pinned ``vad``
+        without Silero falls back the same way, while a pinned ``talk_detect``
+        is honoured as configured.
+        """
+        if self.source == "final":
+            return "final"
+        if self.source == "talk_detect":
+            return "talk_detect"
+        if vad_enabled:
+            return "vad"
+        return "talk_detect" if talk_detect_enabled else "final"
+
     def uses_talk_detect(self, talk_detect_enabled: bool) -> bool:
         """Report whether Asterisk talk detection decides the end of turn."""
-        if self.source == "final":
-            return False
-        if self.source == "talk_detect":
-            return True
-        return bool(talk_detect_enabled)
+        return self.resolve_source(talk_detect_enabled, False) == "talk_detect"
 
     def flush_delay(self, elapsed: Optional[float] = None) -> float:
         """Return how long to wait for another result before running the turn.
@@ -763,6 +806,21 @@ class Engine:
         self._pipeline_caller_talking: Dict[str, bool] = {}
         self._pipeline_caller_talk_changed_at: Dict[str, float] = {}
         self._pipeline_turn_wakeup: Dict[str, asyncio.Event] = {}
+        # The detector the dialog worker resolved for each call ("vad",
+        # "talk_detect" or "final"), so talking reports from any other
+        # detector cannot compete with it.
+        self._pipeline_turn_source: Dict[str, str] = {}
+        # When the recognizer was last told to finalize after the caller
+        # stopped, and when its last result arrived, so the worker can wait
+        # for a result that is on its way before releasing the turn.
+        self._pipeline_stt_final_expected_at: Dict[str, float] = {}
+        self._pipeline_last_final_at: Dict[str, float] = {}
+        # Silero VAD: the shared model (loaded in start()) and one tracker per
+        # pipeline call, plus resample state for wire rates it does not take.
+        self._silero_model: Optional[SileroVadModel] = None
+        self._silero_trackers: Dict[str, SileroCallerTracker] = {}
+        self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
+        self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -1060,6 +1118,9 @@ class Engine:
             self._tool_generation = None
         # 1) Load providers first (low risk)
         await self._load_providers()
+
+        # Silero VAD, when enabled, before the first call can need it.
+        await self._init_silero_vad()
         
         # Initialize tool calling system
         try:
@@ -9606,6 +9667,11 @@ class Engine:
             self._pipeline_caller_talking.pop(call_id, None)
             self._pipeline_caller_talk_changed_at.pop(call_id, None)
             self._pipeline_turn_wakeup.pop(call_id, None)
+            self._pipeline_turn_source.pop(call_id, None)
+            self._pipeline_stt_final_expected_at.pop(call_id, None)
+            self._pipeline_last_final_at.pop(call_id, None)
+            self._silero_trackers.pop(call_id, None)
+            self._resample_state_silero16k.pop(call_id, None)
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -10317,6 +10383,11 @@ class Engine:
                 )
                 return
 
+            # Silero VAD sees every caller frame, gated or not, before any
+            # routing decision below can drop it.
+            if self._silero_vad_active(session.call_id):
+                await self._observe_silero_vad(session, pcm_bytes, pcm_rate, source="audiosocket")
+
             # CRITICAL FIX: Check for pipeline mode FIRST before routing to monolithic providers
             if self._pipeline_forced.get(caller_channel_id):
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
@@ -10333,6 +10404,9 @@ class Engine:
                             return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     except Exception:
                         pass
+                    # Silero VAD already scored this frame and owns barge-in.
+                    if self._silero_owns_barge_in(session.call_id):
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     now = time.time()
                     tts_elapsed_ms = 0
                     try:
@@ -11423,12 +11497,285 @@ class Engine:
         except Exception:
             return False
 
-    def _note_pipeline_caller_talking(self, call_id: str, talking: bool) -> None:
-        """Record Asterisk's talk-detect state and wake the dialog worker.
+    # ------------------------------------------------------------------
+    # Silero VAD: the engine's own caller-speech detector for pipelines
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_silero_settings(config: Any) -> Dict[str, Any]:
+        vad_cfg = getattr(config, "vad", None)
 
-        Tolerates an engine built without __init__ (tests construct handlers
-        that way), so a talk event can never break the watchdog path it shares.
+        def _get(name: str, default: Any) -> Any:
+            value = getattr(vad_cfg, name, None) if vad_cfg is not None else None
+            return default if value is None else value
+
+        stop_threshold = _get("silero_stop_threshold", None)
+        return {
+            "enabled": bool(_get("silero_enabled", False)),
+            "model_path": str(_get("silero_model_path", SILERO_DEFAULT_MODEL_PATH) or SILERO_DEFAULT_MODEL_PATH),
+            "auto_download": bool(_get("silero_auto_download", True)),
+            "threshold": float(_get("silero_threshold", 0.5)),
+            "stop_threshold": float(stop_threshold) if stop_threshold is not None else None,
+            "start_ms": int(_get("silero_start_ms", 96)),
+            "stop_ms": int(_get("silero_stop_ms", 300)),
+            "stt_finalize_ms": int(_get("silero_stt_finalize_ms", 900)),
+            "barge_in": bool(_get("silero_barge_in", True)),
+        }
+
+    def _silero_config(self) -> Dict[str, Any]:
+        settings = getattr(self, "_silero_settings", None)
+        if not settings:
+            settings = self._silero_settings = self._read_silero_settings(getattr(self, "config", None))
+        return settings
+
+    async def _init_silero_vad(self) -> None:
+        """Load the Silero VAD model when ``vad.silero_enabled``, fetching it first if allowed.
+
+        A missing runtime or model disables the detector with an error rather
+        than failing the engine: calls then fall back to talk detection or the
+        result window exactly as before.
         """
+        settings = self._silero_config()
+        if not settings["enabled"]:
+            return
+        path = settings["model_path"]
+        try:
+            resolved = await asyncio.to_thread(
+                ensure_silero_model_file, path, auto_download=settings["auto_download"]
+            )
+            self._silero_model = await asyncio.to_thread(load_silero_model, resolved)
+        except SileroVadError as exc:
+            self._silero_model = None
+            logger.error(
+                "Silero VAD unavailable; pipelines fall back to talk detection",
+                error=str(exc),
+                path=path,
+            )
+            return
+        except Exception:
+            self._silero_model = None
+            logger.error("Silero VAD failed to load", path=path, exc_info=True)
+            return
+        logger.info(
+            "Silero VAD enabled",
+            version=SILERO_VAD_VERSION,
+            path=resolved,
+            threshold=settings["threshold"],
+            stop_threshold=settings["stop_threshold"],
+            start_ms=settings["start_ms"],
+            stop_ms=settings["stop_ms"],
+            stt_finalize_ms=settings["stt_finalize_ms"],
+            barge_in=settings["barge_in"],
+        )
+
+    def _new_silero_tracker(self) -> Optional[SileroCallerTracker]:
+        model = getattr(self, "_silero_model", None)
+        if model is None:
+            return None
+        settings = self._silero_config()
+        return SileroCallerTracker(
+            model,
+            threshold=settings["threshold"],
+            stop_threshold=settings["stop_threshold"],
+            start_ms=settings["start_ms"],
+            stop_ms=settings["stop_ms"],
+        )
+
+    def _silero_vad_active(self, call_id: str) -> bool:
+        """Whether Silero VAD tracks this call's caller audio."""
+        trackers = getattr(self, "_silero_trackers", None)
+        return bool(trackers) and call_id in trackers
+
+    def _silero_owns_barge_in(self, call_id: str) -> bool:
+        return self._silero_vad_active(call_id) and bool(self._silero_config()["barge_in"])
+
+    async def _observe_silero_vad(
+        self,
+        session: CallSession,
+        pcm16: bytes,
+        sample_rate_hz: int,
+        *,
+        source: str,
+    ) -> None:
+        """Score inbound caller audio and act on speech start/stop transitions.
+
+        Runs on every frame, gated or not, so a caller interrupting the agent is
+        seen exactly like one answering it. Inference costs well under a
+        millisecond per 32 ms chunk, so it stays inline on the event loop.
+        """
+        call_id = session.call_id
+        tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+        if tracker is None or not pcm16:
+            return
+        rate = int(sample_rate_hz or 0)
+        if rate not in SILERO_SAMPLE_RATES:
+            try:
+                states = getattr(self, "_resample_state_silero16k", None)
+                if states is None:
+                    states = self._resample_state_silero16k = {}
+                pcm16, states[call_id] = resample_audio(
+                    pcm16, rate, PIPELINE_STT_SAMPLE_RATE_HZ, state=states.get(call_id)
+                )
+                rate = PIPELINE_STT_SAMPLE_RATE_HZ
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                return
+        try:
+            events = tracker.feed(pcm16, rate)
+        except Exception:
+            logger.debug("Silero VAD inference failed", call_id=call_id, source=source, exc_info=True)
+            return
+        for event in events:
+            if event == "start":
+                await self._on_silero_speech_started(session, tracker, source=source)
+            elif event == "stop":
+                await self._on_silero_speech_finished(session, tracker, source=source)
+
+    async def _on_silero_speech_started(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+    ) -> None:
+        """The caller started talking: hold the turn, wake the watchdog, barge in."""
+        call_id = session.call_id
+        self._note_pipeline_caller_talking(call_id, True, source="vad")
+        listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
+            getattr(session, "tts_playing", False)
+        )
+        if listening:
+            await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
+            return
+        if not self._silero_config()["barge_in"]:
+            return
+        cfg = getattr(self.config, "barge_in", None)
+        if not cfg or not getattr(cfg, "enabled", True):
+            return
+        now = time.time()
+        tts_elapsed_ms = 0
+        try:
+            if float(getattr(session, "tts_started_ts", 0.0) or 0.0) > 0:
+                tts_elapsed_ms = int((now - float(session.tts_started_ts)) * 1000)
+        except Exception:
+            tts_elapsed_ms = 0
+        # The same echo protection as Asterisk talk detection, so switching
+        # detectors keeps the tuning a deployment already has.
+        initial_protect = int(getattr(cfg, "talk_detect_initial_protection_ms", 1500))
+        try:
+            if getattr(session, "conversation_state", None) == "greeting":
+                greet_ms = int(getattr(cfg, "greeting_protection_ms", 0))
+                if greet_ms > initial_protect:
+                    initial_protect = greet_ms
+        except Exception:
+            pass
+        if tts_elapsed_ms < initial_protect:
+            logger.debug(
+                "Silero VAD speech suppressed (echo protection)",
+                call_id=call_id,
+                tts_elapsed_ms=tts_elapsed_ms,
+                protection_ms=initial_protect,
+            )
+            return
+        cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
+        last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
+        if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
+            return
+        await self._no_input_note_activity(call_id, "engine:silero_vad_barge_in")
+        try:
+            if not bool(getattr(session, "media_rx_confirmed", False)):
+                session.media_rx_confirmed = True
+                session.first_media_rx_ts = now
+                await self._save_session(session)
+        except Exception:
+            pass
+        await self._apply_barge_in_action(call_id, source="silero_vad", reason="pipeline_tts_overlap")
+        # Reopen capture at once, like the energy path: the caller is talking
+        # over the agent and every further frame belongs to the recognizer.
+        session.audio_capture_enabled = True
+        logger.info(
+            "🎧 BARGE-IN (Silero VAD) triggered",
+            call_id=call_id,
+            source=source,
+            tts_elapsed_ms=tts_elapsed_ms,
+            probability=round(tracker.last_probability, 3),
+        )
+
+    async def _on_silero_speech_finished(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+    ) -> None:
+        """The caller stopped: finalize the recognizer, then release the turn.
+
+        The finalize request is recorded before the worker is woken so that
+        its recomputed deadline already waits for the result on its way.
+        """
+        call_id = session.call_id
+        finalize_requested = False
+        expect_result = False
+        if bool(getattr(session, "audio_capture_enabled", True)):
+            last_final = (getattr(self, "_pipeline_last_final_at", None) or {}).get(call_id)
+            last_speech = tracker.last_speech_at
+            # A result that arrived after the caller's last speech already
+            # covers it; otherwise the recognizer still holds this speech.
+            expect_result = last_speech is not None and (last_final is None or last_final < last_speech)
+            finalize_requested = self._request_pipeline_stt_finalize(call_id, expect_result=expect_result)
+        self._note_pipeline_caller_talking(call_id, False, source="vad")
+        await self._no_input_note_input_state(call_id, False, "engine:silero_vad")
+        logger.debug(
+            "Silero VAD: caller quiet",
+            call_id=call_id,
+            source=source,
+            segment_ms=round(tracker.segment_ms),
+            finalize_requested=finalize_requested,
+            result_expected=expect_result,
+        )
+
+    def _request_pipeline_stt_finalize(self, call_id: str, *, expect_result: bool) -> bool:
+        """Feed the recognizer a burst of silence so it emits its result now.
+
+        A streaming recognizer only closes a phrase after its own silence gate
+        (T-one: 600 ms, at a chunk boundary), so once the caller is known to be
+        quiet the gate is satisfied in one go instead of in real time. The
+        burst is plain zeros through the normal queue, so no recognizer
+        protocol change is needed; a recognizer that already emitted the phrase
+        simply scores a little more silence.
+        """
+        ms = int(self._silero_config()["stt_finalize_ms"])
+        queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
+        if queue is None or ms <= 0:
+            return False
+        silence = b"\x00" * (PIPELINE_STT_SAMPLE_RATE_HZ * PIPELINE_STT_BYTES_PER_SAMPLE * ms // 1000)
+        try:
+            queue.put_nowait(silence)
+        except asyncio.QueueFull:
+            logger.debug("Pipeline queue full; STT finalize burst dropped", call_id=call_id)
+            return False
+        if expect_result:
+            expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+            if expected is None:
+                expected = self._pipeline_stt_final_expected_at = {}
+            expected[call_id] = time.monotonic()
+        return True
+
+    def _note_pipeline_final_arrived(self, call_id: str) -> None:
+        """A recognizer result reached the dialog queue: nothing is outstanding."""
+        arrived = getattr(self, "_pipeline_last_final_at", None)
+        if arrived is None:
+            arrived = self._pipeline_last_final_at = {}
+        arrived[call_id] = time.monotonic()
+        expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+        if expected:
+            expected.pop(call_id, None)
+
+    def _note_pipeline_caller_talking(
+        self, call_id: str, talking: bool, source: str = "talk_detect"
+    ) -> None:
+        """Record a detector's talking state and wake the dialog worker.
+
+        Only the detector the worker resolved for the call may drive it: with
+        Silero VAD in charge, Asterisk talk-detect events still serve barge-in
+        and the watchdog but no longer touch the end of turn, so there is one
+        source of truth. Tolerates an engine built without __init__ (tests
+        construct handlers that way), so a talk event can never break the
+        watchdog path it shares.
+        """
+        owner = (getattr(self, "_pipeline_turn_source", None) or {}).get(call_id)
+        if owner in ("vad", "talk_detect") and source != owner:
+            return
         talking_map = getattr(self, "_pipeline_caller_talking", None)
         if talking_map is None:
             talking_map = self._pipeline_caller_talking = {}
@@ -12137,6 +12484,13 @@ class Engine:
                 int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
                 source="externalmedia",
             )
+            if self._silero_vad_active(session.call_id):
+                await self._observe_silero_vad(
+                    session,
+                    pcm_16k,
+                    int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
+                    source="externalmedia",
+                )
 
             # Check for pipeline mode FIRST (before continuous_input provider routing)
             # Pipeline adapters need audio in their queue, not sent to monolithic providers
@@ -12171,6 +12525,9 @@ class Engine:
                             return
                     except Exception:
                         pass
+                    # Silero VAD already scored this frame and owns barge-in.
+                    if self._silero_owns_barge_in(session.call_id):
+                        return
                     now = time.time()
                     tts_elapsed_ms = 0
                     try:
@@ -14793,6 +15150,16 @@ class Engine:
         # transcripts before _pipeline_runner reaches its own queue setup.
         self._pipeline_transcript_queues.setdefault(call_id, asyncio.Queue(maxsize=8))
         self._pipeline_forced[call_id] = bool(forced)
+        if forced:
+            tracker = self._new_silero_tracker()
+            if tracker is not None:
+                self._silero_trackers[call_id] = tracker
+                logger.info(
+                    "Silero VAD tracking caller speech",
+                    call_id=call_id,
+                    stop_ms=self._silero_config()["stop_ms"],
+                    stt_finalize_ms=self._silero_config()["stt_finalize_ms"],
+                )
         # Pipelines: enable Asterisk talk detection so barge-in can trigger even when
         # ExternalMedia RTP delivery is paused/altered during channel playback.
         try:
@@ -15374,6 +15741,7 @@ class Engine:
                     # Record time when a final transcript is obtained
                     try:
                         self._last_transcript_ts[call_id] = time.time()
+                        self._note_pipeline_final_arrived(call_id)
                     except Exception:
                         pass
                     try:
@@ -15457,6 +15825,7 @@ class Engine:
                             try:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
+                                self._note_pipeline_final_arrived(call_id)
                                 transcript_queue.put_nowait(final)
                                 logger.debug(
                                     "Pipeline STT final enqueued for dialog",
@@ -15503,6 +15872,8 @@ class Engine:
                     silence_ms=end_of_turn.silence_ms,
                     talk_detect_grace_ms=end_of_turn.talk_detect_grace_ms,
                     talk_detect_hold_ms=end_of_turn.talk_detect_hold_ms,
+                    vad_final_wait_ms=end_of_turn.vad_final_wait_ms,
+                    silero_vad=self._silero_vad_active(call_id),
                     max_wait_ms=end_of_turn.max_wait_ms or None,
                     legacy_options=list(end_of_turn.legacy_options) or None,
                 )
@@ -16783,14 +17154,29 @@ class Engine:
                                             exc_info=True,
                                         )
 
-                def talk_detect_driven() -> bool:
-                    """Whether Asterisk talk detection decides the end of this turn."""
+                def turn_source() -> str:
+                    """Which detector decides the end of this turn right now.
+
+                    ``vad`` while Silero VAD tracks the call, ``talk_detect``
+                    while Asterisk talk detection is enabled for it, ``final``
+                    otherwise; an explicit end_of_turn_source pins one. The
+                    answer is recorded per call so talking reports from the
+                    other detectors are ignored.
+                    """
                     try:
                         td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
-                        enabled = bool(td.get("enabled", False))
+                        td_enabled = bool(td.get("enabled", False))
                     except Exception:
-                        enabled = False
-                    return end_of_turn.uses_talk_detect(enabled)
+                        td_enabled = False
+                    resolved = end_of_turn.resolve_source(td_enabled, self._silero_vad_active(call_id))
+                    self._pipeline_turn_source[call_id] = resolved
+                    return resolved
+
+                def detector_driven() -> bool:
+                    """Whether a speech detector, not the result window, ends this turn."""
+                    return turn_source() in ("vad", "talk_detect")
+
+                turn_source()
 
                 async def flush_pending() -> None:
                     """Hand everything the caller has said so far to the LLM."""
@@ -16806,7 +17192,7 @@ class Engine:
                     logger.info(
                         "Caller turn ended on silence",
                         call_id=call_id,
-                        source="talk_detect" if talk_detect_driven() else "final",
+                        source=turn_source(),
                         segments=segments,
                         waited_sec=round(time.monotonic() - started_at, 3)
                         if started_at is not None
@@ -16831,7 +17217,7 @@ class Engine:
                         pending_deadline = None
                         return
                     now = time.monotonic()
-                    if talk_detect_driven():
+                    if detector_driven():
                         talking = self._pipeline_caller_talking.get(call_id, False)
                         changed_at = self._pipeline_caller_talk_changed_at.get(call_id, 0.0)
                         anchor = last_final_at if last_final_at is not None else now
@@ -16839,6 +17225,11 @@ class Engine:
                             deadline = anchor + end_of_turn.talk_detect_hold_sec
                         else:
                             deadline = max(anchor, changed_at) + end_of_turn.talk_detect_grace_sec
+                        # The recognizer was told to finalize when the caller
+                        # stopped: its result gets a bounded chance to join.
+                        expected_at = self._pipeline_stt_final_expected_at.get(call_id)
+                        if expected_at is not None:
+                            deadline = max(deadline, expected_at + end_of_turn.vad_final_wait_sec)
                     else:
                         deadline = now + end_of_turn.silence_sec
                     if end_of_turn.max_wait_ms > 0 and pending_started_at is not None:
@@ -16868,7 +17259,7 @@ class Engine:
                             get_task = None
                         elif wake_task in done:
                             # The caller started or stopped talking.
-                            if talk_detect_driven():
+                            if detector_driven():
                                 reevaluate()
                             continue
                         else:
@@ -16887,6 +17278,7 @@ class Engine:
                         await self._no_input_note_processing(call_id, True)
                         pending_segments.append(normalized)
                         last_final_at = time.monotonic()
+                        self._pipeline_stt_final_expected_at.pop(call_id, None)
                         if pending_started_at is None:
                             pending_started_at = last_final_at
                         reevaluate()
@@ -16894,7 +17286,7 @@ class Engine:
                             "Waiting for caller silence before LLM turn",
                             call_id=call_id,
                             segments=len(pending_segments),
-                            source="talk_detect" if talk_detect_driven() else "final",
+                            source=turn_source(),
                             caller_talking=self._pipeline_caller_talking.get(call_id, False),
                             deadline_in_ms=round((pending_deadline - time.monotonic()) * 1000)
                             if pending_deadline is not None

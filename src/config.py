@@ -995,6 +995,29 @@ class VADConfig(BaseModel):
     upstream_squelch_min_speech_frames: int = 2
     upstream_squelch_end_silence_frames: int = 15
 
+    # Silero VAD: a neural caller-speech detector for modular pipelines, run in
+    # the engine on the frames that reach the recognizer. When enabled it drives
+    # barge-in and the inactivity watchdog, decides the end of the caller's turn
+    # (end_of_turn_source auto/vad) and tells the recognizer to finalize the
+    # moment the caller stops. The model file is fetched into silero_model_path
+    # on first start when silero_auto_download is true.
+    silero_enabled: bool = Field(default=False)
+    silero_model_path: str = Field(default="models/vad/silero_vad.onnx")
+    silero_auto_download: bool = Field(default=True)
+    # Speech probability at or above which a 32 ms chunk counts as speech.
+    silero_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Probability below which speech ends; defaults to silero_threshold - 0.15.
+    silero_stop_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Sustained speech before the caller counts as talking (barge-in and turn hold).
+    silero_start_ms: int = Field(default=96, ge=0)
+    # Silence after the last speech before the caller counts as quiet.
+    silero_stop_ms: int = Field(default=300, ge=0)
+    # Silence fed to the recognizer once the caller is quiet so it finalizes at
+    # once instead of waiting out its own gate (T-one holds 600 ms); 0 disables.
+    silero_stt_finalize_ms: int = Field(default=900, ge=0)
+    # Let Silero speech during agent playback trigger barge-in.
+    silero_barge_in: bool = Field(default=True)
+
 
 class NoInputConfig(BaseModel):
     """Provider-independent caller inactivity policy.

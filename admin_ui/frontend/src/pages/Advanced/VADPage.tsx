@@ -310,6 +310,114 @@ const VADPage = () => {
             </ConfigSection>
 
             <ConfigSection
+                title="Silero VAD (pipelines)"
+                description="A neural speech detector run in the engine on the caller's own frames. When enabled it drives barge-in, the inactivity watchdog and the end of the caller's turn for modular pipelines, and tells the recognizer to finalize the moment the caller stops."
+            >
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormSwitch
+                                label="Enable Silero VAD"
+                                description="Score every 32 ms of caller audio with Silero VAD v6 (ONNX, CPU)."
+                                tooltip="Replaces energy-based detection for pipeline calls: breathing, line noise and background sound no longer count as the caller. Needs onnxruntime in the engine image and the model file below. Asterisk TALK_DETECT may stay on for barge-in; the end of turn follows Silero unless a pipeline pins another source."
+                                checked={vadConfig.silero_enabled ?? false}
+                                onChange={(e) => updateVADConfig('silero_enabled', e.target.checked)}
+                            />
+                            <FormSwitch
+                                label="Silero Barge-In"
+                                description="Let Silero speech during agent playback interrupt the agent."
+                                tooltip="Uses the same echo protection and cooldown as Asterisk talk detection. Turn off to leave barge-in to TALK_DETECT while Silero still decides the end of turn."
+                                checked={vadConfig.silero_barge_in ?? true}
+                                onChange={(e) => updateVADConfig('silero_barge_in', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Model Path"
+                                type="text"
+                                value={vadConfig.silero_model_path ?? 'models/vad/silero_vad.onnx'}
+                                onChange={(e) => updateVADConfig('silero_model_path', e.target.value)}
+                                tooltip="Path of silero_vad.onnx inside the engine container; ./models is mounted at /app/models. scripts/fetch_silero_vad.sh downloads the pinned release there."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormSwitch
+                                label="Auto-Download Model"
+                                description="Fetch the pinned model on first start when the file is missing."
+                                tooltip="Downloads Silero VAD v6.2.1 (about 2 MB) from the project's GitHub release and verifies its SHA-256. Turn off on hosts without outbound access and run scripts/fetch_silero_vad.sh instead."
+                                checked={vadConfig.silero_auto_download ?? true}
+                                onChange={(e) => updateVADConfig('silero_auto_download', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Speech Threshold"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.silero_threshold ?? 0.5}
+                                onChange={(e) => updateVADConfig('silero_threshold', parseFloat(e.target.value))}
+                                tooltip="Speech probability at or above which a chunk counts as speech (0–1). 0.5 suits most lines; raise it on noisy trunks, lower it for quiet callers. Speech ends below threshold − 0.15 unless Stop Threshold is set."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Start (ms)"
+                                type="number"
+                                min="0"
+                                step="32"
+                                value={vadConfig.silero_start_ms ?? 96}
+                                onChange={(e) => updateVADConfig('silero_start_ms', parseInt(e.target.value))}
+                                tooltip="Sustained speech before the caller counts as talking; holds the turn and triggers barge-in. Whole chunks of 32 ms. Higher ignores short noises, lower reacts faster."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Stop (ms)"
+                                type="number"
+                                min="0"
+                                step="32"
+                                value={vadConfig.silero_stop_ms ?? 300}
+                                onChange={(e) => updateVADConfig('silero_stop_ms', parseInt(e.target.value))}
+                                tooltip="Silence after the caller's last speech before they count as quiet. This is the pause a caller may take mid-sentence; the answer follows it by the pipeline's grace plus the recognizer's finalization. 300 ms is snappy, 600–800 ms tolerates thinking aloud."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="STT Finalize Silence (ms)"
+                                type="number"
+                                min="0"
+                                step="100"
+                                value={vadConfig.silero_stt_finalize_ms ?? 900}
+                                onChange={(e) => updateVADConfig('silero_stt_finalize_ms', parseInt(e.target.value))}
+                                tooltip="Silence fed to the recognizer the moment the caller is quiet, so a streaming recognizer closes the phrase at once instead of waiting out its own gate in real time (T-one holds 600 ms, at 300 ms chunk boundaries). 0 disables and the recognizer's own timing applies."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Stop Threshold (optional)"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.silero_stop_threshold ?? ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updateVADConfig('silero_stop_threshold', raw === '' ? undefined : parseFloat(raw));
+                                }}
+                                placeholder="threshold − 0.15"
+                                tooltip="Probability below which speech ends. Leave empty for Silero's own margin of 0.15 below the speech threshold."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
+            <ConfigSection
                 title="Caller Inactivity"
                 description="Check that a silent inbound caller is still present, then end abandoned calls cleanly."
             >

@@ -88,9 +88,11 @@ from the caller's last sound. The silence itself is then tuned with
 `barge_in.pipeline_talk_detect_silence_ms` (800-1000 ms suits a caller who
 thinks aloud; every value is also the latency before an answer).
 
-- `pipelines.<name>.options.llm.end_of_turn_source`: `auto` (default; talk
-  detection whenever it is enabled for the pipeline, the result window
-  otherwise), `talk_detect`, or `final` to pin the result window.
+- `pipelines.<name>.options.llm.end_of_turn_source`: `auto` (default; the
+  first detector available in this order: Silero VAD when `vad.silero_enabled`,
+  Asterisk talk detection when it is enabled for the pipeline, the result
+  window otherwise), `vad`, `talk_detect`, or `final` to pin one. A pinned
+  `vad` without the model loaded falls back the same way as `auto`.
 - `pipelines.<name>.options.llm.end_of_turn_talk_detect_grace_ms`: grace after
   Asterisk reports the caller quiet, or after a result that lands while they
   already are. Defaults to `250`: long enough for a result that is about to
@@ -101,7 +103,28 @@ thinks aloud; every value is also the latency before an answer).
   guaranteed to arrive, and a caller still talking produces a result every
   phrase, so a long quiet hold means the end event was lost.
 
-Every `Caller turn ended on silence` line reports which `source` decided it.
+With Silero VAD enabled (see [Silero VAD](#silero-vad-pipelines) below) the
+engine's own neural detector takes that role: the turn is held while Silero
+reports the caller talking and released `end_of_turn_talk_detect_grace_ms`
+after it reports them quiet, so the pause a caller may take is
+`vad.silero_stop_ms` plus that grace. Because the detector runs in the engine,
+the recognizer is also told to finalize the moment the caller stops instead of
+waiting out its own gate in real time, and the turn waits for that result:
+
+- `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms`: how long a
+  turn waits for the result the recognizer was told to produce when Silero
+  reported the caller quiet. Defaults to `1000`. The result normally lands
+  well inside this; the bound only matters when it never comes (the caller's
+  sound carried no words). Not applied when a result already arrived after
+  the caller's last speech.
+
+Only the resolved detector drives the turn: with Silero in charge, Asterisk
+talk-detect events still serve barge-in and the inactivity watchdog but no
+longer touch the end of turn, so the two cannot disagree about it.
+
+Every `Caller turn ended on silence` line reports which `source` decided it
+(`vad`, `talk_detect` or `final`), and `Pipeline end-of-turn policy resolved`
+at call start reports whether Silero is tracking the call.
 
 Length no longer decides anything, so a one-word "yes" is answered as promptly
 as a paragraph. Every turn is logged as `Caller turn ended on silence` with the
@@ -510,6 +533,7 @@ Controls interruption of TTS playback when the caller speaks.
 
 Notes (pipelines / `local_hybrid`):
 
+- With `vad.silero_enabled` (and `vad.silero_barge_in`, the default), Silero VAD scores every caller frame in the engine, gated or not, and triggers pipeline barge-in on `vad.silero_start_ms` of sustained speech, using the same `talk_detect_initial_protection_ms`, `greeting_protection_ms` and `cooldown_ms` guards as talk detection. The local energy check is then skipped; `TALK_DETECT` may stay enabled alongside it.
 - Pipelines play TTS locally (file playback), so the platform can flush playback on barge-in without colliding with provider-owned VAD/cancellation.
 - With ExternalMedia, Asterisk channel playback may pause/alter the inbound RTP stream; `TALK_DETECT` is the preferred trigger source for pipeline barge-in.
 - Prereqs: Asterisk must have talk detection available (`app_talkdetect.so` / `func_talkdetect.so`). Verify with `asterisk -rx 'module show like talkdetect'` and `asterisk -rx 'core show function TALK_DETECT'`.
@@ -564,6 +588,62 @@ Common pitfalls:
 
 - Too-short utterances (e.g., 20 ms) cause empty STT transcripts → raise `min_utterance_duration_ms` and ensure `webrtc_end_silence_frames` is not too low.
 - Overly aggressive VAD (aggressiveness=2/3) may clip 8 kHz speech; prefer 0–1 for telephony.
+
+### Silero VAD (pipelines)
+
+Asterisk `TALK_DETECT`, WebRTC VAD and the energy checks all decide "speech"
+from signal energy, so breathing, line noise or a television count as the
+caller while a quiet trailing syllable counts as silence. Silero VAD v6 is a
+small neural network (about 2 MB, ONNX) that scores every 32 ms of audio with
+a speech probability, natively at 8 or 16 kHz, in well under a millisecond per
+chunk on one CPU core (about half a percent of a core per call). Enabled, it
+runs in the engine on the very frames that reach the recognizer for every
+modular-pipeline call and becomes the one detector behind barge-in, the
+inactivity watchdog and the end of the caller's turn (see
+[Pipeline End of Turn](#pipeline-end-of-turn-caller-turn-taking)). Full-agent
+providers are not affected.
+
+- `vad.silero_enabled`: `true`/`false` (default `false`). Requires
+  `onnxruntime` in the engine image (in `requirements.txt`; rebuild the
+  `ai_engine` image after upgrading) and the model file below. When either is
+  missing the engine logs `Silero VAD unavailable` at start and pipelines fall
+  back to talk detection or the result window exactly as before.
+- `vad.silero_model_path`: path of `silero_vad.onnx` inside the engine
+  container (default `models/vad/silero_vad.onnx`; `./models` is mounted at
+  `/app/models`).
+- `vad.silero_auto_download`: fetch the pinned release (v6.2.1, SHA-256
+  verified) into that path on first start when the file is missing (default
+  `true`). On hosts without outbound access run `scripts/fetch_silero_vad.sh`
+  instead, or place the file from the `silero-vad` 6.2.1 wheel
+  (`silero_vad/data/silero_vad.onnx`) there.
+- `vad.silero_threshold`: speech probability at or above which a chunk counts
+  as speech, 0–1 (default `0.5`). Raise it on noisy trunks, lower it for quiet
+  callers.
+- `vad.silero_stop_threshold`: probability below which speech ends. Defaults
+  to `silero_threshold − 0.15`, Silero's own margin; chunks between the two
+  thresholds neither end speech nor restart it.
+- `vad.silero_start_ms`: sustained speech before the caller counts as talking
+  (default `96`, three chunks). Holds the turn and triggers barge-in.
+- `vad.silero_stop_ms`: silence after the caller's last speech before they
+  count as quiet (default `300`). This is the pause a caller may take
+  mid-sentence; the answer follows it by the pipeline's grace plus the
+  recognizer's finalization, so 300 ms is snappy and 600–800 ms tolerates a
+  caller who thinks aloud.
+- `vad.silero_stt_finalize_ms`: silence fed to the recognizer the moment the
+  caller is quiet (default `900`, `0` disables). A streaming recognizer only
+  closes a phrase after its own silence gate (T-one: 600 ms, at 300 ms chunk
+  boundaries); the burst satisfies it at once instead of in real time, so the
+  result arrives within a recognizer round trip of the stop rather than 600–900
+  ms later. Plain zeros through the normal audio path, so no recognizer change
+  is needed; a recognizer that already emitted the phrase simply scores a
+  little more silence.
+- `vad.silero_barge_in`: let Silero speech during agent playback trigger
+  barge-in (default `true`). Turn off to leave barge-in to `TALK_DETECT` while
+  Silero still decides the end of turn.
+
+Every call logs `Silero VAD tracking caller speech` at start; each end of
+speech logs `Silero VAD: caller quiet` at debug level with whether a finalize
+burst was sent and whether a result is still expected.
 
 ## Caller inactivity (`no_input`)
 
