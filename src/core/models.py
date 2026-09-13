@@ -45,6 +45,10 @@ class PlaybackRef:
     media_uri: str
     audio_file: str
     timestamp: float = field(default_factory=time.time)
+    # How long the audio should take to play. Lets a PlaybackFinished that
+    # arrives before the audio could possibly have played be recognised as
+    # spurious instead of reopening the caller's microphone mid-prompt.
+    expected_duration_sec: Optional[float] = None
 
 
 @dataclass

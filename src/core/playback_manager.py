@@ -21,6 +21,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = structlog.get_logger(__name__)
 
+# A PlaybackFinished arriving sooner than this after ARI accepted the playback
+# cannot describe audio that actually played.
+MIN_PLAUSIBLE_PLAYBACK_SEC = 0.25
+
 
 class PlaybackManager:
     """
@@ -45,6 +49,8 @@ class PlaybackManager:
         self.ari_client = ari_client
         self.media_dir = media_dir
         self.conversation_coordinator = conversation_coordinator
+        # Monotonic start time per playback, set once ARI has accepted it.
+        self._playback_started_at: Dict[str, float] = {}
         
         # Ensure media directory exists
         # Note: Directory should be set up with setgid bit by preflight.sh
@@ -155,7 +161,8 @@ class PlaybackManager:
                 channel_id=session.caller_channel_id,
                 bridge_id=session.bridge_id,
                 media_uri=f"sound:ai-generated/{os.path.basename(audio_file).replace('.ulaw', '')}",
-                audio_file=audio_file
+                audio_file=audio_file,
+                expected_duration_sec=self._audio_duration_sec(len(audio_bytes)),
             )
             
             # Track playback reference BEFORE playing to avoid race condition
@@ -175,6 +182,8 @@ class PlaybackManager:
                     await self.session_store.clear_gating_token(call_id, playback_id)
                 return None
             
+            self._playback_started_at[playback_id] = time.monotonic()
+
             # Schedule token-aware fallback to ensure gating is cleared even if PlaybackFinished is missed
             await self._schedule_gating_fallback(call_id, playback_id, len(audio_bytes))
             
@@ -205,12 +214,16 @@ class PlaybackManager:
             True if handled successfully, False otherwise
         """
         try:
+            if await self._is_premature_finish(playback_id):
+                return False
+
             # Get playback reference
             playback_ref = await self.session_store.pop_playback(playback_id)
             if not playback_ref:
                 logger.warning("🔊 PlaybackFinished for unknown playback ID",
                              playback_id=playback_id)
                 return False
+            self._playback_started_at.pop(playback_id, None)
             
             # Clear TTS gating token
             if self.conversation_coordinator:
@@ -243,6 +256,43 @@ class PlaybackManager:
                         error=str(e),
                         exc_info=True)
             return False
+
+    @staticmethod
+    def _audio_duration_sec(audio_size: int) -> float:
+        """Return how long the audio should play (8 kHz, one byte per sample)."""
+        return max(0.0, audio_size / 8000.0)
+
+    async def _is_premature_finish(self, playback_id: str) -> bool:
+        """Report whether a PlaybackFinished arrived before the audio could play.
+
+        Asterisk has been observed reporting a bridge playback finished within
+        milliseconds of starting it. Trusting that reopens the caller's
+        microphone while the prompt is still audible, and in a modular pipeline
+        the gated frames are dropped outright, so the caller's own speech loses
+        the slice that was cut out. The scheduled gating fallback still clears
+        the token at the end of the audio, so ignoring the event cannot strand
+        a call; a barge-in clears its gating tokens directly and is unaffected.
+        """
+        started_at = self._playback_started_at.get(playback_id)
+        if started_at is None:
+            return False
+        playback_ref = await self.session_store.get_playback(playback_id)
+        expected = getattr(playback_ref, "expected_duration_sec", None) if playback_ref else None
+        # Only audio comfortably longer than the floor is worth guarding: a clip
+        # shorter than that can legitimately finish within it.
+        if not expected or expected < 2 * MIN_PLAUSIBLE_PLAYBACK_SEC:
+            return False
+        elapsed = time.monotonic() - started_at
+        if elapsed >= MIN_PLAUSIBLE_PLAYBACK_SEC:
+            return False
+        logger.warning(
+            "🔊 Ignoring PlaybackFinished that arrived before the audio could play",
+            playback_id=playback_id,
+            elapsed_sec=round(elapsed, 3),
+            expected_duration_sec=round(float(expected), 3),
+            floor_sec=MIN_PLAUSIBLE_PLAYBACK_SEC,
+        )
+        return True
 
     async def wait_for_playback_end(
         self,
@@ -419,7 +469,7 @@ class PlaybackManager:
         """
         try:
             # Calculate audio duration: 8kHz uLaw = 8000 samples/sec = 1 byte per sample
-            audio_duration = audio_size / 8000.0  # seconds
+            audio_duration = self._audio_duration_sec(audio_size)
             
             # Use longer safety margin for pipeline mode (file-based playback has more latency)
             # Pipeline mode: Asterisk file loading + processing + event delivery = 0.8-1.8s typical
