@@ -9,7 +9,7 @@ import base64
 import pytest
 
 from src.config import ElevenLabsProviderConfig
-from src.pipelines.elevenlabs import (
+from src.pipelines.elevenlabs import (  # noqa: F401
     ElevenLabsTTSAdapter,
     sanitize_proxy_url,
     split_proxy_credentials,
@@ -242,3 +242,76 @@ async def test_the_real_session_keeps_the_aiohttp_default_when_unset():
         assert adapter._session.connector._keepalive_timeout == pytest.approx(15.0)
     finally:
         await adapter.stop()
+
+
+# --- a modular single-capability provider block ------------------------------
+
+
+def _modular_app_config(provider_block):
+    """One provider carrying only the tts capability, as the Admin UI writes it."""
+    from src.config import AppConfig
+
+    return AppConfig(
+        default_provider="local",
+        providers={
+            "local": {"enabled": True},
+            "elevenlabs_tts": {
+                "type": "elevenlabs",
+                "capabilities": ["tts"],
+                "api_key": "test-key",
+                **provider_block,
+            },
+        },
+        asterisk={"host": "127.0.0.1", "username": "ari", "password": "secret"},
+        llm={"initial_greeting": "hi", "prompt": "prompt", "model": "gpt-4o"},
+        pipelines={"p": {"stt": "local_stt", "llm": "local_llm", "tts": "elevenlabs_tts"}},
+        active_pipeline="p",
+        audio_transport="audiosocket",
+    )
+
+
+@pytest.mark.asyncio
+async def test_modular_provider_block_carries_the_proxy_to_the_adapter():
+    """The single-capability editor writes this shape, not the full-agent one."""
+    from src.pipelines.orchestrator import PipelineOrchestrator
+
+    orchestrator = PipelineOrchestrator(
+        _modular_app_config({"proxy": "http://xray:8080", "keepalive_timeout_sec": 120})
+    )
+    await orchestrator.start()
+
+    resolution = orchestrator.get_pipeline("call-1")
+    adapter = resolution.tts_adapter
+
+    assert isinstance(adapter, ElevenLabsTTSAdapter)
+    assert adapter._proxy_url == "http://xray:8080"
+    assert adapter._keepalive_timeout_sec == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
+async def test_modular_provider_block_without_routing_stays_direct():
+    from src.pipelines.orchestrator import PipelineOrchestrator
+
+    orchestrator = PipelineOrchestrator(_modular_app_config({}))
+    await orchestrator.start()
+
+    adapter = orchestrator.get_pipeline("call-2").tts_adapter
+
+    assert adapter._proxy_url is None
+    assert adapter._keepalive_timeout_sec is None
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_proxy_field_stays_direct():
+    """Clearing the field in the editor saves an empty string, not a removal."""
+    from src.pipelines.orchestrator import PipelineOrchestrator
+
+    orchestrator = PipelineOrchestrator(
+        _modular_app_config({"proxy": "", "keepalive_timeout_sec": ""})
+    )
+    await orchestrator.start()
+
+    adapter = orchestrator.get_pipeline("call-3").tts_adapter
+
+    assert adapter._proxy_url is None
+    assert adapter._keepalive_timeout_sec is None

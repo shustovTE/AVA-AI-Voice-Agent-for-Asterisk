@@ -32,3 +32,28 @@ describe('modular LLM provider subtypes', () => {
         ).toBe('deepseek');
     });
 });
+
+describe('modular TTS provider subtypes', () => {
+    it('exposes the ElevenLabs proxy settings so they are reachable outside the full-agent form', () => {
+        const elevenlabs = MODULAR_SUBTYPES.tts.find(subtype => subtype.id === 'elevenlabs');
+
+        expect(elevenlabs).toBeDefined();
+        expect(elevenlabs?.yamlType).toBe('elevenlabs');
+        expect(elevenlabs?.fields).toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({ key: 'proxy', type: 'text', required: false }),
+                expect.objectContaining({ key: 'keepalive_timeout_sec', type: 'number', required: false }),
+            ])
+        );
+    });
+
+    it('leaves both routing fields empty by default, which means a direct connection', () => {
+        const elevenlabs = MODULAR_SUBTYPES.tts.find(subtype => subtype.id === 'elevenlabs');
+        const routing = elevenlabs?.fields.filter(
+            field => field.key === 'proxy' || field.key === 'keepalive_timeout_sec'
+        );
+
+        expect(routing).toHaveLength(2);
+        routing?.forEach(field => expect(field.default).toBeUndefined());
+    });
+});

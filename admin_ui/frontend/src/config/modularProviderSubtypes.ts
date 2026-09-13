@@ -225,6 +225,8 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
       { key: 'model_id', label: 'Model', type: 'combobox', required: false, default: 'eleven_turbo_v2_5', suggestions: ['eleven_turbo_v2_5', 'eleven_multilingual_v2', 'eleven_monolingual_v1'] },
       { key: 'output_format', label: 'Output Format', type: 'combobox', required: false, default: 'ulaw_8000', suggestions: ['ulaw_8000', 'pcm_16000', 'pcm_24000', 'mp3_44100'] },
       OUTPUT_RESAMPLER_FIELD,
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes ElevenLabs traffic, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the call instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional. How long an idle connection to ElevenLabs is kept for reuse; empty keeps the 15 second default. Audio streams one sentence at a time, so a dropped connection makes the next sentence pay a fresh TLS handshake, and through a proxy that costs several extra round trips. A window of 60-180 outlasts a caller pause.' },
     ],
   },
   {

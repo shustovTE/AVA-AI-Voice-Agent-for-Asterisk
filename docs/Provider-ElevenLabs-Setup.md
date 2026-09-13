@@ -597,10 +597,12 @@ providers:
   handshakes, which lands on the greeting where it matters least.
 
 Both keys are also accepted per pipeline under `options.tts`, where they
-override the provider block. The Admin UI exposes them under **Network
-Routing** in the ElevenLabs provider editor (TTS Engine mode). The provider
-connection test in the Admin UI does not go through the proxy, so it can report
-an error while calls work.
+override the provider block. The Admin UI exposes them in either editor: under
+**Network Routing** in the ElevenLabs provider form (TTS Engine mode), and as
+**HTTP Proxy** and **Keepalive Timeout** when the provider is configured as
+*Modular (single capability)* with a TTS provider type of `elevenlabs`. The
+provider connection test in the Admin UI does not go through the proxy, so it
+can report an error while calls work.
 
 ### Pipeline Configuration
 
