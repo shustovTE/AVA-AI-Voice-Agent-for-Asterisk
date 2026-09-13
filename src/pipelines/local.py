@@ -149,7 +149,16 @@ class _LocalAdapterBase:
             await self.close_call(call_id)
         logger.debug("Local adapter stopped", component=self.component_key)
 
-    # validate_connectivity removed - uses smart generic base class implementation
+    async def validate_connectivity(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Probe the address this adapter actually dials.
+
+        The generic validator is handed a pipeline's role options alone, and
+        ``ws_url`` normally lives in the provider block. Without the provider
+        defaults merged in, every check fell back to a hardcoded loopback
+        address and reported a failure on a healthy server.
+        """
+        return await super().validate_connectivity(self._compose_options(options or {}))
+
 
     async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
         if self._closed:
@@ -316,7 +325,9 @@ class _LocalAdapterBase:
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         merged = _merge_dicts(dict(self._provider_defaults or {}), self._pipeline_defaults)
         merged = _merge_dicts(merged, runtime_options)
-        merged.setdefault("ws_url", merged.get("ws_url") or _DEFAULT_WS_URL)
+        # Assignment, not setdefault: the key is present but null whenever the
+        # provider block clears it, and setdefault would leave that null in place.
+        merged["ws_url"] = merged.get("ws_url") or _DEFAULT_WS_URL
         merged.setdefault("connect_timeout_sec", merged.get("connect_timeout_sec", 5.0))
         merged.setdefault("response_timeout_sec", merged.get("response_timeout_sec", 5.0))
         merged.setdefault("mode", merged.get("mode", self._default_mode))

@@ -215,7 +215,10 @@ class Component(ABC):
         # This prevents local_llm from being validated against OpenAI when pipeline
         # options contain base_url for cloud providers
         if component_key.startswith("local_"):
-            base_url = options.get("ws_url") or "ws://127.0.0.1:8765/ws"
+            # Last resort only: local adapters merge their provider block before
+            # calling this, so a real deployment never reaches this literal. It
+            # tracks _DEFAULT_WS_URL in pipelines/local.py, which has no path.
+            base_url = options.get("ws_url") or "ws://127.0.0.1:8765"
             return await self._test_websocket_connection(base_url, api_key=None)
         
         # 1. Extract base URL from options for non-local components
