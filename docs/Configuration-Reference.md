@@ -88,6 +88,21 @@ window and `aggregation_max_wait_sec` as the cap, all converted from seconds.
 `Ignoring superseded transcript aggregation options` — the word and character
 thresholds are what answered callers mid-sentence.
 
+### Pipeline Gated Audio
+
+While the agent speaks, the caller's frames are withheld so the agent cannot
+hear itself. Dropping them outright glues the audio either side of the gap
+together, and a word straddling a short gap reaches the recognizer garbled. The
+engine therefore feeds silence in their place, which keeps the recognizer's
+timeline continuous.
+
+- `pipelines.<name>.options.stt.gated_silence_ms`: how long silence is fed into
+  one gated stretch. Defaults to `3000`. Each silent frame costs the recognizer
+  one more inference, and past a few seconds the caller has long stopped talking
+  and a splice is harmless, so the budget caps what an agent turn costs. `0`
+  restores the previous behaviour of dropping the frames. The budget is renewed
+  as soon as real audio flows again.
+
 ### Golden Baselines
 See the validated configurations in `config/`:
 - `ai-agent.golden-openai.yaml` - OpenAI Realtime (monolithic, fastest)

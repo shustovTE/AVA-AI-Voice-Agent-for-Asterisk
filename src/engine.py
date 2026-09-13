@@ -150,6 +150,11 @@ PIPELINE_STT_STREAM_FORMAT = "pcm16_16k"
 PIPELINE_STT_ENCODING = "linear16"
 PIPELINE_STT_CHANNELS = 1
 PIPELINE_STT_BYTES_PER_SAMPLE = 2
+# While the caller's audio is gated the engine feeds the recognizer silence
+# rather than dropping frames, so a word straddling the gap is not spliced.
+# Past this much the caller has long stopped talking and a splice is harmless,
+# so the budget caps the extra inference an agent turn costs.
+PIPELINE_GATED_SILENCE_MS_DEFAULT = 3000
 CONNECTION_AUDIO_HANDOFF_TIMEOUT_SECONDS = 10.0
 OUTBOUND_ATTEMPT_STALE_SECONDS_DEFAULT = 120.0
 # A human-first AMD preset. In particular, Asterisk's stock max-word default
@@ -693,6 +698,9 @@ class Engine:
         self._resample_state_provider_out: Dict[str, Optional[tuple]] = {}
         # Forced pipeline PCM16@16k path (per-call)
         self._resample_state_pipeline16k: Dict[str, Optional[tuple]] = {}
+        # Silence budget per call while gated, and how much of it is spent.
+        self._pipeline_gated_silence_ms: Dict[str, float] = {}
+        self._pipeline_gated_silence_used_ms: Dict[str, float] = {}
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -9528,6 +9536,8 @@ class Engine:
             self._resample_state_provider_in.pop(call_id, None)
             self._resample_state_provider_out.pop(call_id, None)
             self._resample_state_pipeline16k.pop(call_id, None)
+            self._pipeline_gated_silence_ms.pop(call_id, None)
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -10246,13 +10256,13 @@ class Engine:
                     # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
-                        return
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     # If TALK_DETECT is enabled for this pipeline, prefer it over local energy checks
                     # to avoid double-triggering and false positives on AudioSocket.
                     try:
                         td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
                         if bool(td.get("enabled", False)):
-                            return
+                            return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     except Exception:
                         pass
                     now = time.time()
@@ -10345,7 +10355,11 @@ class Engine:
                                 self.conversation_coordinator.note_audio_during_tts(caller_channel_id)
                             except Exception:
                                 pass
-                        return
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
+                else:
+                    # Real audio is flowing again, so the next gated stretch gets
+                    # the full silence budget.
+                    self._pipeline_gated_silence_used_ms.pop(caller_channel_id, None)
                 
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
@@ -11340,6 +11354,50 @@ class Engine:
             return ok
         except Exception:
             return False
+
+    def _feed_pipeline_silence(self, call_id: str, pcm_bytes: bytes, pcm_rate: int) -> None:
+        """Replace a gated frame with silence instead of dropping it.
+
+        Dropping leaves the streaming recognizer a splice: the audio either side
+        of the gap is glued together and a word straddling it comes out garbled.
+        Silence keeps the timeline continuous. It costs one more inference per
+        frame, so ``gated_silence_ms`` bounds how long it is worth paying.
+        """
+        budget_ms = self._pipeline_gated_silence_ms.get(
+            call_id, float(PIPELINE_GATED_SILENCE_MS_DEFAULT)
+        )
+        if budget_ms <= 0 or not pcm_bytes:
+            return None
+        used_ms = self._pipeline_gated_silence_used_ms.get(call_id, 0.0)
+        if used_ms >= budget_ms:
+            return None
+        frame_ms = (len(pcm_bytes) / 2.0) / max(1, int(pcm_rate)) * 1000.0
+        self._pipeline_gated_silence_used_ms[call_id] = used_ms + frame_ms
+
+        q = self._pipeline_queues.get(call_id)
+        if not q:
+            return None
+        try:
+            # Run the zeros through the same resampler so its state stays aligned
+            # with the sample count the recognizer has already consumed.
+            silence = bytes(len(pcm_bytes))
+            if pcm_rate != PIPELINE_STT_SAMPLE_RATE_HZ:
+                try:
+                    state = self._resample_state_pipeline16k.get(call_id)
+                    silence, state = resample_audio(
+                        silence,
+                        pcm_rate,
+                        PIPELINE_STT_SAMPLE_RATE_HZ,
+                        state=state,
+                    )
+                    self._resample_state_pipeline16k[call_id] = state
+                except (TypeError, ValueError, IndexError):
+                    return None
+            if silence:
+                q.put_nowait(silence)
+        except asyncio.QueueFull:
+            logger.debug("Pipeline queue full; dropping gated silence frame", call_id=call_id)
+        return None
 
     async def _maybe_provider_barge_in_fallback(
         self,
@@ -15136,6 +15194,20 @@ class Engine:
             base_commit_ms = 160
             stt_chunk_ms = int(stt_options.get("chunk_ms", base_commit_ms)) if stt_options else base_commit_ms
             commit_ms = max(stt_chunk_ms, 80)
+            try:
+                self._pipeline_gated_silence_ms[call_id] = max(
+                    0.0,
+                    float(
+                        (stt_options or {}).get(
+                            "gated_silence_ms", PIPELINE_GATED_SILENCE_MS_DEFAULT
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                self._pipeline_gated_silence_ms[call_id] = float(
+                    PIPELINE_GATED_SILENCE_MS_DEFAULT
+                )
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
             commit_bytes = bytes_per_ms * commit_ms
 
             inbound_queue = self._pipeline_queues.get(call_id)
