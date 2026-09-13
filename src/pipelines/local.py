@@ -884,7 +884,9 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     "Local STT final received by adapter",
                     component=self.component_key,
                     call_id=session.call_id,
+                    transcript_chars=len(text),
                     transcript_preview=text[:80],
+                    transcript_tail=text[-40:] if len(text) > 80 else None,
                     receiver_restart_count=session.receiver_restart_count,
                 )
                 try:

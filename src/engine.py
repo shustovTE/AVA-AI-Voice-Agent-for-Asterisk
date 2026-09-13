@@ -15553,6 +15553,9 @@ class Engine:
                         _SENTENCE_RE = re.compile(r"[.!?]\s+")
                         sentence_buffer = ""
                         full_response_text = ""
+                        # Sentences fully handed to playback; on an interruption
+                        # this is what the caller could have heard.
+                        spoken_text = ""
                         first_tts_ts: Optional[float] = None
 
                         stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -15616,6 +15619,7 @@ class Engine:
                                                 await self._put_pipeline_stream_chunk(
                                                     call_id, stream_id, stream_q, tts_chunk
                                                 )
+                                        spoken_text += to_speak + " "
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
@@ -15631,6 +15635,7 @@ class Engine:
                                         await self._put_pipeline_stream_chunk(
                                             call_id, stream_id, stream_q, tts_chunk
                                         )
+                                spoken_text += remainder
 
                             # End-of-segment sentinel
                             await self._put_pipeline_stream_chunk(
@@ -15645,15 +15650,34 @@ class Engine:
                                 pass
 
                         except _PipelinePlaybackInterrupted:
+                            spoken = spoken_text.strip()
                             logger.info(
                                 "Pipeline streaming turn interrupted; discarding remaining TTS",
                                 call_id=call_id,
                                 stream_id=stream_id,
+                                spoken_chars=len(spoken),
+                                generated_chars=len(full_response_text),
                             )
                             try:
                                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
                             except Exception:
                                 pass
+                            # The caller's words must survive the interruption, or the
+                            # model answers the next turn with no memory of them. For
+                            # the assistant only the sentences that reached playback
+                            # are kept, so the history says what was actually heard.
+                            conversation_history.append(_ts_msg("user", transcript_text))
+                            if spoken:
+                                conversation_history.append(_ts_msg("assistant", spoken))
+                            session.conversation_history = list(conversation_history)
+                            try:
+                                await self.session_store.upsert_call(session)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist interrupted turn",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
                             return
                         except Exception:
                             logger.error(
@@ -16684,7 +16708,10 @@ class Engine:
                         waited_sec=round(time.monotonic() - started_at, 3)
                         if started_at is not None
                         else None,
+                        chars=len(aggregated),
                         preview=aggregated[:80],
+                        # The ending is what end-of-turn tuning needs to see.
+                        tail=aggregated[-40:] if len(aggregated) > 80 else None,
                     )
                     await run_turn(aggregated)
 
