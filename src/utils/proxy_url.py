@@ -1,4 +1,4 @@
-"""Proxy URL handling shared by the engine's ElevenLabs adapter and the Admin UI probe.
+"""Proxy URL handling shared by the engine's HTTP adapters and the Admin UI probe.
 
 Both must read one ``proxy`` setting the same way: only ``http://`` and
 ``https://`` are usable (aiohttp speaks no SOCKS), inline credentials become a
@@ -44,12 +44,12 @@ def split_proxy_credentials(
     parts = urlsplit(cleaned)
     if parts.scheme not in SUPPORTED_PROXY_SCHEMES:
         raise ValueError(
-            f"Unsupported ElevenLabs proxy scheme {parts.scheme!r}: aiohttp speaks "
+            f"Unsupported proxy scheme {parts.scheme!r}: aiohttp speaks "
             "only http:// and https://. Expose an HTTP inbound on the proxy, or "
             "install aiohttp-socks and route at the network level instead."
         )
     if not parts.hostname:
-        raise ValueError(f"ElevenLabs proxy URL has no host: {cleaned!r}")
+        raise ValueError(f"Proxy URL has no host: {cleaned!r}")
     if not parts.username and not parts.password:
         return cleaned, None
     token = base64.b64encode(

@@ -594,7 +594,10 @@ providers:
   fresh TLS handshake, and through a proxy that costs several extra round
   trips. A window that outlasts a caller's pause (60-180 s) removes that from
   the middle of a conversation. The first sentence of each call still
-  handshakes, which lands on the greeting where it matters least.
+  handshakes, which lands on the greeting where it matters least. Whether a
+  sentence reused the connection is in its `ElevenLabs TTS synthesis
+  completed` log line: `connection=reused`, or `connection=new` with
+  `connect_ms` for the handshake it paid.
 
 Both keys are also accepted per pipeline under `options.tts`, where they
 override the provider block. The Admin UI exposes them in either editor: under

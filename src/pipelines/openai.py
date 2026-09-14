@@ -31,6 +31,8 @@ from ..audio import (
 from ..config import AppConfig, OpenAIProviderConfig
 from ..logging_config import get_logger
 from .base import LLMComponent, STTComponent, TTSComponent, LLMResponse
+from ..utils.http_trace import HttpTrace, build_trace_config
+from ..utils.proxy_url import split_proxy_credentials
 from ..tools.registry import tool_registry
 
 logger = get_logger(__name__)
@@ -417,6 +419,73 @@ class OpenAILLMAdapter(LLMComponent):
         self._session: Optional[aiohttp.ClientSession] = None
         self._default_timeout = float(self._pipeline_defaults.get("response_timeout_sec", provider_config.response_timeout_sec))
         self._pending_tool_calls_by_call: dict = {}
+        # Transport settings describe the connection, not one request, so they
+        # are resolved once here, as the ElevenLabs adapter does. A malformed
+        # proxy fails now rather than leaking traffic onto the direct route.
+        self._proxy_url, self._proxy_headers = split_proxy_credentials(
+            self._transport_setting("proxy")
+        )
+        self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+        self._trace_enabled = False
+
+    # After ``data: [DONE]`` the body has at most a chunk terminator left; a
+    # server that never ends it must not stall the turn.
+    STREAM_DRAIN_TIMEOUT_SEC = 1.0
+
+    def _transport_setting(self, key: str) -> Any:
+        """Read one transport setting: the pipeline's options.llm override the provider block."""
+        if key in self._pipeline_defaults:
+            return self._pipeline_defaults[key]
+        return getattr(self._provider_defaults, key, None)
+
+    def _resolve_keepalive_timeout(self) -> Optional[float]:
+        raw = self._transport_setting("keepalive_timeout_sec")
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring unparsable LLM keepalive_timeout_sec",
+                component=self.component_key,
+                value=repr(raw),
+            )
+            return None
+        return value if value > 0 else None
+
+    def _request_kwargs(self, timeout: Any, trace: HttpTrace) -> Dict[str, Any]:
+        """Per-request transport arguments: the proxy when set, tracing when ours."""
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if self._proxy_url:
+            kwargs["proxy"] = self._proxy_url
+            if self._proxy_headers:
+                kwargs["proxy_headers"] = self._proxy_headers
+        if self._trace_enabled:
+            kwargs["trace_request_ctx"] = trace
+        return kwargs
+
+    def _trace_fields(self, trace: Optional[HttpTrace]) -> Dict[str, Any]:
+        if trace is None or not self._trace_enabled:
+            return {}
+        return trace.as_log_fields()
+
+    async def _drain_stream(self, call_id: str, response: Any) -> None:
+        """Read the body to its end after ``[DONE]`` so the connection can be pooled.
+
+        aiohttp closes a connection whose body was left unread, and the chunk
+        terminator can land a packet after the ``[DONE]`` line, so breaking out
+        at once could cost the next turn a fresh TLS handshake.
+        """
+        reader = getattr(getattr(response, "content", None), "read", None)
+        if not callable(reader):
+            return
+        try:
+            await asyncio.wait_for(reader(), timeout=self.STREAM_DRAIN_TIMEOUT_SEC)
+        except Exception:
+            logger.debug(
+                "OpenAI stream not drained after [DONE]; the connection will be closed",
+                call_id=call_id,
+            )
 
     async def start(self) -> None:
         logger.debug(
@@ -514,8 +583,14 @@ class OpenAILLMAdapter(LLMComponent):
         retries = 1
         tools_stripped = False
         for attempt in range(retries + 1):
+            trace = HttpTrace()
             try:
-                async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    **self._request_kwargs(merged["timeout_sec"], trace),
+                ) as response:
                     body = await response.text()
                     if response.status >= 400:
                         logger.error(
@@ -564,6 +639,7 @@ class OpenAILLMAdapter(LLMComponent):
                         "model": payload.get("model"),
                         "preview": (content or "")[:80],
                         "finish_reason": finish_reason,
+                        **self._trace_fields(trace),
                     }
                     if tool_calls:
                         log_ctx["tool_calls"] = len(tool_calls)
@@ -716,9 +792,17 @@ class OpenAILLMAdapter(LLMComponent):
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
         finish_reason: Optional[str] = None
         generated_chars = 0
+        first_token_ms: Optional[float] = None
+        started_at = time.perf_counter()
+        trace = HttpTrace()
 
         try:
-            async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+            async with self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                **self._request_kwargs(merged["timeout_sec"], trace),
+            ) as response:
                 if response.status >= 400:
                     body = await response.text()
                     logger.error("OpenAI streaming failed", call_id=call_id, status=response.status, body_preview=body[:128])
@@ -730,6 +814,7 @@ class OpenAILLMAdapter(LLMComponent):
                         continue
                     data_str = line_str[6:]
                     if data_str == "[DONE]":
+                        await self._drain_stream(call_id, response)
                         break
                     try:
                         chunk = json.loads(data_str)
@@ -740,6 +825,8 @@ class OpenAILLMAdapter(LLMComponent):
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
+                                if first_token_ms is None:
+                                    first_token_ms = (time.perf_counter() - started_at) * 1000.0
                                 generated_chars += len(content)
                                 yield content
 
@@ -765,6 +852,16 @@ class OpenAILLMAdapter(LLMComponent):
                         continue
 
             self._note_finish_reason(call_id, finish_reason, payload, generated_chars)
+            logger.info(
+                "OpenAI streaming completed",
+                call_id=call_id,
+                model=payload.get("model"),
+                finish_reason=finish_reason,
+                chars=generated_chars,
+                first_token_ms=round(first_token_ms, 1) if first_token_ms is not None else None,
+                total_ms=round((time.perf_counter() - started_at) * 1000.0, 1),
+                **self._trace_fields(trace),
+            )
 
             # Parse accumulated tool calls
             if _tool_call_accum:
@@ -830,8 +927,30 @@ class OpenAILLMAdapter(LLMComponent):
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
             return
-        factory = self._session_factory or aiohttp.ClientSession
-        self._session = factory()
+        if self._session_factory is not None:
+            self._session = self._session_factory()
+            self._trace_enabled = False
+            return
+        # keepalive_timeout_sec stands on its own: an idle window that outlasts
+        # a caller's turn saves the next request a TCP+TLS handshake whether or
+        # not a proxy is in the path. trust_env stays off, as everywhere in the
+        # engine, so only the configured proxy is ever used.
+        connector = (
+            aiohttp.TCPConnector(keepalive_timeout=self._keepalive_timeout_sec)
+            if self._keepalive_timeout_sec is not None
+            else None
+        )
+        self._session = aiohttp.ClientSession(
+            connector=connector, trace_configs=[build_trace_config()]
+        )
+        self._trace_enabled = True
+        logger.info(
+            "OpenAI-compatible LLM transport ready",
+            component=self.component_key,
+            proxy=self._proxy_url,
+            proxy_authenticated=self._proxy_headers is not None,
+            keepalive_timeout_sec=self._keepalive_timeout_sec,
+        )
 
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         runtime_options = runtime_options or {}

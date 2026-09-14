@@ -43,6 +43,8 @@ const LLM_SUBTYPES: ProviderSubtype[] = [
       { key: 'temperature', label: 'Temperature', type: 'number', required: false, default: 0.7 },
       { key: 'max_tokens', label: 'Max Tokens', type: 'number', required: false, default: 200 },
       { key: 'response_timeout_sec', label: 'Response Timeout (sec)', type: 'number', required: false, default: 15, tooltip: 'Max wait time for LLM response. Increase for complex prompts or slow endpoints.' },
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes this LLM\'s Chat Completions requests, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the adapter instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional, works with or without a proxy. How long an idle connection to the endpoint is kept for reuse; empty keeps the 15 second default. One request is made per caller turn, and the pause between turns usually exceeds 15 seconds, so the default pays a fresh TCP+TLS handshake almost every reply. A window of 120-300 outlasts a turn; the log then shows connection=reused.' },
     ],
   },
   {
@@ -56,6 +58,8 @@ const LLM_SUBTYPES: ProviderSubtype[] = [
       { key: 'temperature', label: 'Temperature', type: 'number', required: false, default: 0.3 },
       { key: 'max_tokens', label: 'Max Tokens', type: 'number', required: false, default: 200 },
       { key: 'response_timeout_sec', label: 'Response Timeout (sec)', type: 'number', required: false, default: 30, tooltip: 'Max wait time for a DeepSeek response.' },
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes this LLM\'s Chat Completions requests, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the adapter instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional, works with or without a proxy. How long an idle connection to the endpoint is kept for reuse; empty keeps the 15 second default. One request is made per caller turn, and the pause between turns usually exceeds 15 seconds, so the default pays a fresh TCP+TLS handshake almost every reply. A window of 120-300 outlasts a turn; the log then shows connection=reused.' },
     ],
   },
   {

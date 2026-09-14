@@ -34,6 +34,19 @@ describe('modular LLM provider subtypes', () => {
 });
 
 describe('modular TTS provider subtypes', () => {
+    it('exposes the transport settings of the OpenAI-compatible LLM subtypes', () => {
+        for (const id of ['openai', 'deepseek']) {
+            const subtype = MODULAR_SUBTYPES.llm.find(candidate => candidate.id === id);
+            expect(subtype).toBeDefined();
+            expect(subtype?.fields).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ key: 'proxy', type: 'text', required: false }),
+                    expect.objectContaining({ key: 'keepalive_timeout_sec', type: 'number', required: false }),
+                ]),
+            );
+        }
+    });
+
     it('exposes the ElevenLabs proxy settings so they are reachable outside the full-agent form', () => {
         const elevenlabs = MODULAR_SUBTYPES.tts.find(subtype => subtype.id === 'elevenlabs');
 

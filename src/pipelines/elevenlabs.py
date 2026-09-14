@@ -21,6 +21,7 @@ import aiohttp
 
 from ..config import AppConfig, ElevenLabsProviderConfig
 from ..logging_config import get_logger
+from ..utils.http_trace import HttpTrace, build_trace_config
 from ..utils.proxy_url import (  # noqa: F401 - re-exported
     SUPPORTED_PROXY_SCHEMES,
     sanitize_proxy_url,
@@ -81,6 +82,16 @@ class ElevenLabsTTSAdapter(TTSComponent):
             self._setting("proxy")
         )
         self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+        self._trace_enabled = False
+
+    def _trace_kwargs(self, trace: HttpTrace) -> Dict[str, Any]:
+        """Attach connection tracing to a request on a session this adapter built."""
+        return {"trace_request_ctx": trace} if self._trace_enabled else {}
+
+    def _trace_fields(self, trace: Optional[HttpTrace]) -> Dict[str, Any]:
+        if trace is None or not self._trace_enabled:
+            return {}
+        return trace.as_log_fields()
 
     def _setting(self, key: str) -> Any:
         """Read one transport setting: pipeline options override the provider."""
@@ -234,6 +245,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
         )
         
         started_at = time.perf_counter()
+        trace = HttpTrace()
         
         try:
             async with self._session.post(
@@ -243,6 +255,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
                 params=params,
                 proxy=self._proxy_url,
                 proxy_headers=self._proxy_headers,
+                **self._trace_kwargs(trace),
             ) as response:
                 if response.status >= 400:
                     body = await response.text()
@@ -261,6 +274,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
                         call_id=call_id,
                         request_id=request_id,
                         started_at=started_at,
+                    trace=trace,
                         output_format=output_format,
                         target_encoding=target_encoding,
                         target_sample_rate=target_sample_rate,
@@ -300,6 +314,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
                     target_encoding=target_encoding,
                     target_sample_rate=target_sample_rate,
                     streamed=False,
+                    **self._trace_fields(trace),
                 )
                 
                 # Yield in chunks for streaming playback
@@ -330,6 +345,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
         target_encoding: str,
         target_sample_rate: int,
         chunk_ms: int,
+        trace: Optional[HttpTrace] = None,
     ) -> AsyncIterator[bytes]:
         """Emit playback frames while the response body is still arriving.
 
@@ -401,6 +417,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
             target_encoding=target_encoding,
             target_sample_rate=target_sample_rate,
             streamed=True,
+            **self._trace_fields(trace),
         )
 
     async def _ensure_session(self) -> None:
@@ -409,13 +426,17 @@ class ElevenLabsTTSAdapter(TTSComponent):
             return
         if self._session_factory is not None:
             self._session = self._session_factory()
+            self._trace_enabled = False
             return
         connector = (
             aiohttp.TCPConnector(keepalive_timeout=self._keepalive_timeout_sec)
             if self._keepalive_timeout_sec is not None
             else None
         )
-        self._session = aiohttp.ClientSession(connector=connector)
+        self._session = aiohttp.ClientSession(
+            connector=connector, trace_configs=[build_trace_config()]
+        )
+        self._trace_enabled = True
         if self._proxy_url:
             logger.info(
                 "ElevenLabs TTS routed through a proxy",

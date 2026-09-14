@@ -811,6 +811,24 @@ Keys the engine owns in the request itself (`model`, `messages`, `stream`, `tool
 
 For prompt caching (`prompt_cache_key` on OpenAI and Mistral, where cached input tokens bill at a fraction of the normal rate), pick a value that stays the same across calls sharing a system prompt and bump it when that prompt changes. A per-call value defeats the cache, and the key must not contain secrets or personal data.
 
+**Transport (LLM).** One Chat Completions request is made per caller turn, and the pause between turns (the reply's playback plus the caller's next words) usually outlasts aiohttp's 15 s idle window, so by default almost every reply pays a fresh TCP+TLS handshake. Two typed keys on the provider block, both also accepted per pipeline under `options.llm` where they override the block, change that; neither is ever forwarded to the endpoint as a body field:
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://api.mistral.ai/v1
+    keepalive_timeout_sec: 240        # idle window for connection reuse; absent = aiohttp's 15 s
+    proxy: "http://xray:8080"         # optional; empty or absent = direct connection
+```
+
+- `keepalive_timeout_sec`: how long an idle connection to the endpoint is kept for reuse. It stands on its own and does not need a proxy; a window of 120-300 s outlasts a turn, so the next request reuses the connection. `0` or an unparsable value falls back to the default.
+- `proxy`: an HTTP proxy URL for this adapter's Chat Completions requests alone, with the same rules as the ElevenLabs adapter (`http://` and `https://` only, inline credentials moved into a `Proxy-Authorization` header and never logged, a malformed value fails the adapter rather than connecting directly). The container's `HTTPS_PROXY` is ignored either way. The OpenAI STT and TTS adapters keep their direct path.
+
+After `data: [DONE]` the adapter now reads the streamed body to its end before releasing the connection: aiohttp closes a connection whose body was left unread, and the chunk terminator can land a packet after the `[DONE]` line, which silently cost the next turn a handshake.
+
+Whether a request reused a connection is visible in the log: `OpenAI chat completion received` and the new `OpenAI streaming completed` line (with `finish_reason`, `chars`, `first_token_ms`, `total_ms`) carry `connection=reused` or `connection=new` with `connect_ms` (TCP, TLS and, through a proxy, the CONNECT round trip) and `headers_ms` (until the response headers). The ElevenLabs TTS `synthesis completed` lines carry the same fields. `OpenAI-compatible LLM transport ready` at the first request of a session reports the proxy and keepalive in force.
+
 Requirements:
 
 - `OPENAI_API_KEY` must be set in the environment.

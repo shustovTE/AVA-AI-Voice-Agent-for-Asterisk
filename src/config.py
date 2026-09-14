@@ -329,6 +329,11 @@ class OpenAIProviderConfig(BaseModel):
     # names it forwards, and never lets one override a field it owns itself
     # (model, messages, stream, tools, tool_choice).
     extra_body: Dict[str, Any] = Field(default_factory=dict)
+    # Transport settings for the Chat Completions adapter, resolved once per
+    # adapter (a pipeline's options.llm overrides them). Typed here so the
+    # vendor pass-through never sends them to the endpoint as body fields.
+    proxy: Optional[str] = None
+    keepalive_timeout_sec: Optional[float] = None
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
