@@ -1850,6 +1850,100 @@ class SmtpTestRequest(BaseModel):
     smtp_tls_verify: Optional[Union[bool, str]] = None
     smtp_timeout_seconds: Optional[Union[float, str]] = None
 
+async def _probe_elevenlabs(
+    provider_config: Dict[str, Any], get_env_key
+) -> Dict[str, Any]:
+    """Reach ElevenLabs the way the TTS adapter will: through ``proxy`` when set.
+
+    A deployment that tunnels only the ElevenLabs leg needs the probe to take
+    the same tunnel, or a green check says nothing about calls and a red one
+    says nothing either. The proxy value is parsed by the engine's own rules
+    (http/https only, inline credentials moved into a header), so a setting
+    the adapter would refuse is reported here as well, and the outcome names
+    which hop failed: the proxy itself, the tunnel through it, or ElevenLabs.
+    """
+    import time
+
+    import httpx
+
+    api_key = str(provider_config.get("api_key") or "").strip()
+    if not api_key or "${" in api_key:
+        api_key = get_env_key("ELEVENLABS_API_KEY")
+    if not api_key:
+        return {"success": False, "message": "ELEVENLABS_API_KEY not set in .env file"}
+
+    from src.utils.proxy_url import sanitize_proxy_url, split_proxy_credentials
+
+    proxy_setting = str(provider_config.get("proxy") or "").strip()
+    try:
+        proxy_url, proxy_headers = split_proxy_credentials(proxy_setting)
+    except ValueError as exc:
+        return {
+            "success": False,
+            "proxy": sanitize_proxy_url(proxy_setting),
+            "message": f"Proxy setting rejected, as the engine would reject it: {exc}",
+        }
+    shown_proxy = sanitize_proxy_url(proxy_setting) if proxy_url else None
+    route = f"via proxy {shown_proxy}" if shown_proxy else "directly"
+
+    # trust_env=False: the adapter ignores HTTPS_PROXY in the container, so the
+    # probe must not quietly take a route the engine will not take.
+    client_kwargs: Dict[str, Any] = {"timeout": 10.0, "trust_env": False}
+    if proxy_url:
+        client_kwargs["proxy"] = httpx.Proxy(url=proxy_url, headers=proxy_headers or None)
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.get(
+                "https://api.elevenlabs.io/v1/voices",
+                headers={"xi-api-key": api_key, "Accept": "application/json"},
+            )
+    except httpx.ProxyError as exc:
+        return {
+            "success": False,
+            "proxy": shown_proxy,
+            "message": f"Proxy {shown_proxy} refused the tunnel to api.elevenlabs.io: {exc}",
+        }
+    except httpx.ConnectError as exc:
+        target = f"proxy {shown_proxy}" if shown_proxy else "api.elevenlabs.io"
+        return {"success": False, "proxy": shown_proxy, "message": f"Cannot connect to {target}: {exc}"}
+    except httpx.TimeoutException as exc:
+        return {
+            "success": False,
+            "proxy": shown_proxy,
+            "message": f"Timed out reaching ElevenLabs {route} ({exc.__class__.__name__})",
+        }
+    except httpx.HTTPError as exc:
+        return {"success": False, "proxy": shown_proxy, "message": f"ElevenLabs request failed {route}: {exc}"}
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    if response.status_code == 200:
+        try:
+            voice_count = len((response.json() or {}).get("voices", []))
+        except Exception:
+            voice_count = 0
+        return {
+            "success": True,
+            "proxy": shown_proxy,
+            "latency_ms": latency_ms,
+            "message": f"Connected to ElevenLabs {route} ({voice_count} voices available, {latency_ms} ms)",
+        }
+    if response.status_code in (401, 403):
+        return {
+            "success": False,
+            "proxy": shown_proxy,
+            "latency_ms": latency_ms,
+            "message": f"Reached ElevenLabs {route}, but the API key was rejected (HTTP {response.status_code})",
+        }
+    return {
+        "success": False,
+        "proxy": shown_proxy,
+        "latency_ms": latency_ms,
+        "message": f"ElevenLabs API error {route}: HTTP {response.status_code}",
+    }
+
+
 @router.post("/providers/test")
 async def test_provider_connection(request: ProviderTestRequest):
     """Test connection to a provider based on its configuration"""
@@ -2074,25 +2168,16 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
         
         # ============================================================
-        # ELEVENLABS AGENT - check before other providers
+        # ELEVENLABS (full agent, or a modular TTS provider of type
+        # elevenlabs whatever its name) - check before other providers.
+        # The probe takes the configured proxy exactly as the adapter does.
         # ============================================================
-        if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
-            api_key = get_env_key('ELEVENLABS_API_KEY')
-            if not api_key:
-                return {"success": False, "message": "ELEVENLABS_API_KEY not set in .env file"}
-            
-            async with httpx.AsyncClient() as client:
-                # Use /v1/voices endpoint for validation (works with all API key types)
-                response = await client.get(
-                    "https://api.elevenlabs.io/v1/voices",
-                    headers={"xi-api-key": api_key, "Accept": "application/json"},
-                    timeout=10.0
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    voice_count = len(data.get('voices', []))
-                    return {"success": True, "message": f"Connected to ElevenLabs ({voice_count} voices available)"}
-                return {"success": False, "message": f"ElevenLabs API error: HTTP {response.status_code}"}
+        if (
+            'elevenlabs' in provider_name
+            or 'agent_id' in provider_config
+            or str(provider_config.get('type') or '').lower() == 'elevenlabs'
+        ):
+            return await _probe_elevenlabs(provider_config, get_env_key)
         
         # ============================================================
         # OPENAI REALTIME

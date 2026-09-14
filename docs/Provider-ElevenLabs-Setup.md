@@ -600,9 +600,17 @@ Both keys are also accepted per pipeline under `options.tts`, where they
 override the provider block. The Admin UI exposes them in either editor: under
 **Network Routing** in the ElevenLabs provider form (TTS Engine mode), and as
 **HTTP Proxy** and **Keepalive Timeout** when the provider is configured as
-*Modular (single capability)* with a TTS provider type of `elevenlabs`. The
-provider connection test in the Admin UI does not go through the proxy, so it
-can report an error while calls work.
+*Modular (single capability)* with a TTS provider type of `elevenlabs`.
+
+**Test connection** on the Providers page probes ElevenLabs the way the
+adapter will reach it: through `proxy` when it is set, directly otherwise, and
+never through an `HTTPS_PROXY` of the container, which the adapter ignores
+too. The result says which route it took and, on failure, which hop failed:
+`Proxy … refused the tunnel` (the proxy answered but would not connect
+onward), `Cannot connect to proxy …` (nothing listens there), `Reached
+ElevenLabs via proxy …, but the API key was rejected` (the route works, the
+key does not), or a timeout on the route. A `socks5://` value is reported as
+rejected right there, exactly as the engine would refuse it at startup.
 
 ### Pipeline Configuration
 

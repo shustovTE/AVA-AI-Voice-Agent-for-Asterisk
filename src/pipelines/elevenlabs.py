@@ -13,16 +13,19 @@ from ..audio.resampler import (
     resample_audio,
     resolve_output_resampler_policy,
 )
-import base64
 import time
 import uuid
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
-from urllib.parse import unquote, urlsplit, urlunsplit
 
 import aiohttp
 
 from ..config import AppConfig, ElevenLabsProviderConfig
 from ..logging_config import get_logger
+from ..utils.proxy_url import (  # noqa: F401 - re-exported
+    SUPPORTED_PROXY_SCHEMES,
+    sanitize_proxy_url,
+    split_proxy_credentials,
+)
 from .base import TTSComponent
 
 logger = get_logger(__name__)
@@ -36,50 +39,10 @@ _OUTPUT_FORMAT_SAMPLE_RATES = {
 }
 _MULAW_OUTPUT_FORMATS = {"ulaw_8000"}
 
-# aiohttp tunnels HTTPS through an HTTP proxy with CONNECT. It has no SOCKS
-# support of its own, so a socks:// URL must be rejected with a usable message
-# rather than failing later inside the request.
-_SUPPORTED_PROXY_SCHEMES = {"http", "https"}
-
-
-def sanitize_proxy_url(proxy: str) -> str:
-    """Return the proxy URL without credentials, safe to log."""
-    parts = urlsplit(proxy)
-    if not parts.username and not parts.password:
-        return proxy
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
-
-
-def split_proxy_credentials(
-    proxy: Optional[str],
-) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
-    """Separate a proxy URL from any credentials written into it.
-
-    aiohttp deprecated its ``proxy_auth`` argument, so inline credentials become
-    a ``Proxy-Authorization`` header instead. Returns ``(None, None)`` when no
-    proxy is configured.
-    """
-    cleaned = (proxy or "").strip()
-    if not cleaned:
-        return None, None
-    parts = urlsplit(cleaned)
-    if parts.scheme not in _SUPPORTED_PROXY_SCHEMES:
-        raise ValueError(
-            f"Unsupported ElevenLabs proxy scheme {parts.scheme!r}: aiohttp speaks "
-            "only http:// and https://. Expose an HTTP inbound on the proxy, or "
-            "install aiohttp-socks and route at the network level instead."
-        )
-    if not parts.hostname:
-        raise ValueError(f"ElevenLabs proxy URL has no host: {cleaned!r}")
-    if not parts.username and not parts.password:
-        return cleaned, None
-    token = base64.b64encode(
-        f"{unquote(parts.username or '')}:{unquote(parts.password or '')}".encode("utf-8")
-    ).decode("ascii")
-    return sanitize_proxy_url(cleaned), {"Proxy-Authorization": f"Basic {token}"}
+# The proxy rules live in src.utils.proxy_url so the Admin UI's connection
+# probe applies exactly what this adapter applies; they are re-exported here
+# for the adapter's callers and tests.
+_SUPPORTED_PROXY_SCHEMES = SUPPORTED_PROXY_SCHEMES
 
 
 class ElevenLabsTTSAdapter(TTSComponent):
