@@ -7,7 +7,7 @@ regardless of which AI provider they're used with.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Mapping, Optional
 from enum import Enum
 import logging
 
@@ -316,6 +316,15 @@ class Tool(ABC):
         """
         pass
     
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Receive the tool's ``tools.<name>`` block before any schema is built.
+
+        Built-in tools are registered as bare classes, so this is how a
+        setting that shapes the definition (which parameters exist, for
+        instance) reaches the instance. The default takes nothing.
+        """
+        return None
+
     async def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         """
         Validate parameters before execution.
@@ -412,6 +421,9 @@ class DescribedTool(Tool):
 
     async def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         return await self._tool.validate_parameters(parameters)
+
+    def configure(self, config: Mapping[str, Any]) -> None:
+        self._tool.configure(config)
 
     def __getattr__(self, name: str) -> Any:
         # Tool-specific helpers the engine may call stay reachable; private

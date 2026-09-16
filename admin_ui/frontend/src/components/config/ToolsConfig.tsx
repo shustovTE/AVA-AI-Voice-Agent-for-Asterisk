@@ -6,6 +6,9 @@ const DEFAULT_HANGUP_TOOL_DESCRIPTION =
     'End the current call. Call this when the caller says goodbye or thank you and is ready to hang up. Set farewell_message to your goodbye sentence.';
 const DEFAULT_HANGUP_FAREWELL_PARAMETER_DESCRIPTION =
     'Farewell message to speak before hanging up. Should be warm and professional.';
+// The built-in text once the farewell_message parameter is switched off.
+const DEFAULT_HANGUP_TOOL_DESCRIPTION_NO_FAREWELL =
+    'End the current call. Call this when the caller says goodbye or thank you and is ready to hang up, in the same reply as your own goodbye: the call ends once your reply has been spoken.';
 const DEFAULT_HANGUP_END_CALL_MARKERS = [
     "no transcript",
     "no transcript needed",
@@ -238,18 +241,39 @@ const ToolsConfig: React.FC<ToolsConfigProps> = ({ config, onChange }) => {
                 <h3 className="text-lg font-semibold">Hangup Tool</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="space-y-2 md:col-span-2">
+                        <label className="text-sm font-medium">Farewell via the farewell_message Parameter</label>
+                        <div className="flex items-start gap-2">
+                            <input
+                                type="checkbox"
+                                className="mt-1"
+                                checked={config.hangup_call?.farewell_message_enabled ?? true}
+                                onChange={(e) => handleNestedChange('hangup_call', 'farewell_message_enabled', e.target.checked)}
+                            />
+                            <p className="text-xs text-muted-foreground">
+                                Checked: the LLM passes its goodbye in farewell_message and the engine speaks it after the tool
+                                runs. Unchecked: the tool has no parameter at all, the LLM says goodbye in its reply and the call
+                                ends once that reply has been heard. The Farewell Message default and the parameter description
+                                apply only when checked.
+                            </p>
+                        </div>
+                    </div>
+                    <div className="space-y-2 md:col-span-2">
                         <label className="text-sm font-medium">Tool Description (what the LLM sees)</label>
                         <textarea
                             className="w-full p-2 rounded border border-input bg-background text-sm h-24"
-                            placeholder={DEFAULT_HANGUP_TOOL_DESCRIPTION}
+                            placeholder={
+                                (config.hangup_call?.farewell_message_enabled ?? true)
+                                    ? DEFAULT_HANGUP_TOOL_DESCRIPTION
+                                    : DEFAULT_HANGUP_TOOL_DESCRIPTION_NO_FAREWELL
+                            }
                             value={config.hangup_call?.description || ''}
                             onChange={(e) => handleNestedChange('hangup_call', 'description', e.target.value)}
                         />
                         <p className="text-xs text-muted-foreground">
                             Sent to the LLM with every request as the description of the hangup_call function. Empty keeps the
                             built-in English text. Write it in the language of your prompts and say when to end the call and
-                            where the goodbye sentence goes: the engine speaks farewell_message itself after the tool runs, so a
-                            goodbye in the reply text as well is heard twice.
+                            where the goodbye sentence goes: with the parameter on, the engine speaks farewell_message itself
+                            after the tool runs, so a goodbye in the reply text as well is heard twice.
                         </p>
                     </div>
                     <div className="space-y-2 md:col-span-2">

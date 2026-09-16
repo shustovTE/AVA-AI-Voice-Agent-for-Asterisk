@@ -1024,6 +1024,11 @@ tools:
     enabled: true
     require_confirmation: false        # Don't ask "shall I hang up?"
     farewell_message: "Thank you for calling. Goodbye!"
+    # false: the tool has no farewell_message parameter at all. The LLM says
+    # goodbye in its reply, the tool only marks the call and the engine ends
+    # it once that reply has been heard, so nothing is spoken twice. The
+    # farewell_message default above applies only when true.
+    farewell_message_enabled: true
     # Optional: the text the LLM sees for this tool, in the language of your
     # prompts. It is sent with every request as the function description, so
     # say when to end the call and where the goodbye sentence goes (the engine

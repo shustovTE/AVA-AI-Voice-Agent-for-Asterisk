@@ -1151,6 +1151,7 @@ class Engine:
             # Operator wording for built-in tools (tools.<name>.description and
             # parameter_descriptions) applies before any schema is built.
             if tools_config:
+                tool_registry.configure_tools(tools_config)
                 tool_registry.apply_definition_overrides(tools_config)
             # Initialize HTTP tools from config (Milestone 24)
             if tools_config:
@@ -17055,11 +17056,18 @@ class Engine:
                                                 logger.info("Farewell playback completed", duration_sec=duration_sec, call_id=call_id)
                                             except Exception as e:
                                                 logger.error("Farewell TTS failed", error=str(e))
+                                        else:
+                                            # farewell_message disabled: the reply already said
+                                            # goodbye, so the call ends once its audio has been heard.
+                                            logger.info(
+                                                "Hangup without farewell; ending after the reply audio drains",
+                                                call_id=call_id,
+                                            )
                                         
                                         await self._terminate_call_after_audio(
                                             call_id,
                                             reason="pipeline_hangup_call",
-                                            audio_already_drained=True,
+                                            audio_already_drained=bool(farewell),
                                         )
                                         return
 
@@ -17332,25 +17340,33 @@ class Engine:
                                                                 await self._commit_pending_deferred_transfer_for_call(call_id, session)
                                                                 return
                                                             if next_result.get("will_hangup"):
-                                                                farewell = next_result.get("message", "Goodbye!")
-                                                                conversation_history.append(_ts_msg("assistant", farewell))
-                                                                session.conversation_history = list(conversation_history)
-                                                                await self.session_store.upsert_call(session)
-                                                                fw_bytes = bytearray()
-                                                                async for chunk in pipeline.tts_adapter.synthesize(call_id, farewell, pipeline.tts_options):
-                                                                    fw_bytes.extend(chunk)
-                                                                if fw_bytes:
-                                                                    fw_pid = await self.playback_manager.play_audio(call_id, bytes(fw_bytes), "pipeline-farewell")
-                                                                    if fw_pid:
-                                                                        await self.playback_manager.wait_for_playback_end(
-                                                                            call_id,
-                                                                            fw_pid,
-                                                                            timeout_sec=(len(fw_bytes) / 8000.0 + 3.0),
-                                                                        )
+                                                                # An empty message means the farewell is
+                                                                # disabled: the reply is the goodbye.
+                                                                farewell = str(next_result.get("message") or "").strip()
+                                                                if farewell:
+                                                                    conversation_history.append(_ts_msg("assistant", farewell))
+                                                                    session.conversation_history = list(conversation_history)
+                                                                    await self.session_store.upsert_call(session)
+                                                                    fw_bytes = bytearray()
+                                                                    async for chunk in pipeline.tts_adapter.synthesize(call_id, farewell, pipeline.tts_options):
+                                                                        fw_bytes.extend(chunk)
+                                                                    if fw_bytes:
+                                                                        fw_pid = await self.playback_manager.play_audio(call_id, bytes(fw_bytes), "pipeline-farewell")
+                                                                        if fw_pid:
+                                                                            await self.playback_manager.wait_for_playback_end(
+                                                                                call_id,
+                                                                                fw_pid,
+                                                                                timeout_sec=(len(fw_bytes) / 8000.0 + 3.0),
+                                                                            )
+                                                                else:
+                                                                    logger.info(
+                                                                        "Hangup without farewell; ending after the reply audio drains",
+                                                                        call_id=call_id,
+                                                                    )
                                                                 await self._terminate_call_after_audio(
                                                                     call_id,
                                                                     reason="pipeline_followup_hangup_call",
-                                                                    audio_already_drained=True,
+                                                                    audio_already_drained=bool(farewell),
                                                                 )
                                                                 return
                                                         else:

@@ -89,6 +89,31 @@ class ToolRegistry:
         self._tools[tool_name] = tool
         logger.info(f"✅ Registered tool: {tool_name} ({tool.definition.category.value})")
 
+    def configure_tools(self, tools_config: Any) -> List[str]:
+        """Hand each registered tool its ``tools.<name>`` block via ``Tool.configure``.
+
+        Runs before ``apply_definition_overrides`` so a setting that shapes the
+        built-in definition is in place when the operator's wording is laid
+        over it. A tool that rejects its block keeps its defaults, with a
+        warning. Returns the names configured.
+        """
+        configured: List[str] = []
+        if not isinstance(tools_config, dict):
+            return configured
+        for name, raw in tools_config.items():
+            if not isinstance(raw, dict):
+                continue
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            try:
+                tool.configure(raw)
+            except Exception as exc:
+                logger.warning("Tool %s rejected its configuration: %s", name, exc)
+                continue
+            configured.append(name)
+        return configured
+
     def apply_definition_overrides(self, tools_config: Any) -> List[str]:
         """Re-describe registered tools from ``tools.<name>`` configuration.
 
