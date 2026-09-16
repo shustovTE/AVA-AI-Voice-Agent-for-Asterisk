@@ -1000,6 +1000,9 @@ class ManagedToolParameter(BaseModel):
     type: str = "string"
     description: str = ""
     required: bool = False
+    # Allowed values; the engine advertises them as the parameter's JSON
+    # `enum` and rejects any other value before the request is made.
+    enum: Optional[List[str]] = None
 
 
 class ManagedToolWrite(BaseModel):
@@ -1341,7 +1344,7 @@ def _build_tool_doc(data: Dict[str, Any], phase: str) -> Dict[str, Any]:
     params = data.get("parameters")
     if params is not None:
         doc["parameters"] = [
-            p if isinstance(p, dict) else p.model_dump() for p in params
+            p if isinstance(p, dict) else p.model_dump(exclude_none=True) for p in params
         ]
     return doc
 
@@ -1514,7 +1517,7 @@ async def patch_managed_tool(name: str, body: ManagedToolPatch):
     patch = body.model_dump(exclude_unset=True)
     if "parameters" in patch and patch["parameters"] is not None:
         patch["parameters"] = [
-            p if isinstance(p, dict) else p.model_dump() for p in patch["parameters"]
+            p if isinstance(p, dict) else p.model_dump(exclude_none=True) for p in patch["parameters"]
         ]
 
     old_phase = _phase_for(cur_block, cur_doc)

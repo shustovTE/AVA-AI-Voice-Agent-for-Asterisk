@@ -316,3 +316,106 @@ describe('HTTPToolForm editor colors', () => {
         expect(onChange).not.toHaveBeenCalled();
     });
 });
+
+describe('HTTPToolForm — enum parameters', () => {
+    const openNewInCallTool = () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Add Tool' }));
+        fireEvent.change(screen.getByLabelText('Tool Name'), { target: { value: 'book_slot' } });
+        fireEvent.change(screen.getByLabelText('URL'), {
+            target: { value: 'https://api.example.com/book' },
+        });
+    };
+
+    it('saves an enum parameter as a string with the allowed values', () => {
+        const onChange = vi.fn();
+        render(<HTTPToolForm config={{}} onChange={onChange} phase="in_call" />);
+        openNewInCallTool();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add Parameter' }));
+        fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'slot' } });
+        fireEvent.change(screen.getByPlaceholderText('Description for AI'), {
+            target: { value: 'Preferred part of the day' },
+        });
+        fireEvent.change(screen.getByLabelText('Parameter 1 type'), { target: { value: 'enum' } });
+        fireEvent.change(screen.getByPlaceholderText(/Allowed values, comma-separated/), {
+            target: { value: ' morning, afternoon ,evening,, morning' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+        expect(onChange).toHaveBeenCalledOnce();
+        expect(onChange.mock.calls[0][0].book_slot.parameters).toEqual([
+            {
+                name: 'slot',
+                type: 'string',
+                description: 'Preferred part of the day',
+                required: false,
+                enum: ['morning', 'afternoon', 'evening'],
+            },
+        ]);
+    });
+
+    it('drops the values again when the type goes back to a plain string, and saves no enum without values', () => {
+        const onChange = vi.fn();
+        render(<HTTPToolForm config={{}} onChange={onChange} phase="in_call" />);
+        openNewInCallTool();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add Parameter' }));
+        fireEvent.change(screen.getByPlaceholderText('Name'), { target: { value: 'slot' } });
+        fireEvent.change(screen.getByLabelText('Parameter 1 type'), { target: { value: 'enum' } });
+        fireEvent.change(screen.getByPlaceholderText(/Allowed values, comma-separated/), {
+            target: { value: 'morning, evening' },
+        });
+        fireEvent.change(screen.getByLabelText('Parameter 1 type'), { target: { value: 'number' } });
+        expect(screen.queryByPlaceholderText(/Allowed values, comma-separated/)).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add Parameter' }));
+        fireEvent.change(screen.getAllByPlaceholderText('Name')[1], { target: { value: 'note' } });
+        fireEvent.change(screen.getByLabelText('Parameter 2 type'), { target: { value: 'enum' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+        expect(onChange.mock.calls[0][0].book_slot.parameters).toEqual([
+            { name: 'slot', type: 'number', description: '', required: false },
+            { name: 'note', type: 'string', description: '', required: false },
+        ]);
+    });
+
+    it('opens an existing enum parameter as the enum type with its values', () => {
+        const onChange = vi.fn();
+        const config = {
+            book_slot: {
+                kind: 'in_call_http_lookup',
+                phase: 'in_call',
+                enabled: true,
+                is_global: false,
+                url: 'https://api.example.com/book',
+                method: 'POST',
+                parameters: [
+                    {
+                        name: 'slot',
+                        type: 'string',
+                        description: 'Preferred part of the day',
+                        required: true,
+                        enum: ['morning', 'evening'],
+                    },
+                ],
+            },
+        };
+        render(<HTTPToolForm config={config} onChange={onChange} phase="in_call" />);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Edit book_slot' }));
+
+        expect(screen.getByLabelText('Parameter 1 type')).toHaveValue('enum');
+        expect(screen.getByPlaceholderText(/Allowed values, comma-separated/)).toHaveValue(
+            'morning, evening'
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+        expect(onChange.mock.calls[0][0].book_slot.parameters[0]).toEqual({
+            name: 'slot',
+            type: 'string',
+            description: 'Preferred part of the day',
+            required: true,
+            enum: ['morning', 'evening'],
+        });
+    });
+});

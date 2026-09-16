@@ -556,11 +556,17 @@ in_call_tools:
         type: string
         description: "Time in HH:MM format"
         required: true
+      - name: slot
+        type: string
+        description: "Preferred part of the day"
+        enum: [morning, afternoon, evening]   # the AI must pick one; anything else is rejected
+        required: false
     body_template: |
       {
         "customer_id": "{customer_id}",
         "date": "{date}",
-        "time": "{time}"
+        "time": "{time}",
+        "slot": "{slot}"
       }
     return_raw_json: false
     output_variables:
@@ -591,7 +597,7 @@ In-call HTTP tools have access to three types of variables:
 
 1. **Context variables** (auto-injected): `{caller_number}`, `{called_number}`, `{call_id}`, etc.
 2. **Pre-call variables** (from pre-call HTTP lookups): `{customer_id}`, `{customer_name}`, etc.
-3. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool
+3. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool. A parameter with `enum` is advertised to the LLM with exactly those allowed values (the Admin UI offers it as the `enum` type, values comma-separated), and a call with any other value is rejected before the request is made.
 
 This means you can use data fetched by pre-call tools in your in-call tool requests. For example, if a pre-call lookup fetches `customer_id`, you can use `{customer_id}` in the in-call tool's body template.
 
