@@ -6,7 +6,7 @@ regardless of which AI provider they're used with.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Any, List, Optional
 from enum import Enum
 import logging
@@ -359,6 +359,66 @@ class Tool(ABC):
         except Exception as e:
             logger.warning(f"Failed to load config for {self.definition.name}: {e}")
             return {}
+
+
+class DescribedTool(Tool):
+    """A registered tool whose LLM-facing texts come from configuration.
+
+    The schema every request advertises is built from ``definition``, so an
+    operator who wants a tool described in the language of their prompts, or
+    with rules that fit their scenario, needs that text to come from
+    ``tools.<name>`` rather than from the code. This wrapper answers
+    ``definition`` with the wrapped tool's, the description and the named
+    parameter descriptions replaced; everything else, execution included, is
+    the wrapped tool's own.
+    """
+
+    def __init__(
+        self,
+        tool: Tool,
+        *,
+        description: Optional[str] = None,
+        parameter_descriptions: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self._tool = tool
+        self._description = description or None
+        self._parameter_descriptions = dict(parameter_descriptions or {})
+
+    @property
+    def wrapped(self) -> Tool:
+        return self._tool
+
+    @property
+    def definition(self) -> ToolDefinition:
+        base = self._tool.definition
+        parameters = [
+            replace(parameter, description=self._parameter_descriptions[parameter.name])
+            if parameter.name in self._parameter_descriptions
+            else parameter
+            for parameter in base.parameters
+        ]
+        return replace(
+            base,
+            description=self._description or base.description,
+            parameters=parameters,
+        )
+
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        context: 'ToolExecutionContext'
+    ) -> Dict[str, Any]:
+        return await self._tool.execute(parameters, context)
+
+    async def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
+        return await self._tool.validate_parameters(parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        # Tool-specific helpers the engine may call stay reachable; private
+        # state is never proxied, so a missing attribute cannot recurse.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._tool, name)
 
 
 class PreCallTool(ABC):

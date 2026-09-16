@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from 'react';
 
 const DEFAULT_HANGUP_POLICY_MODE = 'normal';
+// The built-in text the LLM sees for hangup_call when no description is configured.
+const DEFAULT_HANGUP_TOOL_DESCRIPTION =
+    'End the current call. Call this when the caller says goodbye or thank you and is ready to hang up. Set farewell_message to your goodbye sentence.';
+const DEFAULT_HANGUP_FAREWELL_PARAMETER_DESCRIPTION =
+    'Farewell message to speak before hanging up. Should be warm and professional.';
 const DEFAULT_HANGUP_END_CALL_MARKERS = [
     "no transcript",
     "no transcript needed",
@@ -232,6 +237,36 @@ const ToolsConfig: React.FC<ToolsConfigProps> = ({ config, onChange }) => {
             <div className="space-y-4">
                 <h3 className="text-lg font-semibold">Hangup Tool</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2 md:col-span-2">
+                        <label className="text-sm font-medium">Tool Description (what the LLM sees)</label>
+                        <textarea
+                            className="w-full p-2 rounded border border-input bg-background text-sm h-24"
+                            placeholder={DEFAULT_HANGUP_TOOL_DESCRIPTION}
+                            value={config.hangup_call?.description || ''}
+                            onChange={(e) => handleNestedChange('hangup_call', 'description', e.target.value)}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                            Sent to the LLM with every request as the description of the hangup_call function. Empty keeps the
+                            built-in English text. Write it in the language of your prompts and say when to end the call and
+                            where the goodbye sentence goes: the engine speaks farewell_message itself after the tool runs, so a
+                            goodbye in the reply text as well is heard twice.
+                        </p>
+                    </div>
+                    <div className="space-y-2 md:col-span-2">
+                        <label className="text-sm font-medium">farewell_message Parameter Description</label>
+                        <input
+                            type="text"
+                            className="w-full p-2 rounded border border-input bg-background"
+                            placeholder={DEFAULT_HANGUP_FAREWELL_PARAMETER_DESCRIPTION}
+                            value={config.hangup_call?.parameter_descriptions?.farewell_message || ''}
+                            onChange={(e) =>
+                                handleNestedChange('hangup_call', 'parameter_descriptions', {
+                                    ...(config.hangup_call?.parameter_descriptions || {}),
+                                    farewell_message: e.target.value,
+                                })
+                            }
+                        />
+                    </div>
                     <div className="space-y-2">
                         <label className="text-sm font-medium">Farewell Message</label>
                         <input

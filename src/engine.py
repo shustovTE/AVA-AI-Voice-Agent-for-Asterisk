@@ -1147,8 +1147,12 @@ class Engine:
             from src.tools.registry import tool_registry
             tool_registry.clear()
             tool_registry.initialize_default_tools()
-            # Initialize HTTP tools from config (Milestone 24)
             tools_config = getattr(self.config, 'tools', None)
+            # Operator wording for built-in tools (tools.<name>.description and
+            # parameter_descriptions) applies before any schema is built.
+            if tools_config:
+                tool_registry.apply_definition_overrides(tools_config)
+            # Initialize HTTP tools from config (Milestone 24)
             if tools_config:
                 tool_registry.initialize_http_tools_from_config(tools_config)
             # Initialize in-call HTTP tools from config

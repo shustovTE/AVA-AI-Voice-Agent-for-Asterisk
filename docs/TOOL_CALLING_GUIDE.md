@@ -1024,6 +1024,15 @@ tools:
     enabled: true
     require_confirmation: false        # Don't ask "shall I hang up?"
     farewell_message: "Thank you for calling. Goodbye!"
+    # Optional: the text the LLM sees for this tool, in the language of your
+    # prompts. It is sent with every request as the function description, so
+    # say when to end the call and where the goodbye sentence goes (the engine
+    # speaks farewell_message itself after the tool runs, so a goodbye in the
+    # reply text as well is heard twice). Empty keeps the built-in English text.
+    # Any built-in tool takes the same two keys under tools.<name>.
+    description: "Завершить звонок. Вызывай, когда абонент попрощался или подтвердил, что вопросов больше нет. Прощальную фразу передай в farewell_message, а текст ответа оставь пустым: фразу произнесёт инструмент."
+    parameter_descriptions:
+      farewell_message: "Прощальная фраза, которую агент произнесёт перед завершением звонка."
     # Global end-of-call intent markers remain the default for every Agent.
     # Agents can inherit, extend, or replace them in:
     # Admin UI → Agents → Edit Agent → Tools → Hangup Guardrail.

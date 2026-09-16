@@ -5,7 +5,7 @@ Singleton pattern ensures only one registry exists across the application.
 """
 
 from typing import Dict, List, Type, Optional, Iterable, Set, Union, Any
-from src.tools.base import Tool, ToolDefinition, ToolCategory, ToolPhase, PreCallTool, PostCallTool
+from src.tools.base import Tool, ToolDefinition, ToolCategory, ToolPhase, PreCallTool, PostCallTool, DescribedTool
 import logging
 import hashlib
 import json
@@ -88,6 +88,66 @@ class ToolRegistry:
         
         self._tools[tool_name] = tool
         logger.info(f"✅ Registered tool: {tool_name} ({tool.definition.category.value})")
+
+    def apply_definition_overrides(self, tools_config: Any) -> List[str]:
+        """Re-describe registered tools from ``tools.<name>`` configuration.
+
+        ``description`` replaces the text the LLM sees for the tool and
+        ``parameter_descriptions`` (parameter name to text) replaces single
+        parameter descriptions. Blank values keep the built-in text, names the
+        tool has no parameter for are dropped with a warning, and execution is
+        untouched. Returns the names of the tools re-described.
+        """
+        applied: List[str] = []
+        if not isinstance(tools_config, dict):
+            return applied
+        for name, raw in tools_config.items():
+            if not isinstance(raw, dict):
+                continue
+            description = raw.get("description")
+            description = (
+                description.strip()
+                if isinstance(description, str) and description.strip()
+                else None
+            )
+            raw_parameters = raw.get("parameter_descriptions")
+            parameter_descriptions = {
+                str(key): value.strip()
+                for key, value in (raw_parameters.items() if isinstance(raw_parameters, dict) else [])
+                if isinstance(value, str) and value.strip()
+            }
+            if not description and not parameter_descriptions:
+                continue
+            tool = self._tools.get(name)
+            if tool is None:
+                continue
+            base = tool.wrapped if isinstance(tool, DescribedTool) else tool
+            known = {parameter.name for parameter in base.definition.parameters}
+            unknown = sorted(set(parameter_descriptions) - known)
+            if unknown:
+                logger.warning(
+                    "Ignoring parameter_descriptions for parameters %s does not have: %s",
+                    name,
+                    ", ".join(unknown),
+                )
+                parameter_descriptions = {
+                    key: value for key, value in parameter_descriptions.items() if key in known
+                }
+            if not description and not parameter_descriptions:
+                continue
+            self._tools[name] = DescribedTool(
+                base,
+                description=description,
+                parameter_descriptions=parameter_descriptions,
+            )
+            applied.append(name)
+            logger.info(
+                "Tool re-described from configuration: %s (description=%s, parameters=%s)",
+                name,
+                "configured" if description else "built-in",
+                sorted(parameter_descriptions) or "built-in",
+            )
+        return applied
 
     def register_instance(self, tool: Tool) -> None:
         """
