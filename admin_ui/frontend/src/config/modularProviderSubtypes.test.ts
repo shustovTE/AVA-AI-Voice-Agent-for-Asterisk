@@ -42,8 +42,18 @@ describe('modular TTS provider subtypes', () => {
                 expect.arrayContaining([
                     expect.objectContaining({ key: 'proxy', type: 'text', required: false }),
                     expect.objectContaining({ key: 'keepalive_timeout_sec', type: 'number', required: false }),
+                    expect.objectContaining({ key: 'warm_up', type: 'boolean', required: false }),
                 ]),
             );
+        }
+    });
+
+    it('leaves the prompt warm-up off by default, since a metered API bills one extra prompt per call', () => {
+        for (const id of ['openai', 'deepseek']) {
+            const subtype = MODULAR_SUBTYPES.llm.find(candidate => candidate.id === id);
+            const warmUp = subtype?.fields.find(field => field.key === 'warm_up');
+            expect(warmUp).toBeDefined();
+            expect(warmUp?.default).toBeUndefined();
         }
     });
 

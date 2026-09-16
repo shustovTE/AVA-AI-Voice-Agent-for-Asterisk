@@ -829,6 +829,19 @@ After `data: [DONE]` the adapter now reads the streamed body to its end before r
 
 Whether a request reused a connection is visible in the log: `OpenAI chat completion received` and the new `OpenAI streaming completed` line (with `finish_reason`, `chars`, `first_token_ms`, `total_ms`) carry `connection=reused` or `connection=new` with `connect_ms` (TCP, TLS and, through a proxy, the CONNECT round trip) and `headers_ms` (until the response headers). The ElevenLabs TTS `synthesis completed` lines carry the same fields. `OpenAI-compatible LLM transport ready` at the first request of a session reports the proxy and keepalive in force.
 
+**Prompt warm-up (LLM).** Each call gets its own adapter and connection pool, so the first Chat Completions request of every call pays a new TCP+TLS connection (through a proxy, the CONNECT round trip on top) and the prefill of the whole system prompt, and both land on the caller's first reply. `warm_up: true` on the provider block (or per pipeline under `options.llm`, where it overrides the block; never forwarded to the endpoint) sends one `max_tokens: 1` request the moment the prompt, the tools and the greeting are resolved, while the greeting is synthesized and played. It carries exactly the prefix the first turn will carry: the system prompt with its variables substituted, the tool schemas, the greeting as the assistant's first message, and any vendor field such as `prompt_cache_key`, followed by a one-character user message, through the adapter's own session. The reply is discarded and never enters the history. By the first real turn the connection is open in the pool (`connection=reused` on `OpenAI streaming completed`) and, on an endpoint with prefix caching (vLLM with prefix caching on, OpenAI, Mistral), the prompt prefix is cached, so that turn prefills only the caller's words.
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://ai-api.example.com/v1
+    keepalive_timeout_sec: 150
+    warm_up: true                     # default false
+```
+
+The log shows `Pipeline LLM warm-up started` (debug) and `LLM prompt warm-up completed` with `total_ms`, `messages_count`, `tools_count`, the connection fields, and `prompt_tokens` / `cached_tokens` where the endpoint reports them (`cached_tokens` on the warm-up itself says whether the previous call's prefix was still cached). A failed warm-up logs `LLM prompt warm-up failed` and costs the call nothing else; hangup cancels one still in flight; a caller who interrupts the greeting before it completes simply gets a second connection. Off by default, because a metered API bills one extra prompt per call (the warm-up at the full input price, the first turn at the cached price). The prefix cache only helps where the chat template puts the system prompt at the start of the token stream; a template that attaches it to the last user message (the older Mistral ones do) still gets the handshake out of the way, but not the prefill.
+
 Requirements:
 
 - `OPENAI_API_KEY` must be set in the environment.

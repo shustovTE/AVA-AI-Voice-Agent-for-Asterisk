@@ -838,6 +838,8 @@ class Engine:
         self._pipeline_turn_verdict: Dict[str, Dict[str, Any]] = {}
         self._pipeline_turn_verdict_pending: Dict[str, Dict[str, Any]] = {}
         self._smart_turn_settings: Dict[str, Any] = self._read_smart_turn_settings(config)
+        # LLM warm-up requests in flight, one per call, cancelled at cleanup.
+        self._pipeline_llm_warm_ups: Dict[str, asyncio.Task] = {}
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -9693,6 +9695,9 @@ class Engine:
             self._turn_audio.pop(call_id, None)
             self._pipeline_turn_verdict.pop(call_id, None)
             self._pipeline_turn_verdict_pending.pop(call_id, None)
+            warm_up_task = self._pipeline_llm_warm_ups.pop(call_id, None)
+            if warm_up_task is not None and not warm_up_task.done():
+                warm_up_task.cancel()
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -15414,6 +15419,68 @@ class Engine:
             )
         return allowed
 
+    def _start_pipeline_llm_warm_up(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        llm_options: Dict[str, Any],
+        greeting: str,
+    ) -> Optional[asyncio.Task]:
+        """Warm the LLM for this call while the greeting plays.
+
+        The first Chat Completions request of a call pays for a new
+        connection (each call has its own adapter, so nothing is pooled from
+        the previous call) and for the prefill of the whole system prompt.
+        Both are known before the caller says a word: the prompt, the tools
+        and the greeting are final here, and the caller's first words are
+        seconds away. The adapter sends one ``max_tokens: 1`` request with
+        exactly the prefix the first turn will carry, through the session the
+        turns will use, so that turn finds the connection open and the prefix
+        cached. Fire-and-forget: nothing waits for it, and cleanup cancels it.
+        """
+        adapter = getattr(pipeline, "llm_adapter", None)
+        warm_up = getattr(adapter, "warm_up", None)
+        if not callable(warm_up) or not getattr(adapter, "warm_up_enabled", False):
+            return None
+        # The first turn sends the session history with the greeting appended
+        # (the runner persists it once the greeting audio starts); send the same.
+        prior = _sanitize_for_llm(list(getattr(session, "conversation_history", None) or []))
+        if greeting:
+            prior.append({"role": "assistant", "content": greeting})
+        context = {"prior_messages": prior}
+        task = asyncio.create_task(
+            self._run_pipeline_llm_warm_up(call_id, warm_up, context, dict(llm_options))
+        )
+        self._pipeline_llm_warm_ups[call_id] = task
+
+        def _forget(done: asyncio.Task) -> None:
+            if self._pipeline_llm_warm_ups.get(call_id) is done:
+                self._pipeline_llm_warm_ups.pop(call_id, None)
+
+        task.add_done_callback(_forget)
+        logger.debug(
+            "Pipeline LLM warm-up started",
+            call_id=call_id,
+            prior_messages=len(prior),
+            tools_count=len(llm_options.get("tools") or []),
+        )
+        return task
+
+    async def _run_pipeline_llm_warm_up(
+        self,
+        call_id: str,
+        warm_up: Callable[..., Any],
+        context: Dict[str, Any],
+        llm_options: Dict[str, Any],
+    ) -> None:
+        try:
+            await warm_up(call_id, context, llm_options)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Pipeline LLM warm-up failed", call_id=call_id, error=str(exc))
+
     async def _pipeline_runner(self, call_id: str) -> None:
         """Minimal adapter-driven loop: STT -> LLM -> TTS -> file playback.
 
@@ -15716,6 +15783,11 @@ class Engine:
                     greeting = self._apply_prompt_template_substitution(
                         greeting, session
                     )
+
+            # Prompt, tools and greeting are final here and the caller's first
+            # words are seconds away: warm the LLM now, alongside the greeting.
+            if self._pipeline_output_allowed(call_id, session, stage="llm-warm-up"):
+                self._start_pipeline_llm_warm_up(call_id, session, pipeline, llm_options, greeting)
 
             # Bound pipeline greeting handoff just like monolithic providers.
             # This background watchdog still fires if a TTS async generator hangs

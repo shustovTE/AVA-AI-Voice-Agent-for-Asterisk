@@ -334,6 +334,11 @@ class OpenAIProviderConfig(BaseModel):
     # vendor pass-through never sends them to the endpoint as body fields.
     proxy: Optional[str] = None
     keepalive_timeout_sec: Optional[float] = None
+    # Send one ``max_tokens: 1`` request with the call's prompt while the
+    # greeting plays, so the first real turn finds the connection open and the
+    # prompt prefix in the endpoint's cache. Off by default: on a metered API
+    # it bills one extra prompt per call.
+    warm_up: bool = Field(default=False)
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)

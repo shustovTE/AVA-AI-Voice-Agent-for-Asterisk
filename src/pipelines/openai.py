@@ -426,6 +426,7 @@ class OpenAILLMAdapter(LLMComponent):
             self._transport_setting("proxy")
         )
         self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+        self.warm_up_enabled = self._resolve_warm_up()
         self._trace_enabled = False
 
     # After ``data: [DONE]`` the body has at most a chunk terminator left; a
@@ -452,6 +453,24 @@ class OpenAILLMAdapter(LLMComponent):
             )
             return None
         return value if value > 0 else None
+
+    def _resolve_warm_up(self) -> bool:
+        raw = self._transport_setting("warm_up")
+        if isinstance(raw, bool):
+            return raw
+        if raw is None or raw == "":
+            return False
+        text = str(raw).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        logger.warning(
+            "Ignoring unparsable LLM warm_up",
+            component=self.component_key,
+            value=repr(raw),
+        )
+        return False
 
     def _request_kwargs(self, timeout: Any, trace: HttpTrace) -> Dict[str, Any]:
         """Per-request transport arguments: the proxy when set, tracing when ours."""
@@ -773,17 +792,7 @@ class OpenAILLMAdapter(LLMComponent):
         payload["stream"] = True
 
         # Include tools in streaming request so the LLM can return tool calls
-        tools_list = merged.get("tools")
-        tool_schemas = []
-        call_tool_registry = self.tool_registry_or(tool_registry)
-        if tools_list and isinstance(tools_list, list):
-            for tool_name in tools_list:
-                tool = call_tool_registry.get(tool_name)
-                if tool:
-                    tool_schemas.append(tool.definition.to_openai_schema())
-        if tool_schemas:
-            payload["tools"] = tool_schemas
-            payload["tool_choice"] = "auto"
+        self._attach_tools(payload, merged)
 
         headers = _make_http_headers(merged)
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
@@ -893,6 +902,126 @@ class OpenAILLMAdapter(LLMComponent):
             )
         except aiohttp.ClientError as e:
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
+
+    def _attach_tools(self, payload: Dict[str, Any], merged: Dict[str, Any]) -> None:
+        """Add the allowlisted tools' schemas to a Chat Completions payload.
+
+        Shared by the streamed turn and the warm-up so both advertise the same
+        tools: on an endpoint with prefix caching the schemas are part of the
+        cached prompt, and a warm-up without them would warm a different one.
+        """
+        tools_list = merged.get("tools")
+        tool_schemas = []
+        call_tool_registry = self.tool_registry_or(tool_registry)
+        if tools_list and isinstance(tools_list, list):
+            for tool_name in tools_list:
+                tool = call_tool_registry.get(tool_name)
+                if tool:
+                    tool_schemas.append(tool.definition.to_openai_schema())
+        if tool_schemas:
+            payload["tools"] = tool_schemas
+            payload["tool_choice"] = "auto"
+
+    # The warm-up's last message is never spoken or stored; it only has to be
+    # a user turn every endpoint accepts, so the cached prefix ends exactly
+    # where the caller's first words will begin.
+    WARM_UP_USER_MESSAGE = "."
+
+    async def warm_up(
+        self,
+        call_id: str,
+        context: Dict[str, Any],
+        options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Send the call's prompt once, ahead of the caller's first words.
+
+        One ``max_tokens: 1`` Chat Completions request carrying the same
+        system prompt, prior messages (the greeting), tools and vendor fields
+        the first turn will carry, through this adapter's own session. It
+        leaves the connection open in the pool, so the next request logs
+        ``connection=reused`` instead of paying TCP+TLS, and on an endpoint
+        with prefix caching (vLLM, OpenAI, Mistral) it leaves the prompt
+        prefix cached, so the first turn prefills only the caller's words.
+        The reply is discarded. Nothing here raises: a failed warm-up costs
+        the call nothing but a log line.
+        """
+        merged = self._compose_options(options)
+        if not merged["api_key"]:
+            logger.debug("LLM prompt warm-up skipped: no API key", call_id=call_id)
+            return {"status": "skipped", "reason": "no_api_key"}
+        if bool(merged.get("use_realtime")):
+            logger.debug("LLM prompt warm-up skipped: Realtime transport", call_id=call_id)
+            return {"status": "skipped", "reason": "realtime"}
+
+        await self._ensure_session()
+        assert self._session
+        payload = self._build_chat_payload(self.WARM_UP_USER_MESSAGE, context, merged)
+        payload["max_tokens"] = 1
+        self._attach_tools(payload, merged)
+        headers = _make_http_headers(merged)
+        url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
+
+        started_at = time.perf_counter()
+        trace = HttpTrace()
+        try:
+            async with self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                **self._request_kwargs(merged["timeout_sec"], trace),
+            ) as response:
+                body = await response.text()
+                total_ms = round((time.perf_counter() - started_at) * 1000.0, 1)
+                if response.status >= 400:
+                    logger.warning(
+                        "LLM prompt warm-up failed",
+                        call_id=call_id,
+                        model=payload.get("model"),
+                        status=response.status,
+                        body_preview=body[:128],
+                        total_ms=total_ms,
+                        **self._trace_fields(trace),
+                    )
+                    return {"status": "error", "http_status": response.status, "total_ms": total_ms}
+                usage = self._usage_of(body)
+                fields = {
+                    "total_ms": total_ms,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "cached_tokens": usage.get("cached_tokens"),
+                    **self._trace_fields(trace),
+                }
+                logger.info(
+                    "LLM prompt warm-up completed",
+                    call_id=call_id,
+                    model=payload.get("model"),
+                    messages_count=len(payload.get("messages", [])),
+                    tools_count=len(payload.get("tools", [])),
+                    **fields,
+                )
+                return {"status": "ok", **fields}
+        except Exception as exc:
+            logger.warning(
+                "LLM prompt warm-up failed",
+                call_id=call_id,
+                model=payload.get("model"),
+                error=str(exc),
+                total_ms=round((time.perf_counter() - started_at) * 1000.0, 1),
+                **self._trace_fields(trace),
+            )
+            return {"status": "error", "error": str(exc)}
+
+    @staticmethod
+    def _usage_of(body: str) -> Dict[str, Any]:
+        """Prompt token counts from a completion body; ``cached_tokens`` as OpenAI and vLLM report it."""
+        try:
+            usage = json.loads(body).get("usage") or {}
+        except Exception:
+            return {}
+        details = usage.get("prompt_tokens_details") or {}
+        return {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "cached_tokens": details.get("cached_tokens") if isinstance(details, dict) else None,
+        }
 
     @staticmethod
     def _note_finish_reason(

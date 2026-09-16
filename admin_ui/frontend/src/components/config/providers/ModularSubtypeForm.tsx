@@ -1,5 +1,5 @@
 import React from 'react';
-import { FormInput, FormLabel } from '../../ui/FormComponents';
+import { FormInput, FormLabel, FormSwitch } from '../../ui/FormComponents';
 import HelpTooltip from '../../ui/HelpTooltip';
 import ComboboxInput from '../../ui/ComboboxInput';
 import type { ProviderSubtype, SubtypeField } from '../../../config/modularProviderSubtypes';
@@ -32,6 +32,19 @@ const ModularSubtypeForm: React.FC<ModularSubtypeFormProps> = ({ subtype, config
             onChange={(val) => onChange(field.key, val)}
             suggestions={field.suggestions}
             placeholder={field.placeholder || (field.suggestions ? `e.g., ${field.suggestions[0]}` : '')}
+          />
+        </div>
+      );
+    }
+
+    if (field.type === 'boolean') {
+      return (
+        <div key={field.key}>
+          <FormSwitch
+            label={field.label}
+            tooltip={field.tooltip}
+            checked={Boolean(currentValue)}
+            onChange={(e) => onChange(field.key, e.target.checked)}
           />
         </div>
       );
