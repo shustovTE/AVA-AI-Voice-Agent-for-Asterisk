@@ -295,6 +295,8 @@ class TestInCallHTTPTool:
         
         assert result["status"] == "success"
         assert result["data"] == response_data
+        # The pipeline hands the model only the message, so the JSON must be in it.
+        assert json.loads(result["message"]) == response_data
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -17098,11 +17098,15 @@ class Engine:
                                         # Trigger LLM to generate follow-up response
                                         try:
                                             context_for_llm = {"prior_messages": _sanitize_for_llm(llm_context_history)}
+                                            # The follow-up is the same conversation: it carries
+                                            # the turn's own options (the agent's prompt, the tool
+                                            # allowlist, the pipeline's settings), not the raw
+                                            # pipeline block those were resolved from.
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
                                                 context_for_llm,
-                                                pipeline.llm_options
+                                                llm_options,
                                             )
                                             if llm_response:
                                                 # Handle text response if present

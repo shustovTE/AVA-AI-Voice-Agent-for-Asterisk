@@ -568,7 +568,7 @@ in_call_tools:
         "time": "{time}",
         "slot": "{slot}"
       }
-    return_raw_json: false
+    return_raw_json: false   # true: the model receives the whole response JSON instead of the extracted variables
     output_variables:
       available: "data.available"
       next_slot: "data.next_available_slot"
