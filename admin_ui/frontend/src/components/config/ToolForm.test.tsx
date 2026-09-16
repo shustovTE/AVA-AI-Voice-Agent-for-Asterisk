@@ -194,3 +194,58 @@ describe('ToolForm — global device-state value mapping (issue #577)', () => {
         expect(lastCall.check_extension_status?.state_mapping).toBeUndefined();
     });
 });
+
+type HangupTestConfig = TestToolConfig & {
+    hangup_call?: {
+        enabled?: boolean;
+        farewell_message?: string;
+        farewell_message_enabled?: boolean;
+        description?: string;
+        parameter_descriptions?: Record<string, string>;
+    };
+};
+
+describe('ToolForm — hangup_call wording and the farewell switch', () => {
+    const settle = async () => {
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+    };
+
+    it('turns the farewell_message parameter off and hides the fields that only apply with it', async () => {
+        const user = userEvent.setup();
+        const onChange = vi.fn();
+        render(<Harness onChange={onChange} />);
+        await settle();
+
+        expect(screen.getByLabelText('Default Farewell Message')).toBeInTheDocument();
+        expect(screen.getByLabelText('farewell_message Parameter Description')).toBeInTheDocument();
+        const description = screen.getByLabelText('Tool Description (what the LLM sees)') as HTMLTextAreaElement;
+        expect(description.placeholder).toMatch(/Set farewell_message to your goodbye sentence/);
+
+        await user.click(screen.getByRole('checkbox', { name: /Farewell via farewell_message parameter/i }));
+
+        const latest = onChange.mock.calls[onChange.mock.calls.length - 1][0] as HangupTestConfig;
+        expect(latest.hangup_call?.farewell_message_enabled).toBe(false);
+        expect(screen.queryByLabelText('Default Farewell Message')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('farewell_message Parameter Description')).not.toBeInTheDocument();
+        const withoutFarewell = screen.getByLabelText('Tool Description (what the LLM sees)') as HTMLTextAreaElement;
+        expect(withoutFarewell.placeholder).toMatch(/the call ends once your reply has been spoken/);
+    });
+
+    it('stores the tool description and the parameter description under hangup_call', async () => {
+        const user = userEvent.setup();
+        const onChange = vi.fn();
+        render(<Harness onChange={onChange} />);
+        await settle();
+
+        await user.type(screen.getByLabelText('Tool Description (what the LLM sees)'), 'Завершить звонок.');
+        let latest = onChange.mock.calls[onChange.mock.calls.length - 1][0] as HangupTestConfig;
+        expect(latest.hangup_call?.description).toBe('Завершить звонок.');
+
+        await user.type(screen.getByLabelText('farewell_message Parameter Description'), 'Прощальная фраза.');
+        latest = onChange.mock.calls[onChange.mock.calls.length - 1][0] as HangupTestConfig;
+        expect(latest.hangup_call?.parameter_descriptions?.farewell_message).toBe('Прощальная фраза.');
+        expect(latest.hangup_call?.description).toBe('Завершить звонок.');
+    });
+});
