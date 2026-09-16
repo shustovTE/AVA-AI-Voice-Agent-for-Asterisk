@@ -162,3 +162,134 @@ async def test_stream_can_be_disabled_per_pipeline():
 
     assert not session.requests[0]["url"].endswith("/stream")
     assert response.read_called is True
+
+
+# --- output formats ---------------------------------------------------------------
+#
+# The adapter decodes every raw format the API documents (16-bit PCM at any
+# rate, μ-law and A-law at 8 kHz); mp3 and opus are refused before a request.
+
+import audioop
+
+from src.pipelines.elevenlabs import _OUTPUT_FORMAT_SAMPLE_RATES
+
+
+@pytest.mark.asyncio
+async def test_pcm_8000_streams_on_a_narrowband_call():
+    chunks = [b"\x10\x00\xf0\xff" * 50, b"\x00\x20" * 81, b"\x00\x40" * 40]
+    response = _FakeAudioResponse(chunks)
+    session = _FakeHttpSession(response)
+    adapter = _adapter(session)
+
+    frames = await _collect(
+        adapter,
+        {"output_format": "pcm_8000", "format": {"encoding": "mulaw", "sample_rate": 8000}},
+    )
+
+    assert session.requests[0]["url"].endswith("/stream")
+    assert session.requests[0]["params"]["output_format"] == "pcm_8000"
+    assert response.read_called is False
+    assert [len(f) for f in frames[:-1]] == [160] * (len(frames) - 1)
+    assert b"".join(frames) == convert_pcm16le_to_target_format(b"".join(chunks), "mulaw")
+
+
+@pytest.mark.asyncio
+async def test_alaw_8000_is_decoded_chunk_by_chunk():
+    pcm = b"".join(int(v).to_bytes(2, "little", signed=True) for v in range(-8000, 8000, 50))
+    alaw = audioop.lin2alaw(pcm, 2)
+    chunks = [alaw[:37], alaw[37:200], alaw[200:]]
+    response = _FakeAudioResponse(chunks)
+    session = _FakeHttpSession(response)
+    adapter = _adapter(session)
+
+    frames = await _collect(
+        adapter,
+        {"output_format": "alaw_8000", "format": {"encoding": "linear16", "sample_rate": 8000}},
+    )
+
+    assert session.requests[0]["params"]["output_format"] == "alaw_8000"
+    assert b"".join(frames) == audioop.alaw2lin(alaw, 2)
+
+
+@pytest.mark.asyncio
+async def test_alaw_8000_is_decoded_on_the_buffered_path():
+    pcm = b"\x00\x10" * 400
+    response = _FakeAudioResponse([audioop.lin2alaw(pcm, 2)])
+    session = _FakeHttpSession(response)
+    adapter = _adapter(session, options={"stream": False})
+
+    frames = await _collect(
+        adapter,
+        {"output_format": "alaw_8000", "format": {"encoding": "linear16", "sample_rate": 8000}},
+    )
+
+    assert response.read_called is True
+    assert b"".join(frames) == audioop.alaw2lin(audioop.lin2alaw(pcm, 2), 2)
+
+
+@pytest.mark.asyncio
+async def test_every_documented_raw_format_is_requested_as_configured():
+    assert set(_OUTPUT_FORMAT_SAMPLE_RATES) == {
+        "pcm_8000", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_32000",
+        "pcm_44100", "pcm_48000", "ulaw_8000", "alaw_8000",
+    }
+    for output_format in _OUTPUT_FORMAT_SAMPLE_RATES:
+        response = _FakeAudioResponse([b"\x00\x01" * 480])
+        session = _FakeHttpSession(response)
+        adapter = _adapter(session)
+
+        frames = await _collect(
+            adapter,
+            {"output_format": output_format, "format": {"encoding": "mulaw", "sample_rate": 8000}},
+        )
+
+        assert session.requests[0]["params"]["output_format"] == output_format, output_format
+        assert b"".join(frames), output_format
+
+
+@pytest.mark.asyncio
+async def test_compressed_formats_are_refused_before_any_request():
+    for output_format in ("mp3_44100_128", "opus_48000_64"):
+        session = _FakeHttpSession(_FakeAudioResponse([b"\x00"]))
+        adapter = _adapter(session)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await _collect(
+                adapter,
+                {"output_format": output_format, "format": {"encoding": "mulaw", "sample_rate": 8000}},
+            )
+
+        message = str(excinfo.value)
+        assert message.startswith(f"Unsupported ElevenLabs TTS output format: {output_format}")
+        assert "decoder" in message
+        assert "pcm_8000" in message and "alaw_8000" in message
+        assert session.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_format_is_refused_with_the_accepted_list():
+    session = _FakeHttpSession(_FakeAudioResponse([b"\x00"]))
+    adapter = _adapter(session)
+
+    with pytest.raises(RuntimeError, match=r"pcm_1600 \(not an output format this adapter can decode\); use one of: pcm_8000"):
+        await _collect(
+            adapter,
+            {"output_format": "pcm_1600", "format": {"encoding": "mulaw", "sample_rate": 8000}},
+        )
+    assert session.requests == []
+
+
+@pytest.mark.asyncio
+async def test_any_8khz_format_is_raised_to_pcm_16000_on_a_wideband_call():
+    for output_format in ("ulaw_8000", "alaw_8000", "pcm_8000"):
+        response = _FakeAudioResponse([b"\x00\x01" * 640])
+        session = _FakeHttpSession(response)
+        adapter = _adapter(session)
+
+        await _collect(
+            adapter,
+            {"output_format": output_format, "format": {"encoding": "linear16", "sample_rate": 16000}},
+        )
+
+        assert session.requests[0]["params"]["output_format"] == "pcm_16000", output_format
+        assert session.requests[0]["url"].endswith("/stream")

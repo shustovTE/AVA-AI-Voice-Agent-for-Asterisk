@@ -561,7 +561,7 @@ providers:
 **Key settings**:
 - **`voice_id`**: Choose from the [ElevenLabs Voice Library](https://elevenlabs.io/voice-library). Default is Rachel (`21m00Tcm4TlvDq8ikWAM`).
 - **`model_id`**: `eleven_turbo_v2_5` offers the best balance of speed and quality for telephony.
-- **`output_format`**: Must be `ulaw_8000` for telephony. ElevenLabs returns μ-law encoded audio at 8 kHz.
+- **`output_format`**: the format requested from ElevenLabs. The adapter decodes the raw formats the API offers and nothing else: 16-bit PCM at any rate (`pcm_8000`, `pcm_16000`, `pcm_22050`, `pcm_24000`, `pcm_32000`, `pcm_44100` on the Pro tier or above, `pcm_48000`) and the two 8 kHz telephony codecs (`ulaw_8000`, `alaw_8000`). `mp3_*` and `opus_*` are valid API values, but the engine ships no decoder for them, so they are refused before any request is made, with the accepted list in the error. `ulaw_8000` (the default) or `pcm_8000` suits an 8 kHz call; a wideband (16 kHz) call switches any 8 kHz format to `pcm_16000` on its own so the API is not the bottleneck. A rate other than the call's is resampled by the engine, which keeps that provider on the buffered path (see `stream`).
 - **`stream`**: Default `true`. Requests `/text-to-speech/{voice_id}/stream` and starts playback on the first bytes instead of waiting for the whole sentence, which removes the synthesis time of each sentence from the reply latency. Set `false` to go back to the buffered request. The setting is ignored (and the buffered path used) when the requested `output_format` needs resampling to the call's transport rate, because the resampler keeps no state between chunks.
 
 ### Routing ElevenLabs Through a Proxy

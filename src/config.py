@@ -568,7 +568,9 @@ class ElevenLabsProviderConfig(BaseModel):
     model_id: str = Field(default="eleven_turbo_v2_5")  # Fast, high-quality
     base_url: str = Field(default="https://api.elevenlabs.io/v1")
     # Audio settings
-    output_format: str = Field(default="ulaw_8000")  # ulaw_8000, mp3_44100, pcm_16000, etc.
+    # Raw formats the adapter decodes: pcm_8000 .. pcm_48000, ulaw_8000,
+    # alaw_8000. mp3_* and opus_* are valid API values the engine cannot decode.
+    output_format: str = Field(default="ulaw_8000")
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
     # Play audio as it arrives from /text-to-speech/{voice}/stream instead of
     # waiting for the whole sentence. Ignored when the requested output_format

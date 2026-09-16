@@ -140,6 +140,15 @@ def pcm16le_to_mulaw(data: bytes) -> bytes:
     return audioop.lin2ulaw(data, _PCM_SAMPLE_WIDTH)
 
 
+def alaw_to_pcm16le(data: bytes) -> bytes:
+    """
+    Convert A-law audio data (8-bit) to PCM16 little-endian samples.
+    """
+    if not data:
+        return b""
+    return audioop.alaw2lin(data, _PCM_SAMPLE_WIDTH)
+
+
 def resample_audio(
     pcm_bytes: bytes,
     source_rate: int,

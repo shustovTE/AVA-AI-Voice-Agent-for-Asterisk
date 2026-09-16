@@ -8,6 +8,7 @@ API Reference: https://elevenlabs.io/docs/api-reference/text-to-speech
 from __future__ import annotations
 
 from ..audio.resampler import (
+    alaw_to_pcm16le,
     convert_pcm16le_to_target_format,
     mulaw_to_pcm16le,
     resample_audio,
@@ -31,14 +32,47 @@ from .base import TTSComponent
 
 logger = get_logger(__name__)
 
-# Output formats the adapter knows how to decode, mapped to the sample rate
-# ElevenLabs returns them at.
+# Output formats the adapter can decode itself, mapped to the sample rate
+# ElevenLabs returns them at: 16-bit PCM at every rate the API offers, and the
+# two 8 kHz telephony codecs. The API also offers mp3_* and opus_*, which need
+# a decoder the engine does not ship; those are refused before a request is
+# made rather than failing on the first audio chunk.
 _OUTPUT_FORMAT_SAMPLE_RATES = {
-    "ulaw_8000": 8000,
+    "pcm_8000": 8000,
     "pcm_16000": 16000,
+    "pcm_22050": 22050,
     "pcm_24000": 24000,
+    "pcm_32000": 32000,
+    "pcm_44100": 44100,  # Pro tier or above on ElevenLabs
+    "pcm_48000": 48000,
+    "ulaw_8000": 8000,
+    "alaw_8000": 8000,
 }
 _MULAW_OUTPUT_FORMATS = {"ulaw_8000"}
+_ALAW_OUTPUT_FORMATS = {"alaw_8000"}
+_COMPRESSED_OUTPUT_FORMAT_PREFIXES = ("mp3_", "opus_")
+
+
+def _unsupported_output_format(output_format: str) -> RuntimeError:
+    accepted = ", ".join(_OUTPUT_FORMAT_SAMPLE_RATES)
+    reason = (
+        "mp3 and opus need a decoder the engine does not ship"
+        if str(output_format).startswith(_COMPRESSED_OUTPUT_FORMAT_PREFIXES)
+        else "not an output format this adapter can decode"
+    )
+    return RuntimeError(
+        f"Unsupported ElevenLabs TTS output format: {output_format} ({reason}); "
+        f"use one of: {accepted}"
+    )
+
+
+def _decode_to_pcm16le(raw: bytes, output_format: str) -> bytes:
+    """Bytes as ElevenLabs sent them to PCM16; per-sample, so safe chunk by chunk."""
+    if output_format in _MULAW_OUTPUT_FORMATS:
+        return mulaw_to_pcm16le(raw)
+    if output_format in _ALAW_OUTPUT_FORMATS:
+        return alaw_to_pcm16le(raw)
+    return raw
 
 # The proxy rules live in src.utils.proxy_url so the Admin UI's connection
 # probe applies exactly what this adapter applies; they are re-exported here
@@ -177,22 +211,27 @@ class ElevenLabsTTSAdapter(TTSComponent):
         target_sample_rate = int(merged["format"]["sample_rate"])
 
         # The historical adapter requested native μ-law for 8 kHz calls.
-        # A wideband call must request PCM so no 8 kHz bottleneck is introduced
-        # before the AudioSocket boundary.
+        # A wideband call must request 16 kHz PCM so no 8 kHz bottleneck is
+        # introduced before the AudioSocket boundary; any 8 kHz format
+        # (μ-law, A-law or 8 kHz PCM) would be that bottleneck.
         if (
             target_encoding.lower() in {"linear16", "pcm16", "slin16"}
             and target_sample_rate >= 16000
-            and output_format == "ulaw_8000"
+            and _OUTPUT_FORMAT_SAMPLE_RATES.get(output_format) == 8000
         ):
+            logger.debug(
+                "ElevenLabs output format raised for a wideband call",
+                call_id=call_id,
+                requested=output_format,
+                used="pcm_16000",
+            )
             output_format = "pcm_16000"
         
         request_id = f"11labs-tts-{uuid.uuid4().hex[:12]}"
 
         source_rate = _OUTPUT_FORMAT_SAMPLE_RATES.get(output_format)
         if source_rate is None:
-            raise RuntimeError(
-                f"Unsupported ElevenLabs TTS output format: {output_format}"
-            )
+            raise _unsupported_output_format(output_format)
 
         # Stream only when the API already returns the call's transport rate.
         # resample_audio() keeps no state between invocations, so resampling
@@ -287,11 +326,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
                 raw_audio = await response.read()
                 latency_ms = (time.perf_counter() - started_at) * 1000.0
 
-                pcm_audio = (
-                    mulaw_to_pcm16le(raw_audio)
-                    if output_format in _MULAW_OUTPUT_FORMATS
-                    else raw_audio
-                )
+                pcm_audio = _decode_to_pcm16le(raw_audio, output_format)
 
                 if source_rate != target_sample_rate:
                     pcm_audio, _ = resample_audio(
@@ -349,15 +384,17 @@ class ElevenLabsTTSAdapter(TTSComponent):
     ) -> AsyncIterator[bytes]:
         """Emit playback frames while the response body is still arriving.
 
-        Both conversions used here (μ-law decode and target encoding) are
-        per-sample and stateless, so converting each network chunk on its own
+        Both conversions used here (μ-law or A-law decode and target encoding)
+        are per-sample and stateless, so converting each network chunk on its own
         produces the same bytes as converting the whole response at once. The
         caller only selects this path when no resampling is required.
         """
         frame_bytes = self._frame_size_bytes(
             target_encoding, target_sample_rate, chunk_ms
         )
-        source_is_mulaw = output_format in _MULAW_OUTPUT_FORMATS
+        source_is_companded = (
+            output_format in _MULAW_OUTPUT_FORMATS or output_format in _ALAW_OUTPUT_FORMATS
+        )
         pending = b""
         partial_sample = b""
         raw_bytes = 0
@@ -368,8 +405,8 @@ class ElevenLabsTTSAdapter(TTSComponent):
             if not raw:
                 continue
             raw_bytes += len(raw)
-            if source_is_mulaw:
-                pcm_audio = mulaw_to_pcm16le(raw)
+            if source_is_companded:
+                pcm_audio = _decode_to_pcm16le(raw, output_format)
             else:
                 # A PCM16 sample can straddle a chunk boundary; hold the odd
                 # trailing byte back for the next chunk.
