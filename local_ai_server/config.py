@@ -86,6 +86,13 @@ class LocalAIConfig:
     tone_model_path: str = "/app/models/stt/t-one"
     tone_decoder_type: str = "beam_search"
     tone_kenlm_path: str = ""
+    # onnx-asr backend (GigaAM v3, NeMo FastConformer RU): model name (auto-downloaded
+    # from Hugging Face into cache_dir/<model>) or an explicit directory with the files.
+    onnx_asr_model: str = "gigaam-v3-e2e-ctc"
+    onnx_asr_model_path: str = ""
+    onnx_asr_cache_dir: str = "/app/models/stt/onnx-asr"
+    onnx_asr_quantization: str = ""
+    onnx_asr_device: str = "auto"
     faster_whisper_model: str = "base"
     faster_whisper_device: str = "cpu"
     faster_whisper_compute: str = "int8"
@@ -276,6 +283,13 @@ class LocalAIConfig:
             tone_model_path=os.getenv("TONE_MODEL_PATH", "/app/models/stt/t-one"),
             tone_decoder_type=(os.getenv("TONE_DECODER_TYPE", "beam_search") or "beam_search").strip().lower(),
             tone_kenlm_path=os.getenv("TONE_KENLM_PATH", ""),
+            onnx_asr_model=(os.getenv("ONNX_ASR_MODEL", "gigaam-v3-e2e-ctc") or "gigaam-v3-e2e-ctc").strip(),
+            onnx_asr_model_path=(os.getenv("ONNX_ASR_MODEL_PATH", "") or "").strip(),
+            onnx_asr_cache_dir=(
+                os.getenv("ONNX_ASR_CACHE_DIR", "/app/models/stt/onnx-asr") or "/app/models/stt/onnx-asr"
+            ).strip(),
+            onnx_asr_quantization=(os.getenv("ONNX_ASR_QUANTIZATION", "") or "").strip().lower(),
+            onnx_asr_device=(os.getenv("ONNX_ASR_DEVICE", "auto") or "auto").strip().lower(),
             faster_whisper_model=os.getenv("FASTER_WHISPER_MODEL", "base"),
             faster_whisper_device=os.getenv("FASTER_WHISPER_DEVICE", "cpu"),
             faster_whisper_compute=os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8"),

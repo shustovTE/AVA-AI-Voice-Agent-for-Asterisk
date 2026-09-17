@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -351,6 +352,8 @@ class SherpaOfflineSTTBackend:
       - Silero VAD model (silero_vad.onnx)
     """
 
+    LOG_TAG = "SHERPA-OFFLINE"
+
     def __init__(
         self,
         model_path: str,
@@ -386,12 +389,12 @@ class SherpaOfflineSTTBackend:
             import sherpa_onnx
 
             if not os.path.exists(self.model_path):
-                logging.error("❌ SHERPA-OFFLINE - Model not found at %s", self.model_path)
+                logging.error(f"❌ {self.LOG_TAG} - Model not found at %s", self.model_path)
                 return False
 
             if not self.vad_model_path or not os.path.exists(self.vad_model_path):
                 logging.error(
-                    "❌ SHERPA-OFFLINE - Silero VAD model not found at %s. "
+                    f"❌ {self.LOG_TAG} - Silero VAD model not found at %s. "
                     "Download from: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
                     self.vad_model_path,
                 )
@@ -412,7 +415,7 @@ class SherpaOfflineSTTBackend:
                     missing.append("decoder*.onnx")
                 if not joiner_file:
                     missing.append("joiner*.onnx")
-                logging.error("❌ SHERPA-OFFLINE - Missing model files: %s", ", ".join(missing))
+                logging.error(f"❌ {self.LOG_TAG} - Missing model files: %s", ", ".join(missing))
                 return False
 
             # Offline mode only supports non-streaming transducer models. Streaming
@@ -421,7 +424,7 @@ class SherpaOfflineSTTBackend:
             model_name = os.path.basename(os.path.normpath(self.model_path)).lower()
             is_streaming = "chunk" in encoder_name or "streaming" in model_name
 
-            logging.info("📁 SHERPA-OFFLINE - Model files found:")
+            logging.info(f"📁 {self.LOG_TAG} - Model files found:")
             logging.info("   tokens: %s", tokens_file)
             logging.info("   encoder: %s", encoder_file)
             logging.info("   decoder: %s", decoder_file)
@@ -431,7 +434,7 @@ class SherpaOfflineSTTBackend:
 
             if is_streaming:
                 logging.error(
-                    "❌ SHERPA-OFFLINE - Offline mode requires a non-streaming Sherpa transducer model. "
+                    f"❌ {self.LOG_TAG} - Offline mode requires a non-streaming Sherpa transducer model. "
                     "Got streaming model at %s. Use SHERPA_MODEL_TYPE=online for streaming models "
                     "or switch SHERPA_MODEL_PATH to an offline model such as sherpa-onnx-zipformer-en-2023-06-26.",
                     self.model_path,
@@ -448,22 +451,11 @@ class SherpaOfflineSTTBackend:
                 decoding_method="greedy_search",
             )
 
-            # Store VAD config for per-session creation (no shared VAD instance).
-            self._vad_config = sherpa_onnx.VadModelConfig()
-            self._vad_config.silero_vad.model = self.vad_model_path
-            self._vad_config.silero_vad.threshold = self.vad_threshold
-            self._vad_config.silero_vad.min_silence_duration = self.vad_min_silence_ms / 1000.0
-            self._vad_config.silero_vad.min_speech_duration = self.vad_min_speech_ms / 1000.0
-            self._vad_config.silero_vad.max_speech_duration = 20.0
-            self._vad_config.sample_rate = self.sample_rate
-
-            # Validate VAD config by creating (and discarding) a test instance.
-            _test_vad = sherpa_onnx.VoiceActivityDetector(self._vad_config, buffer_size_in_seconds=30)
-            del _test_vad
+            self._configure_vad(sherpa_onnx)
 
             self._initialized = True
             logging.info(
-                "✅ SHERPA-OFFLINE - OfflineRecognizer + Silero VAD initialized with model %s "
+                f"✅ {self.LOG_TAG} - OfflineRecognizer + Silero VAD initialized with model %s "
                 "(preroll_ms=%d threshold=%.2f min_silence_ms=%d min_speech_ms=%d)",
                 self.model_path,
                 self.preroll_ms,
@@ -473,11 +465,25 @@ class SherpaOfflineSTTBackend:
             )
             return True
         except ImportError:
-            logging.error("❌ SHERPA-OFFLINE - sherpa-onnx not installed")
+            logging.error(f"❌ {self.LOG_TAG} - sherpa-onnx not installed")
             return False
         except Exception as exc:
-            logging.error("❌ SHERPA-OFFLINE - Failed to initialize: %s", exc)
+            logging.error(f"❌ {self.LOG_TAG} - Failed to initialize: %s", exc)
             return False
+
+    def _configure_vad(self, sherpa_onnx: Any) -> None:
+        """Store the Silero VAD config for per-session creation (no shared VAD instance)."""
+        self._vad_config = sherpa_onnx.VadModelConfig()
+        self._vad_config.silero_vad.model = self.vad_model_path
+        self._vad_config.silero_vad.threshold = self.vad_threshold
+        self._vad_config.silero_vad.min_silence_duration = self.vad_min_silence_ms / 1000.0
+        self._vad_config.silero_vad.min_speech_duration = self.vad_min_speech_ms / 1000.0
+        self._vad_config.silero_vad.max_speech_duration = 20.0
+        self._vad_config.sample_rate = self.sample_rate
+
+        # Validate VAD config by creating (and discarding) a test instance.
+        _test_vad = sherpa_onnx.VoiceActivityDetector(self._vad_config, buffer_size_in_seconds=30)
+        del _test_vad
 
     # ------------------------------------------------------------------
     # Per-session VAD lifecycle
@@ -491,7 +497,7 @@ class SherpaOfflineSTTBackend:
             import sherpa_onnx
             return sherpa_onnx.VoiceActivityDetector(self._vad_config, buffer_size_in_seconds=30)
         except Exception as exc:
-            logging.error("❌ SHERPA-OFFLINE - Failed to create session VAD: %s", exc)
+            logging.error(f"❌ {self.LOG_TAG} - Failed to create session VAD: %s", exc)
             return None
 
     # ------------------------------------------------------------------
@@ -611,7 +617,7 @@ class SherpaOfflineSTTBackend:
         suffix = f" validation={validation_error}" if validation_error else " validation=ok"
         if self._debug_segments:
             level(
-                "🔍 SHERPA-OFFLINE VAD segment[%d] - samples=%d duration_ms=%d rms=%.6f "
+                f"🔍 {self.LOG_TAG} VAD segment[%d] - samples=%d duration_ms=%d rms=%.6f "
                 "min=%.6f max=%.6f max_abs=%.6f first5=%s min_required=%d%s",
                 seg_idx,
                 stats["samples"],
@@ -627,7 +633,7 @@ class SherpaOfflineSTTBackend:
             return
 
         level(
-            "🔍 SHERPA-OFFLINE VAD segment[%d] - samples=%d duration_ms=%d rms=%.6f "
+            f"🔍 {self.LOG_TAG} VAD segment[%d] - samples=%d duration_ms=%d rms=%.6f "
             "min=%.6f max=%.6f max_abs=%.6f min_required=%d%s",
             seg_idx,
             stats["samples"],
@@ -658,7 +664,7 @@ class SherpaOfflineSTTBackend:
             self._vad_chunk_count += 1
             if rms > 0.002 or self._vad_chunk_count % 100 == 1:
                 logging.debug(
-                    "🔍 SHERPA-OFFLINE VAD - chunk=%d samples=%d rms=%.6f speech=%s",
+                    f"🔍 {self.LOG_TAG} VAD - chunk=%d samples=%d rms=%.6f speech=%s",
                     self._vad_chunk_count, len(float_samples), rms, rms > 0.002,
                 )
 
@@ -667,7 +673,7 @@ class SherpaOfflineSTTBackend:
             has_segments = not vad.empty()
             if has_segments:
                 logging.info(
-                    "🔍 SHERPA-OFFLINE VAD - Speech segment(s) detected at chunk=%d",
+                    f"🔍 {self.LOG_TAG} VAD - Speech segment(s) detected at chunk=%d",
                     self._vad_chunk_count,
                 )
 
@@ -686,7 +692,7 @@ class SherpaOfflineSTTBackend:
 
                 if validation_error:
                     logging.warning(
-                        "⚠️ SHERPA-OFFLINE - Segment[%d] rejected before decode: %s",
+                        f"⚠️ {self.LOG_TAG} - Segment[%d] rejected before decode: %s",
                         seg_idx - 1,
                         validation_error,
                     )
@@ -694,14 +700,14 @@ class SherpaOfflineSTTBackend:
 
                 if len(speech_samples) < self._min_audio_length:
                     logging.info(
-                        "🔍 SHERPA-OFFLINE VAD segment skipped (too short): %d < %d samples",
+                        f"🔍 {self.LOG_TAG} VAD segment skipped (too short): %d < %d samples",
                         len(speech_samples), self._min_audio_length,
                     )
                     continue
 
                 text = self._transcribe_segment(speech_samples)
                 logging.info(
-                    "🔍 SHERPA-OFFLINE transcribe seg[%d] result: '%s' (empty=%s)",
+                    f"🔍 {self.LOG_TAG} transcribe seg[%d] result: '%s' (empty=%s)",
                     seg_idx - 1, text or "", text is None or text == "",
                 )
                 if text:
@@ -713,7 +719,7 @@ class SherpaOfflineSTTBackend:
             return None
 
         except Exception as exc:
-            logging.error("❌ SHERPA-OFFLINE - Process error: %s", exc)
+            logging.error(f"❌ {self.LOG_TAG} - Process error: %s", exc)
             return None
 
     def finalize(self, vad: Any) -> Optional[Dict[str, Any]]:
@@ -736,7 +742,7 @@ class SherpaOfflineSTTBackend:
                 seg_idx += 1
                 if validation_error:
                     logging.warning(
-                        "⚠️ SHERPA-OFFLINE - Finalize segment[%d] rejected before decode: %s",
+                        f"⚠️ {self.LOG_TAG} - Finalize segment[%d] rejected before decode: %s",
                         seg_idx - 1,
                         validation_error,
                     )
@@ -753,7 +759,7 @@ class SherpaOfflineSTTBackend:
             return None
 
         except Exception as exc:
-            logging.error("❌ SHERPA-OFFLINE - Finalize error: %s", exc)
+            logging.error(f"❌ {self.LOG_TAG} - Finalize error: %s", exc)
             return None
 
     def transcribe_pcm16(self, pcm16_audio: bytes) -> Optional[Dict[str, Any]]:
@@ -771,14 +777,181 @@ class SherpaOfflineSTTBackend:
             return None
 
         except Exception as exc:
-            logging.error("❌ SHERPA-OFFLINE - Transcribe error: %s", exc)
+            logging.error(f"❌ {self.LOG_TAG} - Transcribe error: %s", exc)
             return None
 
     def shutdown(self) -> None:
         self.recognizer = None
         self._vad_config = None
         self._initialized = False
-        logging.info("🛑 SHERPA-OFFLINE - Recognizer shutdown")
+        logging.info(f"🛑 {self.LOG_TAG} - Recognizer shutdown")
+
+
+class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
+    """
+    Offline STT backend for the models of the ``onnx-asr`` package: GigaAM v2/v3
+    (Sber, Russian; the ``e2e`` variants add punctuation and text normalization),
+    NeMo FastConformer Hybrid RU, the multilingual GigaAM, NeMo Parakeet.
+
+    These models decode one whole phrase at a time, so the caller's audio is cut
+    into phrases by the same per-session Silero VAD gate as the Sherpa offline
+    backend; segmenting, pre-roll, validation and finalize are inherited, and only
+    the model loading and the per-segment decode differ. The model is fetched
+    from Hugging Face by name on first use into ``cache_dir/<model>`` (or read
+    from ``model_path`` when the operator placed the files there) and runs on
+    onnxruntime's CUDA provider when ``onnxruntime-gpu`` and a GPU are present
+    (``device=auto``), else on the CPU.
+
+    Requires ``onnx-asr`` (``INCLUDE_ONNX_ASR=true``) and ``sherpa-onnx`` for the
+    VAD gate (``INCLUDE_SHERPA=true``, the default).
+    """
+
+    LOG_TAG = "ONNX-ASR"
+    DEFAULT_MODEL = "gigaam-v3-e2e-ctc"
+    DEFAULT_CACHE_DIR = "/app/models/stt/onnx-asr"
+    DEVICES = ("auto", "cpu", "cuda")
+
+    def __init__(
+        self,
+        model: str,
+        vad_model_path: str,
+        *,
+        model_path: str = "",
+        cache_dir: str = DEFAULT_CACHE_DIR,
+        quantization: str = "",
+        device: str = "auto",
+        sample_rate: int = PCM16_TARGET_RATE,
+        preroll_ms: int = 0,
+        vad_threshold: float = 0.5,
+        vad_min_silence_ms: int = 500,
+        vad_min_speech_ms: int = 250,
+    ):
+        self.model = (model or "").strip() or self.DEFAULT_MODEL
+        self.explicit_model_path = (model_path or "").strip()
+        self.cache_dir = (cache_dir or "").strip() or self.DEFAULT_CACHE_DIR
+        self.quantization = (quantization or "").strip().lower() or None
+        if self.quantization in ("fp32", "float32", "none"):
+            self.quantization = None
+        device = (device or "auto").strip().lower()
+        self.device = device if device in self.DEVICES else "auto"
+        self.providers: List[str] = []
+        self._decode_lock = threading.Lock()
+        super().__init__(
+            model_path=self.explicit_model_path or self.model_dir,
+            vad_model_path=vad_model_path,
+            sample_rate=sample_rate,
+            preroll_ms=preroll_ms,
+            vad_threshold=vad_threshold,
+            vad_min_silence_ms=vad_min_silence_ms,
+            vad_min_speech_ms=vad_min_speech_ms,
+        )
+
+    @property
+    def model_dir(self) -> str:
+        """Where the model files live: the explicit path, else the per-model cache directory."""
+        if self.explicit_model_path:
+            return self.explicit_model_path
+        return os.path.join(self.cache_dir, self.model.replace("/", "__"))
+
+    def _select_providers(self) -> List[str]:
+        """Pick onnxruntime execution providers for the configured device."""
+        try:
+            import onnxruntime as rt
+
+            available = list(rt.get_available_providers())
+        except Exception:
+            available = ["CPUExecutionProvider"]
+        cuda = "CUDAExecutionProvider" in available
+        if self.device == "cpu":
+            return ["CPUExecutionProvider"]
+        if self.device == "cuda":
+            if not cuda:
+                logging.warning(
+                    f"⚠️ {self.LOG_TAG} - CUDA requested but onnxruntime reports no CUDAExecutionProvider "
+                    "(onnxruntime-gpu missing or no GPU visible); falling back to the CPU"
+                )
+                return ["CPUExecutionProvider"]
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"] if cuda else ["CPUExecutionProvider"]
+
+    def initialize(self) -> bool:
+        try:
+            import onnx_asr
+        except ImportError:
+            logging.error(
+                f"❌ {self.LOG_TAG} - onnx-asr is not installed. "
+                "Rebuild the image with INCLUDE_ONNX_ASR=true."
+            )
+            return False
+        try:
+            import sherpa_onnx
+        except ImportError:
+            logging.error(
+                f"❌ {self.LOG_TAG} - sherpa-onnx is not installed; it provides the Silero VAD gate. "
+                "Rebuild the image with INCLUDE_SHERPA=true."
+            )
+            return False
+        try:
+            if not self.vad_model_path or not os.path.exists(self.vad_model_path):
+                logging.error(
+                    f"❌ {self.LOG_TAG} - Silero VAD model not found at %s. "
+                    "Download from: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+                    self.vad_model_path,
+                )
+                return False
+
+            self.providers = self._select_providers()
+            local_dir = self.model_dir
+            offline = bool(self.explicit_model_path)
+            if not offline:
+                os.makedirs(local_dir, exist_ok=True)
+            logging.info(
+                f"📥 {self.LOG_TAG} - Loading model %s (dir=%s quantization=%s providers=%s%s)",
+                self.model,
+                local_dir,
+                self.quantization or "fp32",
+                self.providers,
+                "" if offline else "; downloaded from Hugging Face when missing",
+            )
+            manager = onnx_asr.loader.Manager(providers=self.providers)
+            self.recognizer = manager.create_asr(
+                self.model,
+                local_dir,
+                quantization=self.quantization,
+                offline=offline,
+            )
+
+            self._configure_vad(sherpa_onnx)
+
+            self._initialized = True
+            logging.info(
+                f"✅ {self.LOG_TAG} - Model %s + Silero VAD initialized on %s "
+                "(preroll_ms=%d threshold=%.2f min_silence_ms=%d min_speech_ms=%d)",
+                self.model,
+                self.providers[0],
+                self.preroll_ms,
+                self.vad_threshold,
+                self.vad_min_silence_ms,
+                self.vad_min_speech_ms,
+            )
+            return True
+        except Exception as exc:
+            logging.error(f"❌ {self.LOG_TAG} - Failed to initialize model %s: %s", self.model, exc)
+            return False
+
+    def _transcribe_segment(self, speech_samples: np.ndarray) -> str:
+        """Decode one VAD segment with the onnx-asr model (serialized: one decode at a time)."""
+        waveform = np.ascontiguousarray(speech_samples, dtype=np.float32)
+        with self._decode_lock:
+            text = self.recognizer.recognize(waveform, sample_rate=self.sample_rate)
+        return (text or "").strip()
+
+    def shutdown(self) -> None:
+        self.recognizer = None
+        self._vad_config = None
+        self._initialized = False
+        logging.info(f"🛑 {self.LOG_TAG} - Recognizer shutdown")
+
 
 
 class ToneSTTBackend:

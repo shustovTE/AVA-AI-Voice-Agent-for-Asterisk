@@ -43,6 +43,7 @@ interface BackendCapabilities {
         kroko_embedded: { available: boolean; reason: string };
         kroko_cloud: { available: boolean; reason: string };
         tone: { available: boolean; reason: string };
+        onnx_asr?: { available: boolean; reason: string };
         faster_whisper: { available: boolean; reason: string };
     };
     tts: {
@@ -285,9 +286,11 @@ export const HealthWidget = () => {
             capabilities && !capabilities.stt?.faster_whisper?.available;
         const needsTone = pendingChanges.stt?.backend === 'tone' &&
             capabilities && !capabilities.stt?.tone?.available;
+        const needsOnnxAsr = pendingChanges.stt?.backend === 'onnx_asr' &&
+            capabilities && !capabilities.stt?.onnx_asr?.available;
         const needsMeloTTS = pendingChanges.tts?.backend === 'melotts' && 
             capabilities && !capabilities.tts?.melotts?.available;
-        return { needsFasterWhisper, needsTone, needsMeloTTS, any: needsFasterWhisper || needsTone || needsMeloTTS };
+        return { needsFasterWhisper, needsTone, needsOnnxAsr, needsMeloTTS, any: needsFasterWhisper || needsTone || needsOnnxAsr || needsMeloTTS };
     };
 
     // Rebuild and enable new backends
@@ -302,6 +305,7 @@ export const HealthWidget = () => {
             const res = await axios.post('/api/local-ai/rebuild', {
                 include_faster_whisper: rebuild.needsFasterWhisper,
                 include_tone: rebuild.needsTone,
+                include_onnx_asr: rebuild.needsOnnxAsr,
                 include_melotts: rebuild.needsMeloTTS,
                 stt_backend: pendingChanges.stt?.backend,
                 stt_model: pendingChanges.stt?.modelPath || 'base',
@@ -599,6 +603,9 @@ export const HealthWidget = () => {
                                         if (backend === 'tone') {
                                             if (models.length === 0 && !capabilities?.stt?.tone?.available) return null;
                                         }
+                                        if (backend === 'onnx_asr') {
+                                            if (models.length === 0) return null;
+                                        }
                                         if (backend === 'faster_whisper') {
                                             // Show Faster-Whisper option (requires rebuild)
                                             return (
@@ -639,6 +646,13 @@ export const HealthWidget = () => {
                                             </option>
                                         </optgroup>
                                     )}
+                                    <optgroup key="onnx_asr" label="GigaAM v3 / NeMo (onnx-asr)">
+                                        <option key="onnx_asr_gigaam_v3_e2e_ctc" value="onnx_asr:gigaam-v3-e2e-ctc">
+                                            GigaAM v3 E2E CTC (ru) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                        </option>
+                                        <option key="onnx_asr_gigaam_v3_e2e_rnnt" value="onnx_asr:gigaam-v3-e2e-rnnt">GigaAM v3 E2E RNNT (ru)</option>
+                                        <option key="onnx_asr_nemo_ru_ctc" value="onnx_asr:nemo-fastconformer-ru-ctc">NeMo FastConformer RU (CTC)</option>
+                                    </optgroup>
                                 </select>
                             </div>
                             <div className="text-xs text-muted-foreground bg-muted/50 p-2 rounded border border-border/50 truncate flex justify-between">

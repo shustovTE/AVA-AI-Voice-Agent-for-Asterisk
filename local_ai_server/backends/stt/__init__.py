@@ -5,6 +5,7 @@ from backends.stt.kroko_backend import KrokoBackend
 from backends.stt.faster_whisper_backend import FasterWhisperBackend
 from backends.stt.whisper_cpp_backend import WhisperCppBackend
 from backends.stt.tone_backend import ToneBackend
+from backends.stt.onnx_asr_backend import OnnxAsrBackend
 
 STT_REGISTRY.register(VoskBackend)
 STT_REGISTRY.register(SherpaBackend)
@@ -12,3 +13,4 @@ STT_REGISTRY.register(KrokoBackend)
 STT_REGISTRY.register(FasterWhisperBackend)
 STT_REGISTRY.register(WhisperCppBackend)
 STT_REGISTRY.register(ToneBackend)
+STT_REGISTRY.register(OnnxAsrBackend)

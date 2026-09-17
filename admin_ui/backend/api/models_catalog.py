@@ -251,6 +251,47 @@ TONE_STT_MODELS = [
      "note": "Set TONE_KENLM_PATH when using TONE_DECODER_TYPE=beam_search."},
 ]
 
+# onnx-asr models: fetched from Hugging Face by the local AI server itself on first
+# start (ONNX_ASR_CACHE_DIR), so there is nothing to download from here. The path is
+# the onnx-asr model name.
+_ONNX_ASR_NOTE = (
+    "Requires INCLUDE_ONNX_ASR=true in the Docker build. Downloaded from Hugging Face by the "
+    "local AI server on first start. Offline model behind the Silero VAD gate: a phrase is "
+    "recognized once the caller pauses. GPU recommended (ONNX_ASR_DEVICE=auto uses CUDA when present)."
+)
+ONNX_ASR_STT_MODELS = [
+    {"id": "onnx_asr_gigaam_v3_e2e_ctc", "name": "GigaAM v3 E2E CTC (Russian, punctuation)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 950, "size_display": "~950 MB (fp32)",
+     "model_path": "gigaam-v3-e2e-ctc", "download_url": None, "auto_download": True, "recommended": True,
+     "description": "Sber GigaAM v3 with punctuation and text normalization built in; CTC decoder (fastest).",
+     "note": _ONNX_ASR_NOTE},
+    {"id": "onnx_asr_gigaam_v3_e2e_rnnt", "name": "GigaAM v3 E2E RNNT (Russian, punctuation)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 980, "size_display": "~980 MB (fp32)",
+     "model_path": "gigaam-v3-e2e-rnnt", "download_url": None, "auto_download": True,
+     "description": "Sber GigaAM v3 with punctuation and normalization; RNNT decoder (slightly more accurate, slower).",
+     "note": _ONNX_ASR_NOTE},
+    {"id": "onnx_asr_gigaam_v3_ctc", "name": "GigaAM v3 CTC (Russian, lowercase)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 950, "size_display": "~950 MB (fp32)",
+     "model_path": "gigaam-v3-ctc", "download_url": None, "auto_download": True,
+     "description": "Sber GigaAM v3, plain lowercase text without punctuation; CTC decoder.",
+     "note": _ONNX_ASR_NOTE},
+    {"id": "onnx_asr_gigaam_v3_rnnt", "name": "GigaAM v3 RNNT (Russian, lowercase)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 980, "size_display": "~980 MB (fp32)",
+     "model_path": "gigaam-v3-rnnt", "download_url": None, "auto_download": True,
+     "description": "Sber GigaAM v3, plain lowercase text without punctuation; RNNT decoder.",
+     "note": _ONNX_ASR_NOTE},
+    {"id": "onnx_asr_nemo_fastconformer_ru_ctc", "name": "NeMo FastConformer Hybrid Large RU (CTC)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 460, "size_display": "~460 MB (fp32)",
+     "model_path": "nemo-fastconformer-ru-ctc", "download_url": None, "auto_download": True,
+     "description": "NVIDIA NeMo Russian FastConformer with punctuation and capitalization; CTC decoder.",
+     "note": _ONNX_ASR_NOTE},
+    {"id": "onnx_asr_nemo_fastconformer_ru_rnnt", "name": "NeMo FastConformer Hybrid Large RU (RNNT)", "language": "ru-RU",
+     "region": "europe", "backend": "onnx_asr", "size_mb": 470, "size_display": "~470 MB (fp32)",
+     "model_path": "nemo-fastconformer-ru-rnnt", "download_url": None, "auto_download": True,
+     "description": "NVIDIA NeMo Russian FastConformer with punctuation and capitalization; RNNT decoder.",
+     "note": _ONNX_ASR_NOTE},
+]
+
 FASTER_WHISPER_STT_MODELS = [
     # Faster-Whisper models auto-download from HuggingFace on first use
     # Requires: docker build --build-arg INCLUDE_FASTER_WHISPER=true
@@ -1445,7 +1486,7 @@ MATCHA_TTS_MODELS = [
 def get_full_catalog():
     """Get the complete model catalog organized by type."""
     return {
-        "stt": VOSK_STT_MODELS + SHERPA_STT_MODELS + KROKO_STT_MODELS + TONE_STT_MODELS + FASTER_WHISPER_STT_MODELS + WHISPER_CPP_STT_MODELS,
+        "stt": VOSK_STT_MODELS + SHERPA_STT_MODELS + KROKO_STT_MODELS + TONE_STT_MODELS + ONNX_ASR_STT_MODELS + FASTER_WHISPER_STT_MODELS + WHISPER_CPP_STT_MODELS,
         "tts": PIPER_TTS_MODELS + KOKORO_TTS_MODELS + MELOTTS_MODELS + SILERO_TTS_MODELS + MATCHA_TTS_MODELS,
         "llm": LLM_MODELS,
     }

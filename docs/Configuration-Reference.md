@@ -200,7 +200,7 @@ Environment variables for selecting local STT/TTS backends:
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
+| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `onnx_asr`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
 | `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts`, `silero` | `piper` | Text-to-speech engine |
 
 **STT Backends**:
@@ -208,6 +208,7 @@ Environment variables for selecting local STT/TTS backends:
 - **Sherpa-ONNX**: Low-latency streaming ASR using ONNX runtime
 - **Kroko**: High-quality streaming ASR with 12+ languages (requires API key for hosted mode)
 - **T-one**: Native Russian telephony STT using the upstream streaming CTC pipeline
+- **onnx-asr** (`onnx_asr`): GigaAM v3 (Sber) and NeMo FastConformer RU through ONNX Runtime, offline models behind the Silero VAD gate (a phrase is recognized once the caller pauses; CUDA when the GPU image and a GPU are present). `ONNX_ASR_MODEL` picks the model (`gigaam-v3-e2e-ctc` by default), fetched from Hugging Face on first start; requires `INCLUDE_ONNX_ASR=true`. See [LOCAL_ONLY_SETUP.md](LOCAL_ONLY_SETUP.md#supported-stt-models).
 - **Faster-Whisper**: Whisper inference via `faster-whisper` (model IDs like `base`, `small`, etc., or a local model directory depending on your install)
 - **Whisper.cpp**: Local GGML Whisper inference with multilingual language hints
 

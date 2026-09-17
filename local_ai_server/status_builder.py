@@ -11,11 +11,27 @@ def _stt_language(server) -> Optional[str]:
         return getattr(server, "kroko_language", None)
     if backend == "tone":
         return "ru"
+    if backend == "onnx_asr":
+        model = str(getattr(server, "onnx_asr_model", "") or "").lower()
+        if "multilingual" in model:
+            return "multi"
+        if model.startswith("gigaam") or "-ru-" in model or model.endswith("-ru"):
+            return "ru"
+        return None
     if backend == "faster_whisper":
         return getattr(server, "faster_whisper_language", None)
     if backend == "whisper_cpp":
         return getattr(server, "whisper_cpp_language", None)
     return None
+
+
+def _onnx_asr_device(server) -> str:
+    """The device the onnx-asr model actually runs on, or the configured one before it is loaded."""
+    backend = getattr(server, "onnx_asr_backend", None)
+    providers = list(getattr(backend, "providers", None) or [])
+    if providers:
+        return "cuda" if providers[0] == "CUDAExecutionProvider" else "cpu"
+    return str(getattr(server, "onnx_asr_device", "auto") or "auto")
 
 
 def _stt_status(server) -> Tuple[bool, Optional[str], Optional[str]]:
@@ -44,6 +60,13 @@ def _stt_status(server) -> Tuple[bool, Optional[str], Optional[str]]:
         path = getattr(server, "tone_model_path", None)
         decoder = getattr(server, "tone_decoder_type", "beam_search")
         display = f"T-one ({os.path.basename(path or 't-one')}, {decoder})"
+        return loaded, path, display
+    if server.stt_backend == "onnx_asr":
+        backend = getattr(server, "onnx_asr_backend", None)
+        loaded = server.mock_models or backend is not None
+        model = getattr(server, "onnx_asr_model", None) or "gigaam-v3-e2e-ctc"
+        path = getattr(server, "onnx_asr_model_path", None) or getattr(backend, "model_dir", None) or model
+        display = f"onnx-asr ({model}, {_onnx_asr_device(server)})"
         return loaded, path, display
     if server.stt_backend == "faster_whisper":
         loaded = server.mock_models or server.faster_whisper_backend is not None
@@ -168,6 +191,9 @@ def build_status_response(server) -> Dict[str, Any]:
                 "compute_type": getattr(server, "faster_whisper_compute", None) if server.stt_backend == "faster_whisper" else None,
                 "sherpa_model_type": getattr(server, "sherpa_model_type", None) if server.stt_backend == "sherpa" else None,
                 "tone_decoder_type": getattr(server, "tone_decoder_type", None) if server.stt_backend == "tone" else None,
+                "onnx_asr_model": getattr(server, "onnx_asr_model", None) if server.stt_backend == "onnx_asr" else None,
+                "onnx_asr_device": _onnx_asr_device(server) if server.stt_backend == "onnx_asr" else None,
+                "onnx_asr_quantization": (getattr(server, "onnx_asr_quantization", None) or "fp32") if server.stt_backend == "onnx_asr" else None,
             },
             "llm": {
                 "loaded": llm_loaded,

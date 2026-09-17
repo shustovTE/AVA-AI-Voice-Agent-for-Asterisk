@@ -26,6 +26,7 @@ BUILD_TIME_ESTIMATES = {
     "faster_whisper": 180,  # ~3 min
     "whisper_cpp": 240,     # ~4 min
     "tone": 300,            # ~5 min (kenlm/pyctcdecode install)
+    "onnx_asr": 120,        # ~2 min (pure wheels: onnx-asr + onnxruntime)
     "melotts": 300,         # ~5 min
     "kroko_embedded": 120,  # ~2 min
     "vosk": 60,             # ~1 min
@@ -38,6 +39,7 @@ BACKEND_BUILD_ARGS = {
     "faster_whisper": "INCLUDE_FASTER_WHISPER",
     "whisper_cpp": "INCLUDE_WHISPER_CPP",
     "tone": "INCLUDE_TONE",
+    "onnx_asr": "INCLUDE_ONNX_ASR",
     "melotts": "INCLUDE_MELOTTS",
     "kroko_embedded": "INCLUDE_KROKO_EMBEDDED",
     "vosk": "INCLUDE_VOSK",
@@ -54,6 +56,7 @@ _DEFAULT_INCLUDE_BASE: Dict[str, bool] = {
     "faster_whisper": False,
     "whisper_cpp": False,
     "tone": False,
+    "onnx_asr": False,
     "melotts": False,
     "kroko_embedded": False,
     "vosk": True,
@@ -70,6 +73,7 @@ _DEFAULT_INCLUDE_GPU: Dict[str, bool] = {
     "faster_whisper": True,
     "whisper_cpp": True,
     "tone": False,
+    "onnx_asr": False,
 }
 
 

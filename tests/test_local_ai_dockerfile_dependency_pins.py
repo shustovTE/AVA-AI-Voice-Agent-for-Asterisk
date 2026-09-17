@@ -19,6 +19,7 @@ def test_optional_native_dependency_pins_have_one_source_of_truth() -> None:
         r"^llama-cpp-python==\d+\.\d+\.\d+$", requirements, re.MULTILINE
     )
     assert re.search(r"^faster-whisper==\d+\.\d+\.\d+$", requirements, re.MULTILINE)
+    assert re.search(r"^onnx-asr==\d+\.\d+\.\d+$", requirements, re.MULTILINE)
     assert re.search(r"^kokoro==\d+\.\d+\.\d+$", requirements, re.MULTILINE)
     assert re.search(r"^torch==\d+\.\d+\.\d+$", requirements, re.MULTILINE)
     assert re.search(r"^torchaudio==\d+\.\d+\.\d+$", requirements, re.MULTILINE)
@@ -59,6 +60,10 @@ def test_optional_native_dependency_pins_have_one_source_of_truth() -> None:
         assert "requires gradio, which is not installed" in content, dockerfile
         assert "No unexpected broken requirements found." in content, dockerfile
         assert not re.search(r"pip install[^\n]*faster-whisper==", content), dockerfile
+        assert "grep -m 1 '^onnx-asr==' requirements.txt" in content, dockerfile
+        assert not re.search(r"pip install[^\n]*onnx-asr==", content), dockerfile
+        extra = "gpu,hub" if dockerfile.name.endswith(".gpu") else "cpu,hub"
+        assert f"onnx-asr[{extra}]==" in content, dockerfile
         assert not re.search(r"pip install[^\n]*kokoro(?:==|>=)", content), dockerfile
         assert not re.search(r"pip install[^\n]*torch(?:==|>=)", content), dockerfile
         assert not re.search(r"pip install[^\n]*torchaudio(?:==|>=)", content), dockerfile

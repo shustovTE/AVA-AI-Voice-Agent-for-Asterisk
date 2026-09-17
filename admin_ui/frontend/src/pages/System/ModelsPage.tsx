@@ -102,7 +102,7 @@ interface AvailableModels {
 
 interface BackendCapabilities {
     stt?: {
-        tone?: { available: boolean; reason?: string };
+        tone?: { available: boolean; reason?: string }; onnx_asr?: { available: boolean; reason?: string };
         faster_whisper?: { available: boolean; reason?: string };
         kroko_embedded?: { available: boolean; reason?: string };
         whisper_cpp?: { available: boolean; reason?: string };
@@ -162,7 +162,7 @@ const ModelsPage = () => {
     const [serverStatus, setServerStatus] = useState<ServerStatus>('loading');
     const [restarting, setRestarting] = useState(false);
     const [pendingChanges, setPendingChanges] = useState<{ stt?: string; tts?: string; llm?: string }>({});
-    const [pendingSttExtra, setPendingSttExtra] = useState<{ language?: string; device?: string; compute_type?: string; sherpa_model_type?: string; sherpa_vad_model_path?: string; tone_decoder_type?: string; tone_kenlm_path?: string }>({});
+    const [pendingSttExtra, setPendingSttExtra] = useState<{ language?: string; device?: string; compute_type?: string; sherpa_model_type?: string; sherpa_vad_model_path?: string; tone_decoder_type?: string; tone_kenlm_path?: string; onnx_asr_device?: string; onnx_asr_quantization?: string }>({});
     const [pendingLlmConfig, setPendingLlmConfig] = useState<{ context?: number; max_tokens?: number }>({});
     const [pendingRuntimeConfig, setPendingRuntimeConfig] = useState<{ enable_filler_audio?: boolean; llm_streaming_tts_overlap?: boolean }>({});
     const [startingServer, setStartingServer] = useState(false);
@@ -658,6 +658,7 @@ const ModelsPage = () => {
         if (b === 'faster_whisper') return !!capabilities?.stt?.faster_whisper?.available;
         if (b === 'whisper_cpp') return !!capabilities?.stt?.whisper_cpp?.available;
         if (b === 'tone') return !!capabilities?.stt?.tone?.available;
+        if (b === 'onnx_asr') return !!capabilities?.stt?.onnx_asr?.available;
         if (b === 'kroko') return true; // cloud always available; embedded availability is checked separately at apply time
         if (b === 'vosk') return true;
         if (b === 'sherpa') return true;
@@ -687,6 +688,13 @@ const ModelsPage = () => {
             issues.push({
                 key: 'tone_rebuild',
                 message: 'T-one is not installed in this Local AI image. Full container rebuild is required.',
+                requiresRebuild: true
+            });
+        }
+        if (sttSel.backend === 'onnx_asr' && capabilities && !capabilities.stt?.onnx_asr?.available) {
+            issues.push({
+                key: 'onnx_asr_rebuild',
+                message: 'onnx-asr (GigaAM v3 / NeMo) is not installed in this Local AI image. Full container rebuild is required.',
                 requiresRebuild: true
             });
         }
@@ -750,9 +758,10 @@ const ModelsPage = () => {
         krokoEmbedded: compatibilityIssues.some(issue => issue.key === 'kroko_rebuild'),
         whisperCpp: compatibilityIssues.some(issue => issue.key === 'whispercpp_rebuild'),
         tone: compatibilityIssues.some(issue => issue.key === 'tone_rebuild'),
+        onnxAsr: compatibilityIssues.some(issue => issue.key === 'onnx_asr_rebuild'),
         silero: compatibilityIssues.some(issue => issue.key === 'silero_rebuild')
     };
-    const requiresAnyRebuild = requiresRebuild.fasterWhisper || requiresRebuild.whisperCpp || requiresRebuild.tone || requiresRebuild.meloTts || requiresRebuild.krokoEmbedded || requiresRebuild.silero;
+    const requiresAnyRebuild = requiresRebuild.fasterWhisper || requiresRebuild.whisperCpp || requiresRebuild.tone || requiresRebuild.onnxAsr || requiresRebuild.meloTts || requiresRebuild.krokoEmbedded || requiresRebuild.silero;
 
     const applyPendingChanges = async () => {
         if (!hasPendingApplyChanges) return;
@@ -817,6 +826,7 @@ const ModelsPage = () => {
                     include_faster_whisper: requiresRebuild.fasterWhisper,
                     include_whisper_cpp: requiresRebuild.whisperCpp,
                     include_tone: requiresRebuild.tone,
+                    include_onnx_asr: requiresRebuild.onnxAsr,
                     include_melotts: requiresRebuild.meloTts,
                     include_kroko_embedded: requiresRebuild.krokoEmbedded,
                     include_silero: requiresRebuild.silero,
@@ -898,6 +908,9 @@ const ModelsPage = () => {
                     } else if (backend === 'tone') {
                         if (pendingSttExtra.tone_decoder_type) extra.tone_decoder_type = pendingSttExtra.tone_decoder_type;
                         if (pendingSttExtra.tone_kenlm_path) extra.tone_kenlm_path = pendingSttExtra.tone_kenlm_path;
+                    } else if (backend === 'onnx_asr') {
+                        if (pendingSttExtra.onnx_asr_device) extra.onnx_asr_device = pendingSttExtra.onnx_asr_device;
+                        if (pendingSttExtra.onnx_asr_quantization !== undefined) extra.onnx_asr_quantization = pendingSttExtra.onnx_asr_quantization;
                     }
                 }
                 if (type === 'tts' && backend === 'silero') {
@@ -1109,7 +1122,7 @@ const ModelsPage = () => {
                                     >
                                         {availableModels?.stt && Object.entries(availableModels.stt).map(([backend, models]) => (
                                             backend === 'faster_whisper' ? null : (
-                                                <optgroup key={backend} label={backend.charAt(0).toUpperCase() + backend.slice(1)}>
+                                                <optgroup key={backend} label={backend === 'onnx_asr' ? 'GigaAM v3 / NeMo (onnx-asr, downloaded)' : backend.charAt(0).toUpperCase() + backend.slice(1)}>
                                                     {models.map((m: any) => (
                                                         <option key={m.path} value={`${backend}:${m.path}`}>{m.name}</option>
                                                     ))}
@@ -1123,6 +1136,27 @@ const ModelsPage = () => {
                                                 </option>
                                             </optgroup>
                                         )}
+                                        {/* onnx-asr models are fetched by the server on first start; list them even before any is cached. */}
+                                        <optgroup label="GigaAM v3 / NeMo (onnx-asr)">
+                                                <option value="onnx_asr:gigaam-v3-e2e-ctc">
+                                                    GigaAM v3 E2E CTC (ru, punctuation) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                                <option value="onnx_asr:gigaam-v3-e2e-rnnt">
+                                                    GigaAM v3 E2E RNNT (ru, punctuation) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                                <option value="onnx_asr:gigaam-v3-ctc">
+                                                    GigaAM v3 CTC (ru, lowercase) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                                <option value="onnx_asr:gigaam-v3-rnnt">
+                                                    GigaAM v3 RNNT (ru, lowercase) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                                <option value="onnx_asr:nemo-fastconformer-ru-ctc">
+                                                    NeMo FastConformer RU (CTC) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                                <option value="onnx_asr:nemo-fastconformer-ru-rnnt">
+                                                    NeMo FastConformer RU (RNNT) {!capabilities?.stt?.onnx_asr?.available ? '(requires rebuild)' : ''}
+                                                </option>
+                                        </optgroup>
                                         <optgroup label="Faster Whisper">
                                             <option value="faster_whisper:tiny.en">
                                                 Whisper Tiny English (CPU demo) {!capabilities?.stt?.faster_whisper?.available ? '(requires rebuild)' : ''}
@@ -1304,6 +1338,57 @@ const ModelsPage = () => {
                                                             />
                                                         </div>
                                                     )}
+                                                </div>
+                                            );
+                                        }
+                                        if (selectedBackend === 'onnx_asr') {
+                                            return (
+                                                <div className="mt-2 space-y-1.5">
+                                                    <div>
+                                                        <label className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                                            Device
+                                                            <HelpTooltip
+                                                                content={
+                                                                    <>
+                                                                        <strong>onnx-asr device</strong> — where ONNX Runtime runs the model.
+                                                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                                            <li><code>auto</code> — CUDA when the GPU image and a GPU are present, else CPU.</li>
+                                                                            <li><code>cuda</code> — needs the GPU image (onnxruntime-gpu); falls back to CPU with a warning.</li>
+                                                                            <li><code>cpu</code> — a 5-second phrase takes about a second; consider int8.</li>
+                                                                        </ul>
+                                                                    </>
+                                                                }
+                                                            />
+                                                        </label>
+                                                        <select
+                                                            className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.onnx_asr_device ? 'border-yellow-500' : 'border-border'}`}
+                                                            value={pendingSttExtra.onnx_asr_device ?? (activeModels.stt as any).onnx_asr_device ?? 'auto'}
+                                                            onChange={(e) => {
+                                                                setPendingSttExtra(prev => ({ ...prev, onnx_asr_device: e.target.value }));
+                                                                if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
+                                                            }}
+                                                            disabled={restarting}
+                                                        >
+                                                            <option value="auto">Auto</option>
+                                                            <option value="cuda">CUDA</option>
+                                                            <option value="cpu">CPU</option>
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-[10px] text-muted-foreground">Quantization</label>
+                                                        <select
+                                                            className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.onnx_asr_quantization !== undefined ? 'border-yellow-500' : 'border-border'}`}
+                                                            value={pendingSttExtra.onnx_asr_quantization ?? ((activeModels.stt as any).onnx_asr_quantization === 'int8' ? 'int8' : '')}
+                                                            onChange={(e) => {
+                                                                setPendingSttExtra(prev => ({ ...prev, onnx_asr_quantization: e.target.value }));
+                                                                if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
+                                                            }}
+                                                            disabled={restarting}
+                                                        >
+                                                            <option value="">fp32</option>
+                                                            <option value="int8">int8</option>
+                                                        </select>
+                                                    </div>
                                                 </div>
                                             );
                                         }

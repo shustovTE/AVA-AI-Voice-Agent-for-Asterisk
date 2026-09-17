@@ -61,6 +61,10 @@ class SessionContext:
     # Sherpa-onnx session state
     sherpa_stream: Optional[Any] = None
     sherpa_offline_vad: Optional[Any] = None  # Per-session Silero VAD for offline mode
+    # onnx-asr (GigaAM v3 / NeMo) session state: its own Silero VAD gate and a
+    # lock so a trailing flush never races a decode running in a worker thread.
+    onnx_asr_vad: Optional[Any] = None
+    onnx_asr_lock: Optional[Any] = None
     # T-one session state
     tone_state: Optional[Any] = None
     tone_buffer_8k: bytes = b""

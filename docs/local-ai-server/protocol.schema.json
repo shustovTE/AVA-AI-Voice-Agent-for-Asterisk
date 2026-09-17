@@ -506,6 +506,23 @@
             "tone_kenlm_path": {
               "type": "string"
             },
+            "onnx_asr_model": {
+              "type": "string"
+            },
+            "onnx_asr_model_path": {
+              "type": "string"
+            },
+            "onnx_asr_quantization": {
+              "type": "string"
+            },
+            "onnx_asr_device": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "cpu",
+                "cuda"
+              ]
+            },
             "kroko_url": {
               "type": "string"
             },
@@ -560,6 +577,23 @@
         },
         "tone_kenlm_path": {
           "type": "string"
+        },
+        "onnx_asr_model": {
+          "type": "string"
+        },
+        "onnx_asr_model_path": {
+          "type": "string"
+        },
+        "onnx_asr_quantization": {
+          "type": "string"
+        },
+        "onnx_asr_device": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "cpu",
+            "cuda"
+          ]
         },
         "tts_backend": {
           "type": "string"

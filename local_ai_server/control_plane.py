@@ -30,6 +30,10 @@ _STT_CONFIG_MAP = {
     "tone_model_path": "tone_model_path",
     "tone_decoder_type": "tone_decoder_type",
     "tone_kenlm_path": "tone_kenlm_path",
+    "onnx_asr_model": "onnx_asr_model",
+    "onnx_asr_model_path": "onnx_asr_model_path",
+    "onnx_asr_quantization": "onnx_asr_quantization",
+    "onnx_asr_device": "onnx_asr_device",
 }
 
 _TTS_CONFIG_MAP = {
@@ -133,7 +137,7 @@ def apply_switch_model_request(
 
     if "stt_backend" in data:
         backend = (data["stt_backend"] or "").strip().lower()
-        if backend in ("vosk", "sherpa", "kroko", "faster_whisper", "whisper_cpp", "tone"):
+        if backend in ("vosk", "sherpa", "kroko", "faster_whisper", "whisper_cpp", "tone", "onnx_asr"):
             new_config = replace(new_config, stt_backend=backend)
             changed.append(f"stt_backend={backend}")
 
@@ -151,6 +155,10 @@ def apply_switch_model_request(
         elif new_config.stt_backend == "tone":
             new_config = replace(new_config, tone_model_path=stt_path)
             changed.append(f"tone_model_path={os.path.basename(stt_path)}")
+        elif new_config.stt_backend == "onnx_asr":
+            # For onnx-asr the "model path" is the model name (auto-downloaded).
+            new_config = replace(new_config, onnx_asr_model=str(stt_path).strip())
+            changed.append(f"onnx_asr_model={str(stt_path).strip()}")
         else:
             new_config = replace(new_config, stt_model_path=stt_path)
             changed.append(f"stt_model_path={os.path.basename(stt_path)}")
@@ -211,6 +219,30 @@ def apply_switch_model_request(
         value = str(data["tone_kenlm_path"])
         new_config = replace(new_config, tone_kenlm_path=value)
         changed.append(f"tone_kenlm_path={os.path.basename(value)}")
+
+    if "onnx_asr_model" in data:
+        value = str(data["onnx_asr_model"] or "").strip()
+        if value:
+            new_config = replace(new_config, onnx_asr_model=value)
+            changed.append(f"onnx_asr_model={value}")
+
+    if "onnx_asr_model_path" in data:
+        value = str(data["onnx_asr_model_path"] or "").strip()
+        new_config = replace(new_config, onnx_asr_model_path=value)
+        changed.append(f"onnx_asr_model_path={os.path.basename(value) if value else '(auto)'}")
+
+    if "onnx_asr_quantization" in data:
+        value = str(data["onnx_asr_quantization"] or "").strip().lower()
+        if value in ("fp32", "float32", "none"):
+            value = ""
+        new_config = replace(new_config, onnx_asr_quantization=value)
+        changed.append(f"onnx_asr_quantization={value or 'fp32'}")
+
+    if "onnx_asr_device" in data:
+        value = str(data["onnx_asr_device"] or "").strip().lower()
+        if value in ("auto", "cpu", "cuda"):
+            new_config = replace(new_config, onnx_asr_device=value)
+            changed.append(f"onnx_asr_device={value}")
 
     if "kroko_url" in data:
         new_config = replace(new_config, kroko_url=data["kroko_url"])

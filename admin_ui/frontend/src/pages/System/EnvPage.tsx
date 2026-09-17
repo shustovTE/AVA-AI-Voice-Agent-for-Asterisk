@@ -1399,6 +1399,7 @@ const EnvPage = () => {
                                 { value: 'kroko', label: 'Kroko (Cloud/Embedded)' },
                                 { value: 'sherpa', label: 'Sherpa-ONNX (Local)' },
                                 { value: 'tone', label: `T-one${localCaps && !localCaps.stt?.tone?.available ? ' (requires rebuild)' : ''}` },
+                                { value: 'onnx_asr', label: `GigaAM v3 / NeMo (onnx-asr)${localCaps && !localCaps.stt?.onnx_asr?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'faster_whisper', label: `Faster Whisper${localCaps && !localCaps.stt?.faster_whisper?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'whisper_cpp', label: `Whisper.cpp (GGML)${localCaps && !localCaps.stt?.whisper_cpp?.available ? ' (requires rebuild)' : ''}` },
                             ]}
@@ -1603,6 +1604,52 @@ const EnvPage = () => {
                                         />
                                     </>
                                 )}
+                            </>
+                        )}
+
+                        {sttBackend === 'onnx_asr' && (
+                            <>
+                                <FormSelect
+                                    label="onnx-asr Model"
+                                    value={env['ONNX_ASR_MODEL'] || 'gigaam-v3-e2e-ctc'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_MODEL', e.target.value)}
+                                    options={[
+                                        { value: 'gigaam-v3-e2e-ctc', label: 'GigaAM v3 E2E CTC (ru, punctuation)' },
+                                        { value: 'gigaam-v3-e2e-rnnt', label: 'GigaAM v3 E2E RNNT (ru, punctuation)' },
+                                        { value: 'gigaam-v3-ctc', label: 'GigaAM v3 CTC (ru, lowercase)' },
+                                        { value: 'gigaam-v3-rnnt', label: 'GigaAM v3 RNNT (ru, lowercase)' },
+                                        { value: 'nemo-fastconformer-ru-ctc', label: 'NeMo FastConformer RU (CTC)' },
+                                        { value: 'nemo-fastconformer-ru-rnnt', label: 'NeMo FastConformer RU (RNNT)' },
+                                    ]}
+                                    tooltip="Offline Russian ASR run by the Local AI Server through ONNX Runtime; the model is downloaded from Hugging Face on first start. The e2e variants add punctuation and number normalization. Phrases are cut by the Silero VAD gate (SHERPA_VAD_* settings) and recognized once the caller pauses."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Device"
+                                    value={env['ONNX_ASR_DEVICE'] || 'auto'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_DEVICE', e.target.value)}
+                                    options={[
+                                        { value: 'auto', label: 'Auto (CUDA when available)' },
+                                        { value: 'cuda', label: 'CUDA (GPU image)' },
+                                        { value: 'cpu', label: 'CPU' },
+                                    ]}
+                                    tooltip="CUDA needs the GPU image (docker-compose.gpu.yml) so onnxruntime-gpu is installed; on the CPU a 5-second phrase takes about a second."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Quantization"
+                                    value={env['ONNX_ASR_QUANTIZATION'] || ''}
+                                    onChange={(e) => updateEnv('ONNX_ASR_QUANTIZATION', e.target.value)}
+                                    options={[
+                                        { value: '', label: 'fp32 (default)' },
+                                        { value: 'int8', label: 'int8 (smaller, faster on CPU)' },
+                                    ]}
+                                    tooltip="int8 weights are about a quarter of the size and faster on a CPU; on a GPU keep fp32."
+                                />
+                                <FormInput
+                                    label="onnx-asr Model Directory (optional)"
+                                    value={env['ONNX_ASR_MODEL_PATH'] || ''}
+                                    onChange={(e) => updateEnv('ONNX_ASR_MODEL_PATH', e.target.value)}
+                                    tooltip="Directory that already holds the model files (config.json, the .onnx and the vocabulary). Leave empty to download into ONNX_ASR_CACHE_DIR (/app/models/stt/onnx-asr) on first start."
+                                />
                             </>
                         )}
 

@@ -216,6 +216,9 @@ LOCAL_WS_AUTH_TOKEN=<generate-a-strong-random-token>
 # STT/TTS/LLM config (same as Topology 2)
 LOCAL_STT_BACKEND=faster_whisper
 LOCAL_STT_MODEL_PATH=base
+# Russian on a GPU box: build with INCLUDE_ONNX_ASR=true and use
+#LOCAL_STT_BACKEND=onnx_asr
+#ONNX_ASR_MODEL=gigaam-v3-e2e-ctc
 LOCAL_TTS_BACKEND=kokoro
 KOKORO_MODE=hf
 KOKORO_VOICE=af_heart
@@ -591,6 +594,20 @@ Models are **not bundled** in Docker images. Download them via:
   - `TONE_KENLM_PATH=/app/models/stt/t-one/kenlm.bin` when using `beam_search`
 - T-one expects 8 kHz audio internally; `local_ai_server` handles 16 kHz to 8 kHz conversion and 300 ms chunk framing.
 - Recommended for Russian community validation when you want the upstream T-one path instead of Sherpa/Whisper.
+
+**GigaAM v3 / NeMo FastConformer RU via onnx-asr** (Russian, offline, VAD-gated; GPU recommended):
+- Requires rebuild: `docker compose build --build-arg INCLUDE_ONNX_ASR=true local_ai_server` (the GPU image, `docker-compose.gpu.yml`, installs `onnxruntime-gpu`; the CPU image installs the CPU runtime)
+- Set `LOCAL_STT_BACKEND=onnx_asr` and pick the model with `ONNX_ASR_MODEL`:
+  - `gigaam-v3-e2e-ctc` (default; punctuation and number normalization built in, fastest), `gigaam-v3-e2e-rnnt` (slightly more accurate, slower)
+  - `gigaam-v3-ctc`, `gigaam-v3-rnnt` (plain lowercase text)
+  - `nemo-fastconformer-ru-ctc`, `nemo-fastconformer-ru-rnnt` (NVIDIA NeMo, punctuation and capitalization)
+  - any other name the [onnx-asr](https://github.com/istupakov/onnx-asr) package knows (for example `gigaam-multilingual-ctc`)
+- The model (about 1 GB in fp32) is downloaded from Hugging Face by the server on first start into `ONNX_ASR_CACHE_DIR` (`/app/models/stt/onnx-asr/<model>`, on the `./models` volume, so it is kept across restarts). To skip the download, place the files (`config.json`, the `.onnx`, the vocabulary) in a directory and set `ONNX_ASR_MODEL_PATH`.
+- `ONNX_ASR_DEVICE=auto` runs on CUDA when `onnxruntime-gpu` sees a GPU and on the CPU otherwise; `ONNX_ASR_QUANTIZATION=int8` takes a quarter of the memory and is faster on a CPU.
+- These models decode whole phrases: the caller's audio is cut into phrases by the same Silero VAD gate as Sherpa offline (`SHERPA_VAD_MODEL_PATH`, `SHERPA_VAD_THRESHOLD`, `SHERPA_VAD_MIN_SILENCE_MS`, `SHERPA_VAD_MIN_SPEECH_MS`, `SHERPA_OFFLINE_PREROLL_MS` apply; the VAD model is downloaded automatically), and each phrase is recognized once the caller pauses. There are no partial results; the engine's own Silero VAD still decides the end of the caller's turn and barge-in.
+- Latency: about 100–300 ms per 5-second phrase on a GPU, 0.5–1.5 s on a CPU; both are added after the caller stops. Raise `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms` on the engine so the turn waits for the recognizer's final on a CPU.
+- GPU memory: the model needs about 1 GB next to whatever else uses the GPU (a vLLM on the same card must leave that much free, for example `--gpu-memory-utilization 0.85`).
+- Status shows `onnx-asr (<model>, cuda|cpu)`; the log lines are tagged `ONNX-ASR`.
 
 **Kroko Embedded** (optional, requires rebuild):
 - `docker compose build --build-arg INCLUDE_KROKO_EMBEDDED=true local_ai_server`
