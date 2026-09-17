@@ -2090,7 +2090,9 @@ const CallSchedulingPage = () => {
                                                         />
                                                     </div>
                                                     <div>
-                                                        <FormLabel>Caller ID override (optional)</FormLabel>
+                                                        <FormLabel tooltip="The extension or number this lead is dialed from instead of the global AAVA_OUTBOUND_EXTENSION_IDENTITY. It becomes CALLERID(num) and, on FreePBX, AMPUSER and FROMEXTEN, so the call carries that extension's outbound CID, trunk and route permissions. Empty keeps the global identity.">
+                                                            Caller ID override (optional)
+                                                        </FormLabel>
                                                         <input
                                                             value={manualLeadForm.caller_id}
                                                             onChange={e => setManualLeadForm(p => ({ ...p, caller_id: e.target.value }))}

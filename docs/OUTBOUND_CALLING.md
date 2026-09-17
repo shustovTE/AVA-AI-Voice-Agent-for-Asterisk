@@ -21,7 +21,7 @@ This feature adds a simple, AI-native outbound dialer inspired by Vicidial-style
 ## Key Assumptions
 
 - Your **outbound trunk(s)** and **outbound routes** are already configured in Asterisk/FreePBX.
-- AAVA originates outbound calls using your configured **outbound identity extension** (default `6789`), so FreePBX routing and caller-ID rules apply consistently.
+- AAVA originates outbound calls using your configured **outbound identity extension** (default `6789`), so FreePBX routing and caller-ID rules apply consistently. A lead's **Caller ID override** (CSV column `caller_id`, the manual-lead form, or `caller_id` on `PATCH /api/outbound/leads/{lead_id}`) replaces that identity for the lead's own calls: it becomes `CALLERID(num)` and, on FreePBX, `AMPUSER`/`FROMEXTEN` too, so the call is placed as that extension with its outbound CID, trunk and route permissions, and one campaign can dial different leads from different extensions. The log line `Outbound originate` reports `caller_identity` and whether it came from the `lead` or the `global` setting. On FreePBX, an outbound route with **Override Extension** enabled applies the route's CID regardless of the extension.
 - This is a **single-node** design.
 
 ## Architecture (High Level)
@@ -132,7 +132,8 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
 ### Updating a lead (`PATCH /api/outbound/leads/{lead_id}`)
 
 - `PATCH /api/outbound/leads/{lead_id}` updates `name`, `agent`, `timezone`,
-  `caller_id`, and `custom_vars` (replaced as a whole, not merged). Only
+  `caller_id` (the extension or number the lead is dialed from; see *Key
+  Assumptions*), and `custom_vars` (replaced as a whole, not merged). Only
   fields present in the request change; an explicit `null` clears the override
   back to the campaign default. Returns `409` while the lead is actively being
   dialed (`leased`/`dialing`/`amd_pending`/`in_progress`); state and attempt

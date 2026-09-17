@@ -3206,7 +3206,7 @@ class Engine:
             consent_timeout = 30
         consent_media_uri = str(campaign.get("consent_media_uri") or "").strip()
 
-        caller_id_num = self._outbound_extension_identity
+        caller_id_num, caller_identity_source = self._outbound_caller_identity(lead)
         caller_id_name = str(os.getenv("AAVA_OUTBOUND_CALLERID_NAME", "Asterisk AI")).strip() or "Asterisk AI"
         caller_id_header = f"{caller_id_name} <{caller_id_num}>"
 
@@ -3280,6 +3280,8 @@ class Engine:
             endpoint=endpoint,
             context=context_name,
             routing_method=routing_method,
+            caller_identity=caller_id_num,
+            caller_identity_source=caller_identity_source,
         )
 
         resp = await self.ari_client.originate_channel(
@@ -3318,6 +3320,22 @@ class Engine:
         meta["originated_at_ts"] = time.time()
         self._outbound_attempt_meta_by_attempt_id[attempt_id] = meta
         self._outbound_attempt_meta_by_channel_id[str(channel_id)] = meta
+
+    def _outbound_caller_identity(self, lead: Dict[str, Any]) -> Tuple[str, str]:
+        """The identity an outbound call is placed from, and where it came from.
+
+        A lead's ``caller_id_override`` (CSV column ``caller_id``, the manual
+        lead form, ``PATCH /leads/{id}``) replaces the global
+        ``AAVA_OUTBOUND_EXTENSION_IDENTITY`` for that lead's calls. The value
+        becomes ``CALLERID(num)`` and, on FreePBX, ``AMPUSER``/``FROMEXTEN``
+        as well, so the PBX treats the call as placed from that extension and
+        applies its outbound CID, trunk and route permissions: one campaign
+        can dial its leads from different extensions.
+        """
+        override = str((lead or {}).get("caller_id_override") or "").strip()
+        if override:
+            return override, "lead"
+        return self._outbound_extension_identity, "global"
 
     async def _outbound_choose_endpoint(self, dial_phone: str) -> str:
         """

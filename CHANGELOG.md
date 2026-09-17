@@ -62,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lead's Caller ID override now places the call:** the value was accepted from the CSV column `caller_id`, the manual-lead form and `PATCH /api/outbound/leads/{lead_id}`, stored and shown, but the originate ignored it and always dialed as the global `AAVA_OUTBOUND_EXTENSION_IDENTITY`, so a campaign could not dial its leads from different extensions. The override now becomes `CALLERID(num)` and, on FreePBX, `AMPUSER`/`FROMEXTEN` for that lead's calls, so the PBX applies that extension's outbound CID, trunk and route permissions; an empty override keeps the global identity. `Outbound originate` logs `caller_identity` and its source (`lead` or `global`).
+
 - **A pipeline's reply after a tool keeps the agent's prompt and tools:** the follow-up request that answers a tool result was built from the raw pipeline block instead of the options resolved for the call, so it went out without the agent's system prompt (the pipeline default or the global prompt took its place) and without the tool schemas, which left the model answering out of persona after a tool and unable to call a second one. The follow-up now carries exactly what the first request carried.
 - **`return_raw_json: true` on an in-call HTTP tool now reaches the model:** the pipeline hands the model only the tool's message, and in raw mode that message was the fixed text `Retrieved data successfully.`, so the JSON the operator asked for never arrived. The message is now the response JSON itself.
 

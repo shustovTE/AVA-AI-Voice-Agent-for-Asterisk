@@ -957,7 +957,8 @@ class OutboundStore:
           - agent (optional; preferred Agent slug)
           - context (deprecated compatibility alias for agent)
           - timezone (optional)
-          - caller_id (optional; stored but MVP uses extension identity)
+          - caller_id (optional; the extension or number this lead is dialed
+            from, replacing AAVA_OUTBOUND_EXTENSION_IDENTITY for its calls)
         """
         if not self._enabled:
             raise RuntimeError("OutboundStore disabled")

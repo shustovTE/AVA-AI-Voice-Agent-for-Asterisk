@@ -431,7 +431,7 @@ Outbound calling is implemented as an **engine-driven scheduler + SQLite + ARI o
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate) |
+| `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate). A lead's Caller ID override replaces it for that lead's calls. |
 | `AAVA_OUTBOUND_AMD_CONTEXT` | `aava-outbound-amd` | Dialplan context name used for AMD hop (`continueInDialplan`) |
 | `AAVA_OUTBOUND_PBX_TYPE` | `freepbx` | PBX-specific AAVA Campaign channel vars: `freepbx` \| `generic`. Legacy `vicidial` remains readable for one migration release but cannot be newly selected in the UI; use Call Scheduling → VICIdial Remote Agents. |
 | `AAVA_OUTBOUND_DIAL_CONTEXT` | `from-internal` | Asterisk dialplan context for `Local/` channel origination |
