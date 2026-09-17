@@ -1566,10 +1566,19 @@ class Engine:
                 "is_outbound": bool(getattr(session, "is_outbound", False)),
             }
             await self._save_session(session)
+            # The hard duration cap counts from the call's start, not from
+            # this registration (an outbound call has already been through
+            # the AMD hop by now).
+            elapsed_sec = 0.0
+            start_time = getattr(session, "start_time", None)
+            if isinstance(start_time, datetime):
+                started = start_time if start_time.tzinfo else start_time.replace(tzinfo=timezone.utc)
+                elapsed_sec = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
             await watchdog.register(
                 session.call_id,
                 policy,
                 is_outbound=bool(getattr(session, "is_outbound", False)),
+                elapsed_sec=elapsed_sec,
             )
         except Exception:
             logger.error(
@@ -10177,8 +10186,9 @@ class Engine:
             # Determine outcome
             outcome = "completed"
             explicit_outcome = str(getattr(session, "call_outcome", "") or "").strip()
-            if explicit_outcome == "no_input_timeout":
-                outcome = "no_input_timeout"
+            if explicit_outcome in ("no_input_timeout", "max_duration"):
+                # Policy outcomes, not provider failures.
+                outcome = explicit_outcome
             elif session.error_message:
                 outcome = "error"
             elif self._session_was_transferred(session):
@@ -10268,8 +10278,8 @@ class Engine:
                                 final_outcome = "error"
                             elif self._session_was_transferred(session):
                                 final_outcome = "transferred"
-                            elif str(getattr(session, "call_outcome", "") or "") == "no_input_timeout":
-                                final_outcome = "no_input_timeout"
+                            elif str(getattr(session, "call_outcome", "") or "") in ("no_input_timeout", "max_duration"):
+                                final_outcome = str(getattr(session, "call_outcome", "") or "")
 
                             await self.outbound_store.finish_attempt(
                                 attempt_id,
@@ -15457,40 +15467,46 @@ class Engine:
         if self._session_was_transferred(session) or self._session_has_pending_attended_transfer(session):
             logger.info("No-input hangup skipped during transfer", call_id=call_id)
             return
-        # The stall timer and the check-ins share this terminal path and the
-        # no_input_timeout outcome; the state records which one fired.
+        # The check-ins, the stall timer and the hard duration cap share this
+        # terminal path; the watchdog's phase says which one fired. The first
+        # two end as no_input_timeout, the cap as max_duration.
         watchdog = getattr(self, "no_input_watchdog", None)
         snapshot = watchdog.snapshot(call_id) if watchdog is not None else None
-        stalled = bool(snapshot and snapshot.get("phase") == "stall_hangup")
-        session.call_outcome = "no_input_timeout"
+        phase = str((snapshot or {}).get("phase") or "")
+        if phase == "max_duration_hangup":
+            reason, outcome, message = "max_duration", "max_duration", "Hanging up call at its maximum duration"
+            details = {"max_call_duration_sec": snapshot.get("max_call_duration_sec")}
+        elif phase == "stall_hangup":
+            reason, outcome, message = "stall", "no_input_timeout", "Hanging up stalled conversation"
+            details = {
+                "stall_timeout_sec": snapshot.get("stall_timeout_sec"),
+                "last_exchange_source": snapshot.get("last_exchange_source"),
+            }
+        else:
+            reason, outcome, message, details = "no_input", "no_input_timeout", "Hanging up inactive caller", {}
+        session.call_outcome = outcome
         session.no_input_state.update(
             {
                 "timed_out": True,
                 "timed_out_at": time.time(),
-                "timed_out_reason": "stall" if stalled else "no_input",
+                "timed_out_reason": reason,
             }
         )
         await self._save_session(session)
         logger.info(
-            "Hanging up stalled conversation" if stalled else "Hanging up inactive caller",
+            message,
             call_id=call_id,
             channel_id=session.caller_channel_id,
             provider=session.provider_name,
             pipeline=session.pipeline_name,
-            **(
-                {
-                    "stall_timeout_sec": snapshot.get("stall_timeout_sec"),
-                    "last_exchange_source": snapshot.get("last_exchange_source"),
-                }
-                if stalled
-                else {}
-            ),
+            **details,
         )
         await self._terminate_call_after_audio(
             call_id,
-            reason="no_input_timeout",
-            call_outcome="no_input_timeout",
-            # _speak_no_input_announcement already completed the transport drain.
+            reason=outcome,
+            call_outcome=outcome,
+            # The announcements already completed the transport drain; the
+            # stall timer and the cap end the call at once by design.
             audio_already_drained=True,
         )
 

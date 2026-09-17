@@ -153,6 +153,7 @@ const OutcomeIcon = ({ outcome }: { outcome: string }) => {
         case 'abandoned':
             return <PhoneOff className="w-4 h-4 text-yellow-500" />;
         case 'no_input_timeout':
+        case 'max_duration':
             return <PhoneOff className="w-4 h-4 text-amber-500" />;
         default:
             return <Phone className="w-4 h-4 text-muted-foreground" />;
@@ -161,6 +162,7 @@ const OutcomeIcon = ({ outcome }: { outcome: string }) => {
 
 const outcomeLabel = (outcome: string): string => {
     if (outcome === 'no_input_timeout') return 'No input timeout';
+    if (outcome === 'max_duration') return 'Max duration reached';
     return outcome.replace(/_/g, ' ');
 };
 

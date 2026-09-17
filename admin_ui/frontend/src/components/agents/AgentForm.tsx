@@ -420,7 +420,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
     };
 
     const updateNoInputNumberOverride = (
-        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins' | 'stall_timeout_sec',
+        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins' | 'stall_timeout_sec' | 'max_call_duration_sec',
         raw: string,
         minimum: number,
         maximum: number,
@@ -854,6 +854,17 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                             placeholder="Inherit global stall timeout"
                             onChange={(e) => updateNoInputNumberOverride('stall_timeout_sec', e.target.value, 0, 7200)}
                             tooltip="Hang up once nothing has been exchanged for this long, whatever the line carries (hold music, noise, an IVR). Runs for inbound and outbound calls alike; 0 disables it for this agent."
+                        />
+                        <FormInput
+                            id="agent-no-input-max-duration"
+                            label="Max Call Duration (sec)"
+                            type="number"
+                            min="0"
+                            max="86400"
+                            value={noInputNumber('max_call_duration_sec')}
+                            placeholder="Inherit global max call duration"
+                            onChange={(e) => updateNoInputNumberOverride('max_call_duration_sec', e.target.value, 0, 86400)}
+                            tooltip="Hard cap on a call's length counted from its start; the engine hangs up when it is reached whatever the call is doing. Runs for inbound and outbound calls alike; 0 disables it for this agent."
                         />
                     </div>
                 </details>

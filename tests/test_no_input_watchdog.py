@@ -1055,3 +1055,176 @@ async def test_engine_records_why_the_watchdog_hung_up():
     assert updated.call_outcome == "no_input_timeout"
     assert updated.no_input_state["timed_out_reason"] == "stall"
     engine.ari_client.hangup_channel.assert_awaited_once_with("channel-stalled")
+
+
+# --- the hard duration cap (no_input.max_call_duration_sec) ---------------------------
+
+
+def test_max_call_duration_is_off_by_default_and_coerced_like_the_other_fields():
+    assert NoInputPolicy().max_call_duration_sec == 0.0
+    assert NoInputPolicy().max_duration_applies() is False
+    assert NoInputPolicy.from_mapping({"max_call_duration_sec": "1800"}).max_call_duration_sec == 1800.0
+    assert NoInputPolicy.from_mapping({"max_call_duration_sec": -5}).max_call_duration_sec == 0.0
+    assert NoInputPolicy.from_mapping({"max_call_duration_sec": 100000}).max_call_duration_sec == 0.0
+    assert NoInputPolicy(max_call_duration_sec=1800).max_duration_applies() is True
+    # The block's master switch turns it off; the direction gates do not.
+    assert NoInputPolicy(enabled=False, max_call_duration_sec=1800).max_duration_applies() is False
+    assert NoInputPolicy(outbound_enabled=False, max_call_duration_sec=1800).max_duration_applies() is True
+    assert NoInputConfig(max_call_duration_sec=1800).max_call_duration_sec == 1800.0
+    with pytest.raises(ValueError):
+        NoInputConfig(max_call_duration_sec=-1)
+
+
+@pytest.mark.asyncio
+async def test_max_call_duration_hangs_up_whatever_the_call_is_doing():
+    announcements = []
+    hangups = []
+
+    async def announce(call_id, text, kind):
+        announcements.append(kind)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    policy = NoInputPolicy(initial_timeout_sec=10, grace_timeout_sec=10, max_call_duration_sec=0.06)
+    # Outbound: neither the check-ins nor the stall timer apply; the cap alone registers.
+    assert await watchdog.register("capped", policy, is_outbound=True) is True
+    try:
+        # No mark_ready: the cap does not wait for the greeting. The caller is
+        # making sound and the agent is speaking: neither pauses it.
+        await watchdog.note_input_state("capped", True, "engine:silero_vad")
+        await watchdog.note_agent_output_start("capped")
+        await asyncio.sleep(0.03)
+        assert hangups == []
+        await _wait_until(lambda: hangups == ["capped"])
+        assert announcements == []
+        assert watchdog.snapshot("capped")["phase"] == "max_duration_hangup"
+    finally:
+        await watchdog.stop("capped")
+
+
+@pytest.mark.asyncio
+async def test_max_call_duration_counts_from_the_calls_start():
+    hangups = []
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(AsyncMock(return_value=True), hangup)
+    started = time.monotonic()
+    await watchdog.register("late", NoInputPolicy(max_call_duration_sec=0.2), is_outbound=False, elapsed_sec=0.15)
+    try:
+        await _wait_until(lambda: hangups == ["late"])
+        assert time.monotonic() - started < 0.15
+    finally:
+        await watchdog.stop("late")
+
+
+@pytest.mark.asyncio
+async def test_max_call_duration_waits_for_a_transfer_to_finish(monkeypatch):
+    import src.core.no_input_watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "_HARD_LIMIT_RETRY_SEC", 0.02)
+    hangups = []
+    paused = {"value": True}
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    async def should_pause(call_id):
+        return paused["value"]
+
+    watchdog = NoInputWatchdog(AsyncMock(return_value=True), hangup, should_pause=should_pause)
+    await watchdog.register("transfer", NoInputPolicy(max_call_duration_sec=0.03), is_outbound=False)
+    try:
+        await asyncio.sleep(0.1)
+        assert hangups == []
+        paused["value"] = False
+        await _wait_until(lambda: hangups == ["transfer"])
+    finally:
+        await watchdog.stop("transfer")
+
+
+@pytest.mark.asyncio
+async def test_the_check_ins_and_the_cap_coexist():
+    announcements = []
+    hangups = []
+
+    async def announce(call_id, text, kind):
+        announcements.append(kind)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    # A quiet caller still gets the check-in flow when the cap is far away...
+    policy = NoInputPolicy(initial_timeout_sec=0.03, grace_timeout_sec=0.03, max_check_ins=1, max_call_duration_sec=1.0)
+    await watchdog.register("quiet-capped", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("quiet-capped")
+        await _wait_until(lambda: hangups == ["quiet-capped"])
+        assert announcements == ["check_in", "final"]
+        assert watchdog.snapshot("quiet-capped")["phase"] == "hangup"
+    finally:
+        await watchdog.stop("quiet-capped")
+
+    # ...and the cap wins when it is nearer.
+    announcements.clear()
+    hangups.clear()
+    policy = NoInputPolicy(initial_timeout_sec=0.5, grace_timeout_sec=0.5, max_check_ins=1, max_call_duration_sec=0.04)
+    await watchdog.register("capped-first", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("capped-first")
+        await _wait_until(lambda: hangups == ["capped-first"])
+        assert announcements == []
+        assert watchdog.snapshot("capped-first")["phase"] == "max_duration_hangup"
+    finally:
+        await watchdog.stop("capped-first")
+
+
+@pytest.mark.asyncio
+async def test_engine_records_the_cap_as_its_own_outcome():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.conversation_coordinator = None
+    engine.ari_client = SimpleNamespace(hangup_channel=AsyncMock())
+    engine.no_input_watchdog = SimpleNamespace(
+        snapshot=lambda call_id: {"phase": "max_duration_hangup", "max_call_duration_sec": 1800.0}
+    )
+    session = CallSession(call_id="long-call", caller_channel_id="channel-long")
+    await engine.session_store.upsert_call(session)
+
+    await engine._hangup_for_no_input("long-call")
+
+    updated = await engine.session_store.get_by_call_id("long-call")
+    assert updated.call_outcome == "max_duration"
+    assert updated.no_input_state["timed_out_reason"] == "max_duration"
+    engine.ari_client.hangup_channel.assert_awaited_once_with("channel-long")
+
+
+@pytest.mark.asyncio
+async def test_engine_registers_the_watchdog_with_the_time_the_call_already_lasted():
+    from datetime import datetime, timedelta, timezone
+
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.conversation_coordinator = None
+    engine.config = SimpleNamespace(no_input=NoInputConfig(max_call_duration_sec=1800))
+    engine.no_input_watchdog = SimpleNamespace(register=AsyncMock(return_value=True))
+    session = CallSession(call_id="amd-call", caller_channel_id="channel-amd")
+    session.is_outbound = True
+    session.start_time = datetime.now(timezone.utc) - timedelta(seconds=12)
+    await engine.session_store.upsert_call(session)
+
+    await engine._configure_no_input_watchdog(session, None)
+
+    call = engine.no_input_watchdog.register.await_args
+    assert call.kwargs["is_outbound"] is True
+    assert 11.5 <= call.kwargs["elapsed_sec"] <= 13.0
+    policy = call.args[1]
+    assert policy.max_call_duration_sec == 1800.0
+    assert policy.max_duration_applies() is True
+    assert policy.applies_to(is_outbound=True) is False  # the check-ins stay opt-in for outbound

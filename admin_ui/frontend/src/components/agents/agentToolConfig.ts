@@ -60,7 +60,7 @@ const sanitizeNoInputOverrides = (raw: Record<string, unknown>): Record<string, 
     const knownKeys = new Set([
         'enabled', 'inbound_enabled', 'outbound_enabled',
         'initial_timeout_sec', 'grace_timeout_sec', 'max_check_ins',
-        'check_in_message', 'final_message', 'stall_timeout_sec',
+        'check_in_message', 'final_message', 'stall_timeout_sec', 'max_call_duration_sec',
     ]);
     const unsafePassthroughKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -83,6 +83,10 @@ const sanitizeNoInputOverrides = (raw: Record<string, unknown>): Record<string, 
     const stall = raw['stall_timeout_sec'];
     if (typeof stall === 'number' && Number.isFinite(stall) && stall >= 0 && stall <= 7200) {
         sanitized['stall_timeout_sec'] = stall;
+    }
+    const maxDuration = raw['max_call_duration_sec'];
+    if (typeof maxDuration === 'number' && Number.isFinite(maxDuration) && maxDuration >= 0 && maxDuration <= 86400) {
+        sanitized['max_call_duration_sec'] = maxDuration;
     }
     for (const key of ['check_in_message', 'final_message']) {
         const value = raw[key];

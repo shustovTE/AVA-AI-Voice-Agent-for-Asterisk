@@ -579,9 +579,19 @@ const VADPage = () => {
                                 tooltip="Hang up once nothing has been exchanged for this long: no caller words reached the model and the agent did not finish an utterance. Unlike the check-ins it ignores the speech detectors, so hold music, noise or an IVR cannot keep the call open, and it applies to inbound and outbound calls alike. 0 disables it; 90-120 is a sensible value."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
+                            <FormInput
+                                label="Max Call Duration (seconds)"
+                                type="number"
+                                min="0"
+                                max="86400"
+                                value={noInputConfig.max_call_duration_sec ?? 0}
+                                onChange={(e) => updateNoInputConfig('max_call_duration_sec', parseFloat(e.target.value))}
+                                tooltip="Hard cap on a call's length, counted from its start: the engine hangs up when it is reached whatever the call is doing, even mid-sentence (a transfer in progress only delays it). Applies to inbound and outbound calls alike. 0 disables it."
+                                disabled={!(noInputConfig.enabled ?? true)}
+                            />
                         </div>
                         <p className="text-xs text-muted-foreground">
-                            The stall timeout is the safety net for lines that carry sound but no conversation. It runs for outbound calls too (only the switch above turns it off), counts from the last exchange rather than from the last sound, and ends the call without an announcement.
+                            The stall timeout is the safety net for lines that carry sound but no conversation: it counts from the last exchange rather than from the last sound and ends the call without an announcement. The max call duration is a hard cap that nothing pauses. Both run for outbound calls too (only the switch above turns them off). A call ended by the cap is recorded as &quot;max duration&quot;, one ended by the stall timeout as &quot;no input timeout&quot;.
                         </p>
                     </div>
                 </ConfigCard>

@@ -122,6 +122,24 @@ describe('per-agent stall timeout override', () => {
     });
 });
 
+describe('per-agent max call duration override', () => {
+    const roundTrip = (max_call_duration_sec: unknown) => {
+        const state = parseAgentConfig({
+            provider: 'openai_realtime',
+            extra_json: JSON.stringify({ no_input: { max_call_duration_sec } }),
+        });
+        return JSON.parse(serializeAgentConfig(state).extra_json || '{}').no_input ?? {};
+    };
+
+    it('round-trips a cap, including an explicit zero, and drops one outside its range', () => {
+        expect(roundTrip(1800)).toEqual({ max_call_duration_sec: 1800 });
+        expect(roundTrip(0)).toEqual({ max_call_duration_sec: 0 });
+        expect(roundTrip(-1)).toEqual({});
+        expect(roundTrip(86401)).toEqual({});
+        expect(roundTrip('1800')).toEqual({});
+    });
+});
+
 describe('per-agent connection audio configuration', () => {
     it('round-trips the caller-only media URI through extra_json', () => {
         const state = parseAgentConfig({

@@ -135,7 +135,7 @@ class CallSession:
     cleanup_after_tts: bool = False
     cleanup_in_progress: bool = False
     cleanup_completed: bool = False
-    call_outcome: str = ""  # caller_hangup | agent_hangup | transferred | no_input_timeout
+    call_outcome: str = ""  # caller_hangup | agent_hangup | transferred | no_input_timeout | max_duration
     pending_local_channel_id: Optional[str] = None
     pending_external_media_id: Optional[str] = None
     ssrc: Optional[int] = None

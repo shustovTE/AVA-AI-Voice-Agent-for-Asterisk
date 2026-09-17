@@ -1076,6 +1076,11 @@ class NoInputConfig(BaseModel):
     # or an IVR cannot keep the call open, and it applies to inbound and
     # outbound calls alike (only `enabled` gates it). 0 disables it.
     stall_timeout_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
+    # Hang up when the call has lasted this long, whatever it is doing: a hard
+    # cap counted from the call's start that nothing pauses (a transfer in
+    # progress only delays it). Inbound and outbound alike; only `enabled`
+    # gates it. 0 disables it.
+    max_call_duration_sec: float = Field(default=0.0, ge=0.0, le=86400.0)
 
     @field_validator("check_in_message", "final_message")
     @classmethod

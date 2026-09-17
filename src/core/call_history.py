@@ -50,7 +50,7 @@ class CallRecord:
     conversation_history: List[Dict[str, Any]] = field(default_factory=list)
     
     # Outcome
-    outcome: str = "completed"  # completed | transferred | error | abandoned | no_input_timeout
+    outcome: str = "completed"  # completed | transferred | error | abandoned | no_input_timeout | max_duration
     transfer_destination: Optional[str] = None
     error_message: Optional[str] = None
 

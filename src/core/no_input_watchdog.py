@@ -33,6 +33,9 @@ HangupCallback = Callable[[str], Awaitable[None]]
 PauseCallback = Callable[[str], Awaitable[bool]]
 
 _DEFAULT_CHECK_IN_MESSAGE = "Are you still there?"
+# How soon the maximum-duration hangup is retried while a transfer or hold
+# keeps the engine from ending the call.
+_HARD_LIMIT_RETRY_SEC = 5.0
 _DEFAULT_FINAL_MESSAGE = "I still can't hear you, so I'll end the call now. Goodbye."
 
 
@@ -100,6 +103,10 @@ class NoInputPolicy:
     # an IVR cannot keep the call open, and it applies to inbound and outbound
     # calls alike. 0 disables it.
     stall_timeout_sec: float = 0.0
+    # Hang up when the call has lasted this long, whatever it is doing: a hard
+    # cap counted from the call's start, paused by nothing (a transfer in
+    # progress only delays it). Inbound and outbound alike. 0 disables it.
+    max_call_duration_sec: float = 0.0
 
     @classmethod
     def from_mapping(cls, value: Optional[Mapping[str, Any]]) -> "NoInputPolicy":
@@ -115,6 +122,7 @@ class NoInputPolicy:
             check_in_message=_coerce_message(raw.get("check_in_message"), _DEFAULT_CHECK_IN_MESSAGE),
             final_message=_coerce_message(raw.get("final_message"), _DEFAULT_FINAL_MESSAGE),
             stall_timeout_sec=_coerce_float(raw.get("stall_timeout_sec", 0.0), 0.0, 0.0, 7200.0),
+            max_call_duration_sec=_coerce_float(raw.get("max_call_duration_sec", 0.0), 0.0, 0.0, 86400.0),
         )
 
     def applies_to(self, *, is_outbound: bool) -> bool:
@@ -126,6 +134,10 @@ class NoInputPolicy:
     def stall_applies(self) -> bool:
         """Return whether the stall timer runs; it ignores the call direction."""
         return bool(self.enabled and self.stall_timeout_sec > 0)
+
+    def max_duration_applies(self) -> bool:
+        """Return whether the hard duration cap runs; it ignores the call direction."""
+        return bool(self.enabled and self.max_call_duration_sec > 0)
 
 
 @dataclass
@@ -155,6 +167,10 @@ class _CallState:
     # agent finished. Caller sound alone never moves it.
     last_exchange_at: float = field(default_factory=time.monotonic)
     last_exchange_source: str = "call_start"
+    # When the call started (monotonic; registration minus the time already
+    # elapsed) and when the hard duration cap ends it, None when it is off.
+    started_at: float = field(default_factory=time.monotonic)
+    max_duration_deadline: Optional[float] = None
 
 
 class NoInputWatchdog:
@@ -199,6 +215,9 @@ class NoInputWatchdog:
             "stall_timeout_sec": state.policy.stall_timeout_sec,
             "last_exchange_at": state.last_exchange_at,
             "last_exchange_source": state.last_exchange_source,
+            "max_call_duration_sec": state.policy.max_call_duration_sec,
+            "started_at": state.started_at,
+            "max_duration_deadline": state.max_duration_deadline,
         }
 
     async def register(
@@ -207,17 +226,20 @@ class NoInputWatchdog:
         policy: NoInputPolicy,
         *,
         is_outbound: bool,
+        elapsed_sec: float = 0.0,
     ) -> bool:
         """Replace any prior state and start a watchdog when policy applies.
 
-        The check-ins follow the direction gates; the stall timer runs for
-        either direction whenever the policy sets it. Nothing is registered
-        when neither applies.
+        The check-ins follow the direction gates; the stall timer and the
+        hard duration cap run for either direction whenever the policy sets
+        them. Nothing is registered when none applies. ``elapsed_sec`` is how
+        long the call has already lasted, so the cap counts from its start.
         """
         await self.stop(call_id)
         inactivity_enabled = policy.applies_to(is_outbound=is_outbound)
         stall_enabled = policy.stall_applies()
-        if not inactivity_enabled and not stall_enabled:
+        max_duration_enabled = policy.max_duration_applies()
+        if not inactivity_enabled and not stall_enabled and not max_duration_enabled:
             logger.info(
                 "Caller inactivity watchdog disabled for call",
                 call_id=call_id,
@@ -230,6 +252,15 @@ class NoInputWatchdog:
             is_outbound=is_outbound,
             inactivity_enabled=inactivity_enabled,
         )
+        try:
+            elapsed = max(0.0, float(elapsed_sec or 0.0))
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        if not math.isfinite(elapsed):
+            elapsed = 0.0
+        state.started_at = self._clock() - elapsed
+        if max_duration_enabled:
+            state.max_duration_deadline = state.started_at + policy.max_call_duration_sec
         self._states[call_id] = state
         state.task = asyncio.create_task(self._run(state), name=f"no-input-{call_id}")
         _NO_INPUT_ACTIVE.inc()
@@ -242,6 +273,8 @@ class NoInputWatchdog:
             grace_timeout_sec=policy.grace_timeout_sec,
             max_check_ins=policy.max_check_ins,
             stall_timeout_sec=policy.stall_timeout_sec if stall_enabled else None,
+            max_call_duration_sec=policy.max_call_duration_sec if max_duration_enabled else None,
+            elapsed_sec=round(elapsed, 1) if elapsed else None,
         )
         return True
 
@@ -455,7 +488,9 @@ class NoInputWatchdog:
             while self._states.get(state.call_id) is state and not state.terminal:
                 inactivity_counting = self._can_count(state)
                 stall_counting = self._stall_can_count(state)
-                if not inactivity_counting and not stall_counting:
+                # The hard cap counts whatever the call is doing.
+                hard_deadline = state.max_duration_deadline
+                if not inactivity_counting and not stall_counting and hard_deadline is None:
                     await self._wait_for_change(state)
                     continue
 
@@ -467,9 +502,23 @@ class NoInputWatchdog:
                     candidates.append(("inactivity", float(state.deadline or self._clock())))
                 if stall_counting:
                     candidates.append(("stall", self._stall_deadline(state)))
+                if hard_deadline is not None:
+                    candidates.append(("max_duration", float(hard_deadline)))
                 kind, deadline = min(candidates, key=lambda item: item[1])
                 changed = await self._wait_for_change(state, max(0.0, deadline - self._clock()))
                 if changed:
+                    continue
+
+                if kind == "max_duration":
+                    if state.max_duration_deadline is None or state.max_duration_deadline > self._clock():
+                        continue
+                    if self._should_pause and await self._should_pause(state.call_id):
+                        # A transfer or hold in progress: the engine would refuse
+                        # the hangup now. Try again shortly rather than give up.
+                        state.max_duration_deadline = self._clock() + _HARD_LIMIT_RETRY_SEC
+                        _NO_INPUT_EVENTS.labels("policy_paused").inc()
+                        continue
+                    await self._finish_for_max_duration(state)
                     continue
 
                 if kind == "stall":
@@ -557,6 +606,30 @@ class NoInputWatchdog:
         state.output_active = False
         state.phase = "grace"
         state.deadline = self._clock() + state.policy.grace_timeout_sec
+
+    async def _finish_for_max_duration(self, state: _CallState) -> None:
+        """Hang up a call that has lasted its maximum duration."""
+        state.terminal = True
+        state.phase = "max_duration_hangup"
+        state.deadline = None
+        _NO_INPUT_EVENTS.labels("max_duration_hangup").inc()
+        logger.info(
+            "Call reached its maximum duration; hanging up",
+            call_id=state.call_id,
+            max_call_duration_sec=state.policy.max_call_duration_sec,
+            duration_sec=round(self._clock() - state.started_at, 1),
+            agent_speaking=state.output_active,
+            caller_sound_active=state.input_active,
+        )
+        try:
+            await self._hangup(state.call_id)
+        except Exception:
+            logger.error(
+                "Maximum duration hangup callback failed",
+                call_id=state.call_id,
+                exc_info=True,
+            )
+            _NO_INPUT_EVENTS.labels("watchdog_error").inc()
 
     async def _finish_for_stall(self, state: _CallState) -> None:
         """Hang up a call in which nothing has been exchanged for the stall timeout."""
