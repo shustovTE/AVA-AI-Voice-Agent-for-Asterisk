@@ -139,3 +139,48 @@ async def test_patch_lead_conflicts_while_lead_is_active(tmp_path, monkeypatch):
     )
     assert patched["custom_vars"] == {"task": "next call"}
     assert await store.recycle_lead(lead_id, mode="redial") is True
+
+
+@pytest.mark.asyncio
+async def test_get_lead_returns_the_lead_as_listed_or_404(tmp_path, monkeypatch):
+    store, campaign_id = await _campaign_store(tmp_path, monkeypatch)
+    await outbound.add_manual_lead(
+        campaign_id,
+        outbound.ManualLeadCreateRequest(phone_number="+15551230001", custom_vars={"task": "first"}),
+    )
+    lead_id = await store.get_lead_id_by_phone(campaign_id, "+15551230001")
+
+    lead = await outbound.get_lead(lead_id)
+
+    assert lead["id"] == lead_id
+    assert lead["campaign_id"] == campaign_id
+    assert lead["phone_number"] == "+15551230001"
+    assert lead["custom_vars"] == {"task": "first"}
+    assert lead["state"] == "pending"
+    assert lead["last_outcome_attempt"] is None
+    # Exactly the entry the campaign list shows (the route's Query defaults
+    # only resolve under FastAPI, so the list is read from the store here).
+    listed = (await store.list_leads(campaign_id))["leads"]
+    assert listed == [lead]
+
+    with pytest.raises(HTTPException) as excinfo:
+        await outbound.get_lead("no-such-lead")
+    assert excinfo.value.status_code == 404
+
+
+def test_get_lead_declares_its_response_schema():
+    """An automation importing the OpenAPI document sees the lead's fields."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(outbound.router, prefix="/api")
+    spec = app.openapi()
+
+    operation = spec["paths"]["/api/outbound/leads/{lead_id}"]["get"]
+    schema_ref = operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+    assert schema_ref.endswith("/LeadOut")
+    properties = spec["components"]["schemas"]["LeadOut"]["properties"]
+    for field in ("id", "campaign_id", "phone_number", "custom_vars", "state", "attempt_count",
+                  "last_outcome_attempt", "last_amd_status", "last_call_history_call_id"):
+        assert field in properties, field
+    assert "404" in operation["responses"] or "422" in operation["responses"]

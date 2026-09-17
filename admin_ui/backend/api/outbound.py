@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Add the project root before importing shared engine modules. The resolved
 # fallback keeps direct Admin-backend test runs working outside containers.
@@ -864,6 +864,60 @@ async def list_leads(
 ):
     store = _get_outbound_store()
     return await store.list_leads(campaign_id, page=page, page_size=page_size, state=state, q=q)
+
+
+class LeadOut(BaseModel):
+    """A lead as the campaign list shows it, plus its most recent dial attempt.
+
+    Declared so the OpenAPI document (and an automation tool importing it)
+    knows the fields. Columns a later migration adds pass through unchanged.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    campaign_id: str
+    phone_number: str
+    name: Optional[str] = None
+    lead_timezone: Optional[str] = None
+    context_override: Optional[str] = Field(None, description="Agent selected for this lead; empty means the campaign default")
+    agent_routing_method: Optional[str] = None
+    caller_id_override: Optional[str] = None
+    custom_vars: Dict[str, Any] = Field(default_factory=dict)
+    state: str = Field(..., description="pending | leased | dialing | amd_pending | in_progress | completed | failed | canceled")
+    attempt_count: int = 0
+    last_outcome: Optional[str] = None
+    last_attempt_at_utc: Optional[str] = None
+    leased_until_utc: Optional[str] = None
+    created_at_utc: str
+    updated_at_utc: str
+    # The most recent dial attempt; all empty until the lead has been dialed.
+    last_started_at_utc: Optional[str] = None
+    last_ended_at_utc: Optional[str] = None
+    last_duration_seconds: Optional[int] = None
+    last_outcome_attempt: Optional[str] = None
+    last_amd_status: Optional[str] = None
+    last_amd_cause: Optional[str] = None
+    last_consent_dtmf: Optional[str] = None
+    last_consent_result: Optional[str] = None
+    last_context: Optional[str] = None
+    last_provider: Optional[str] = None
+    last_call_history_call_id: Optional[str] = None
+    last_error_message: Optional[str] = None
+
+
+@router.get("/leads/{lead_id}", response_model=LeadOut)
+async def get_lead(lead_id: str):
+    """One lead by id, as `GET /campaigns/{campaign_id}/leads` lists it.
+
+    The lead's own fields plus its most recent dial attempt as `last_*`
+    fields (all null until the lead has been dialed). 404 for an unknown id.
+    """
+    store = _get_outbound_store()
+    lead = await store.get_lead_detail(lead_id)
+    if lead is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
 
 
 class LeadPatchRequest(BaseModel):

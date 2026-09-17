@@ -171,6 +171,44 @@ class ImportWarningRow:
     warning_reason: str
 
 
+# A lead as the Admin UI lists it: the lead's own columns plus the most recent
+# dial attempt as ``last_*`` fields. Shared by the campaign list and the
+# single-lead lookup so the two can never show a lead differently.
+_LEAD_WITH_LAST_ATTEMPT_SQL = """
+    SELECT
+        l.*,
+        a.started_at_utc AS last_started_at_utc,
+        a.ended_at_utc AS last_ended_at_utc,
+        a.duration_seconds AS last_duration_seconds,
+        a.outcome AS last_outcome_attempt,
+        a.amd_status AS last_amd_status,
+        a.amd_cause AS last_amd_cause,
+        a.consent_dtmf AS last_consent_dtmf,
+        a.consent_result AS last_consent_result,
+        a.context AS last_context,
+        a.provider AS last_provider,
+        a.call_history_call_id AS last_call_history_call_id,
+        a.error_message AS last_error_message
+    FROM outbound_leads l
+    LEFT JOIN outbound_attempts a
+      ON a.id = (
+        SELECT id
+        FROM outbound_attempts
+        WHERE lead_id = l.id
+        ORDER BY started_at_utc DESC
+        LIMIT 1
+      )
+"""
+
+
+def _lead_row_to_dict(row: Any) -> Dict[str, Any]:
+    """A lead row for the API: ``custom_vars`` parsed, the raw JSON column gone."""
+    d = dict(row)
+    d["custom_vars"] = _safe_json_loads(str(d.get("custom_vars_json") or "{}"))
+    d.pop("custom_vars_json", None)
+    return d
+
+
 class OutboundStore:
     _CREATE_TABLES_SQL = [
         """
@@ -1260,41 +1298,14 @@ class OutboundStore:
                     ).fetchone()["c"]
                     rows = conn.execute(
                         f"""
-                        SELECT
-                            l.*,
-                            a.started_at_utc AS last_started_at_utc,
-                            a.ended_at_utc AS last_ended_at_utc,
-                            a.duration_seconds AS last_duration_seconds,
-                            a.outcome AS last_outcome_attempt,
-                            a.amd_status AS last_amd_status,
-                            a.amd_cause AS last_amd_cause,
-                            a.consent_dtmf AS last_consent_dtmf,
-                            a.consent_result AS last_consent_result,
-                            a.context AS last_context,
-                            a.provider AS last_provider,
-                            a.call_history_call_id AS last_call_history_call_id,
-                            a.error_message AS last_error_message
-                        FROM outbound_leads l
-                        LEFT JOIN outbound_attempts a
-                          ON a.id = (
-                            SELECT id
-                            FROM outbound_attempts
-                            WHERE lead_id = l.id
-                            ORDER BY started_at_utc DESC
-                            LIMIT 1
-                          )
+                        {_LEAD_WITH_LAST_ATTEMPT_SQL}
                         WHERE {where}
                         ORDER BY l.created_at_utc DESC
                         LIMIT ? OFFSET ?
                         """,
                         args + [size_i, offset],
                     ).fetchall()
-                    out = []
-                    for r in rows:
-                        d = dict(r)
-                        d["custom_vars"] = _safe_json_loads(str(d.get("custom_vars_json") or "{}"))
-                        d.pop("custom_vars_json", None)
-                        out.append(d)
+                    out = [_lead_row_to_dict(r) for r in rows]
                     total_pages = (total + size_i - 1) // size_i
                     return {"leads": out, "total": total, "page": page_i, "page_size": size_i, "total_pages": total_pages}
                 finally:
@@ -1414,6 +1425,30 @@ class OutboundStore:
     # leased/dialing the runtime already owns the lead's data, so edits are
     # rejected instead of racing the call.
     _LEAD_EDITABLE_STATES = ("pending", "completed", "failed", "canceled")
+
+    async def get_lead_detail(self, lead_id: str) -> Optional[Dict[str, Any]]:
+        """One lead as the campaign list shows it: its row plus its last attempt.
+
+        The same query as :meth:`list_leads` narrowed to one id, so the
+        ``last_*`` fields and the parsed ``custom_vars`` match the list entry
+        exactly. ``None`` for an unknown id.
+        """
+        if not self._enabled:
+            return None
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    row = conn.execute(
+                        f"{_LEAD_WITH_LAST_ATTEMPT_SQL} WHERE l.id = ?",
+                        (str(lead_id or "").strip(),),
+                    ).fetchone()
+                    return _lead_row_to_dict(row) if row is not None else None
+                finally:
+                    conn.close()
+
+        return await self._run(_sync)
 
     async def get_lead(self, lead_id: str) -> Optional[Dict[str, Any]]:
         """Return one lead row with parsed custom_vars, or None when unknown."""

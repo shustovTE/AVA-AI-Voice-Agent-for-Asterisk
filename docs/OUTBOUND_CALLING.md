@@ -112,6 +112,23 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
   authoritative metadata cannot be recovered or its stored custom_vars JSON is
   corrupt.
 
+### Reading a lead (`GET /api/outbound/leads/{lead_id}`)
+
+- `GET /api/outbound/leads/{lead_id}` returns one lead exactly as
+  `GET /api/outbound/campaigns/{campaign_id}/leads` lists it: the lead's own
+  fields (`id`, `campaign_id`, `phone_number`, `name`, `lead_timezone`,
+  `context_override`, `agent_routing_method`, `caller_id_override`,
+  `custom_vars` as an object, `state`, `attempt_count`, `last_outcome`,
+  `last_attempt_at_utc`, `leased_until_utc`, `created_at_utc`,
+  `updated_at_utc`) plus its most recent dial attempt as `last_started_at_utc`,
+  `last_ended_at_utc`, `last_duration_seconds`, `last_outcome_attempt`,
+  `last_amd_status`, `last_amd_cause`, `last_consent_dtmf`,
+  `last_consent_result`, `last_context`, `last_provider`,
+  `last_call_history_call_id` and `last_error_message` (all `null` until the
+  lead has been dialed). `404` for an unknown id. The response schema is
+  declared in the OpenAPI document, so an automation tool that imports it
+  sees the fields.
+
 ### Updating a lead (`PATCH /api/outbound/leads/{lead_id}`)
 
 - `PATCH /api/outbound/leads/{lead_id}` updates `name`, `agent`, `timezone`,
