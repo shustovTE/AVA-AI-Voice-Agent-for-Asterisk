@@ -94,6 +94,12 @@ class NoInputPolicy:
     max_check_ins: int = 1
     check_in_message: str = _DEFAULT_CHECK_IN_MESSAGE
     final_message: str = _DEFAULT_FINAL_MESSAGE
+    # Hang up once nothing has been exchanged for this long: no caller words
+    # reached the model and the agent did not finish an utterance. Unlike the
+    # check-ins it ignores the caller-speech detectors, so hold music, noise or
+    # an IVR cannot keep the call open, and it applies to inbound and outbound
+    # calls alike. 0 disables it.
+    stall_timeout_sec: float = 0.0
 
     @classmethod
     def from_mapping(cls, value: Optional[Mapping[str, Any]]) -> "NoInputPolicy":
@@ -108,13 +114,18 @@ class NoInputPolicy:
             max_check_ins=_coerce_int(raw.get("max_check_ins", 1), 1, 0, 10),
             check_in_message=_coerce_message(raw.get("check_in_message"), _DEFAULT_CHECK_IN_MESSAGE),
             final_message=_coerce_message(raw.get("final_message"), _DEFAULT_FINAL_MESSAGE),
+            stall_timeout_sec=_coerce_float(raw.get("stall_timeout_sec", 0.0), 0.0, 0.0, 7200.0),
         )
 
     def applies_to(self, *, is_outbound: bool) -> bool:
-        """Return whether this policy applies to the call direction."""
+        """Return whether the inactivity check-ins apply to the call direction."""
         if not self.enabled:
             return False
         return self.outbound_enabled if is_outbound else self.inbound_enabled
+
+    def stall_applies(self) -> bool:
+        """Return whether the stall timer runs; it ignores the call direction."""
+        return bool(self.enabled and self.stall_timeout_sec > 0)
 
 
 @dataclass
@@ -137,6 +148,13 @@ class _CallState:
     output_pause_remaining: Optional[float] = None
     last_activity_at: float = field(default_factory=time.monotonic)
     last_activity_source: str = "call_start"
+    # Whether the check-in/final-message machinery runs for this call (the
+    # direction gates); the stall timer runs whenever the policy sets it.
+    inactivity_enabled: bool = True
+    # The last exchange: a caller turn handed to the model or an utterance the
+    # agent finished. Caller sound alone never moves it.
+    last_exchange_at: float = field(default_factory=time.monotonic)
+    last_exchange_source: str = "call_start"
 
 
 class NoInputWatchdog:
@@ -177,6 +195,10 @@ class NoInputWatchdog:
             "deadline": state.deadline,
             "last_activity_at": state.last_activity_at,
             "last_activity_source": state.last_activity_source,
+            "inactivity_enabled": state.inactivity_enabled,
+            "stall_timeout_sec": state.policy.stall_timeout_sec,
+            "last_exchange_at": state.last_exchange_at,
+            "last_exchange_source": state.last_exchange_source,
         }
 
     async def register(
@@ -186,16 +208,28 @@ class NoInputWatchdog:
         *,
         is_outbound: bool,
     ) -> bool:
-        """Replace any prior state and start a watchdog when policy applies."""
+        """Replace any prior state and start a watchdog when policy applies.
+
+        The check-ins follow the direction gates; the stall timer runs for
+        either direction whenever the policy sets it. Nothing is registered
+        when neither applies.
+        """
         await self.stop(call_id)
-        if not policy.applies_to(is_outbound=is_outbound):
+        inactivity_enabled = policy.applies_to(is_outbound=is_outbound)
+        stall_enabled = policy.stall_applies()
+        if not inactivity_enabled and not stall_enabled:
             logger.info(
                 "Caller inactivity watchdog disabled for call",
                 call_id=call_id,
                 is_outbound=is_outbound,
             )
             return False
-        state = _CallState(call_id=call_id, policy=policy, is_outbound=is_outbound)
+        state = _CallState(
+            call_id=call_id,
+            policy=policy,
+            is_outbound=is_outbound,
+            inactivity_enabled=inactivity_enabled,
+        )
         self._states[call_id] = state
         state.task = asyncio.create_task(self._run(state), name=f"no-input-{call_id}")
         _NO_INPUT_ACTIVE.inc()
@@ -203,9 +237,11 @@ class NoInputWatchdog:
             "Caller inactivity watchdog registered",
             call_id=call_id,
             is_outbound=is_outbound,
+            check_ins_enabled=inactivity_enabled,
             initial_timeout_sec=policy.initial_timeout_sec,
             grace_timeout_sec=policy.grace_timeout_sec,
             max_check_ins=policy.max_check_ins,
+            stall_timeout_sec=policy.stall_timeout_sec if stall_enabled else None,
         )
         return True
 
@@ -229,9 +265,15 @@ class NoInputWatchdog:
         if not state:
             return
         state.ready = True
+        self._note_exchange(state, "ready")
         if not state.output_active and not state.processing and not state.suspended:
             self._reset_initial_deadline(state)
         self._wake(state)
+
+    def _note_exchange(self, state: _CallState, source: str) -> None:
+        """Restart the stall timer: the conversation moved."""
+        state.last_exchange_at = self._clock()
+        state.last_exchange_source = source
 
     async def note_activity(self, call_id: str, source: str) -> None:
         """Reset inactivity state for authoritative caller activity."""
@@ -256,6 +298,8 @@ class NoInputWatchdog:
             return
         state.processing = bool(active)
         if active:
+            # A caller turn reached the model: an exchange.
+            self._note_exchange(state, "caller_turn")
             state.deadline = None
         elif state.ready and not state.output_active and not state.suspended:
             self._reset_initial_deadline(state)
@@ -313,6 +357,12 @@ class NoInputWatchdog:
             return
         state.output_active = False
         state.processing = False
+        if reset_timer:
+            # The agent finished an utterance (a reply, a greeting or one of the
+            # watchdog's own announcements): an exchange. A hosted agent's reply
+            # to its own silence pseudo-turn (reset_timer=False) is not one, so
+            # it cannot keep a stalled call open either.
+            self._note_exchange(state, "agent_output")
         if preserve_policy_state:
             state.output_pause_remaining = None
             self._wake(state)
@@ -358,13 +408,34 @@ class NoInputWatchdog:
     def _can_count(self, state: _CallState) -> bool:
         """Return whether idle time may currently advance."""
         return bool(
-            state.ready
+            state.inactivity_enabled
+            and state.ready
             and not state.input_active
             and not state.output_active
             and not state.processing
             and not state.suspended
             and not state.terminal
         )
+
+    def _stall_can_count(self, state: _CallState) -> bool:
+        """Return whether the stall timer may currently advance.
+
+        Caller sound (``input_active``) is deliberately not a reason to pause:
+        hold music and noise are what this timer is for. Agent output pauses it
+        so a long utterance is never cut; a caller turn being processed does
+        not, since accepting the turn already restarted it and a reply that
+        never comes is a stall too.
+        """
+        return bool(
+            state.policy.stall_timeout_sec > 0
+            and state.ready
+            and not state.output_active
+            and not state.suspended
+            and not state.terminal
+        )
+
+    def _stall_deadline(self, state: _CallState) -> float:
+        return state.last_exchange_at + state.policy.stall_timeout_sec
 
     async def _wait_for_change(self, state: _CallState, timeout: Optional[float] = None) -> bool:
         """Wait for a state change and report whether one beat the timeout."""
@@ -379,20 +450,41 @@ class NoInputWatchdog:
             return False
 
     async def _run(self, state: _CallState) -> None:
-        """Drive check-in and terminal transitions for one call."""
+        """Drive check-in, stall and terminal transitions for one call."""
         try:
             while self._states.get(state.call_id) is state and not state.terminal:
-                if not self._can_count(state):
+                inactivity_counting = self._can_count(state)
+                stall_counting = self._stall_can_count(state)
+                if not inactivity_counting and not stall_counting:
                     await self._wait_for_change(state)
                     continue
 
-                if state.deadline is None:
+                if inactivity_counting and state.deadline is None:
                     self._reset_initial_deadline(state)
-                changed = await self._wait_for_change(
-                    state,
-                    max(0.0, float(state.deadline or self._clock()) - self._clock()),
-                )
-                if changed or not self._can_count(state):
+                # Wait for whichever deadline comes first.
+                candidates = []
+                if inactivity_counting:
+                    candidates.append(("inactivity", float(state.deadline or self._clock())))
+                if stall_counting:
+                    candidates.append(("stall", self._stall_deadline(state)))
+                kind, deadline = min(candidates, key=lambda item: item[1])
+                changed = await self._wait_for_change(state, max(0.0, deadline - self._clock()))
+                if changed:
+                    continue
+
+                if kind == "stall":
+                    if not self._stall_can_count(state) or self._stall_deadline(state) > self._clock():
+                        continue
+                    if self._should_pause and await self._should_pause(state.call_id):
+                        # On hold or in a transfer: the conversation is not
+                        # expected to move. Count again from here.
+                        self._note_exchange(state, "policy_paused")
+                        _NO_INPUT_EVENTS.labels("policy_paused").inc()
+                        continue
+                    await self._finish_for_stall(state)
+                    continue
+
+                if not self._can_count(state):
                     continue
 
                 # Transfer/MOH state can be changed by a tool through SessionStore
@@ -465,6 +557,31 @@ class NoInputWatchdog:
         state.output_active = False
         state.phase = "grace"
         state.deadline = self._clock() + state.policy.grace_timeout_sec
+
+    async def _finish_for_stall(self, state: _CallState) -> None:
+        """Hang up a call in which nothing has been exchanged for the stall timeout."""
+        state.terminal = True
+        state.phase = "stall_hangup"
+        state.deadline = None
+        _NO_INPUT_EVENTS.labels("stall_hangup").inc()
+        logger.info(
+            "Conversation stalled; hanging up",
+            call_id=state.call_id,
+            stall_timeout_sec=state.policy.stall_timeout_sec,
+            since_exchange_sec=round(self._clock() - state.last_exchange_at, 1),
+            last_exchange_source=state.last_exchange_source,
+            caller_sound_active=state.input_active,
+            last_activity_source=state.last_activity_source,
+        )
+        try:
+            await self._hangup(state.call_id)
+        except Exception:
+            logger.error(
+                "Conversation stall hangup callback failed",
+                call_id=state.call_id,
+                exc_info=True,
+            )
+            _NO_INPUT_EVENTS.labels("watchdog_error").inc()
 
     async def _finish_for_no_input(self, state: _CallState) -> None:
         """Speak the terminal warning and attempt the engine-owned hangup."""

@@ -567,6 +567,22 @@ const VADPage = () => {
                         <p className="text-xs text-muted-foreground">
                             Outbound calls do not inherit this behavior automatically. Enable it explicitly in the outbound agent's settings.
                         </p>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Stall Timeout (seconds)"
+                                type="number"
+                                min="0"
+                                max="7200"
+                                value={noInputConfig.stall_timeout_sec ?? 0}
+                                onChange={(e) => updateNoInputConfig('stall_timeout_sec', parseFloat(e.target.value))}
+                                tooltip="Hang up once nothing has been exchanged for this long: no caller words reached the model and the agent did not finish an utterance. Unlike the check-ins it ignores the speech detectors, so hold music, noise or an IVR cannot keep the call open, and it applies to inbound and outbound calls alike. 0 disables it; 90-120 is a sensible value."
+                                disabled={!(noInputConfig.enabled ?? true)}
+                            />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                            The stall timeout is the safety net for lines that carry sound but no conversation. It runs for outbound calls too (only the switch above turns it off), counts from the last exchange rather than from the last sound, and ends the call without an announcement.
+                        </p>
                     </div>
                 </ConfigCard>
             </ConfigSection>

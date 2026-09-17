@@ -420,7 +420,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
     };
 
     const updateNoInputNumberOverride = (
-        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins',
+        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins' | 'stall_timeout_sec',
         raw: string,
         minimum: number,
         maximum: number,
@@ -843,6 +843,17 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                             placeholder="Inherit global final message"
                             onChange={(e) => updateNoInputOverride('final_message', e.target.value)}
                             tooltip="Spoken immediately before the engine ends an inactive call."
+                        />
+                        <FormInput
+                            id="agent-no-input-stall"
+                            label="Stall Timeout (sec)"
+                            type="number"
+                            min="0"
+                            max="7200"
+                            value={noInputNumber('stall_timeout_sec')}
+                            placeholder="Inherit global stall timeout"
+                            onChange={(e) => updateNoInputNumberOverride('stall_timeout_sec', e.target.value, 0, 7200)}
+                            tooltip="Hang up once nothing has been exchanged for this long, whatever the line carries (hold music, noise, an IVR). Runs for inbound and outbound calls alike; 0 disables it for this agent."
                         />
                     </div>
                 </details>

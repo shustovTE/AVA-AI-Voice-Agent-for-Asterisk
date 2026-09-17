@@ -15457,20 +15457,34 @@ class Engine:
         if self._session_was_transferred(session) or self._session_has_pending_attended_transfer(session):
             logger.info("No-input hangup skipped during transfer", call_id=call_id)
             return
+        # The stall timer and the check-ins share this terminal path and the
+        # no_input_timeout outcome; the state records which one fired.
+        watchdog = getattr(self, "no_input_watchdog", None)
+        snapshot = watchdog.snapshot(call_id) if watchdog is not None else None
+        stalled = bool(snapshot and snapshot.get("phase") == "stall_hangup")
         session.call_outcome = "no_input_timeout"
         session.no_input_state.update(
             {
                 "timed_out": True,
                 "timed_out_at": time.time(),
+                "timed_out_reason": "stall" if stalled else "no_input",
             }
         )
         await self._save_session(session)
         logger.info(
-            "Hanging up inactive caller",
+            "Hanging up stalled conversation" if stalled else "Hanging up inactive caller",
             call_id=call_id,
             channel_id=session.caller_channel_id,
             provider=session.provider_name,
             pipeline=session.pipeline_name,
+            **(
+                {
+                    "stall_timeout_sec": snapshot.get("stall_timeout_sec"),
+                    "last_exchange_source": snapshot.get("last_exchange_source"),
+                }
+                if stalled
+                else {}
+            ),
         )
         await self._terminate_call_after_audio(
             call_id,

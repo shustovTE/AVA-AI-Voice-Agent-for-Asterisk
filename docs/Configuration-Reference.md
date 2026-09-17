@@ -733,8 +733,17 @@ The engine-level watchdog prevents an answered call from remaining open indefini
 - `no_input.max_check_ins`: Number of check-ins before the final message and hangup. Defaults to 1; `0` skips directly to the final message.
 - `no_input.check_in_message`: Check-in text, spoken by the active provider/pipeline in the agent's configured voice.
 - `no_input.final_message`: Non-empty text spoken before the ARI hangup. Blank or whitespace-only per-agent values inherit the safe default.
+- `no_input.stall_timeout_sec`: Hang up once nothing has been exchanged for this long. Defaults to `0` (off); `90`–`120` is a sensible value. See *Stalled conversations* below.
 
 Caller media activity, provider speech-start events, and user transcripts reset the window. The timer pauses during greetings, agent TTS, LLM processing, sustained caller speech, and other output gating. A terminal watchdog hangup is stored in Call History as `no_input_timeout`, not as a provider error.
+
+### Stalled conversations (`no_input.stall_timeout_sec`)
+
+The check-ins count only while the caller is quiet. A line that carries sound but no conversation therefore never triggers them: hold music, a noisy room, an IVR or a radio keep the speech detectors (Silero VAD, `TALK_DETECT`, provider VAD) reporting caller speech, the recognizer returns nothing the model could answer, and the call stays open until the trunk drops it. For outbound calls the check-ins are off by default anyway.
+
+`stall_timeout_sec` is the safety net for that case. It counts from the last *exchange*, which is either a caller turn handed to the model (a transcript accepted for an LLM turn) or an utterance the agent finished (a reply, the greeting, a check-in), and it ignores the speech detectors entirely: caller sound on its own never restarts it. It pauses while the agent is speaking, so a long reply is never cut, and while the caller is on hold or in a transfer; a hosted agent's reply to its own silence pseudo-turn does not count as an exchange. When it expires the engine hangs up without an announcement and records the call as `no_input_timeout`, with `timed_out_reason: stall` in the session's `no_input_state` and the log line `Conversation stalled; hanging up` (`since_exchange_sec`, `last_exchange_source`, `caller_sound_active`), followed by `Hanging up stalled conversation`.
+
+It applies to inbound and outbound calls alike: only `no_input.enabled` turns it off, not `inbound_enabled`/`outbound_enabled`, so an outbound campaign can have it without the check-ins. Per-agent overrides set their own value (`0` disables it for that agent). In the Admin UI it is **Stall Timeout** under **Advanced Settings → Voice Activity Detection → Caller Inactivity** and under **Agents → Edit Agent → Caller Inactivity Overrides**. A value below the check-in flow (`initial_timeout_sec` plus `grace_timeout_sec` per check-in) ends a quiet caller's call before the final message; keep it above that flow for inbound calls, for example `90` with the default `30` + `15`.
 
 Provider generation completion is not treated as caller playback completion. Before terminal hangup, the engine also drains provider/coalescing queues, jitter frames, frame remainder, active ARI playback, and a short transport-specific post-roll. This applies uniformly to AudioSocket and ExternalMedia/RTP; pipeline/file announcements use Asterisk `PlaybackFinished` as their authoritative boundary.
 

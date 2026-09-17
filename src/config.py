@@ -1070,6 +1070,12 @@ class NoInputConfig(BaseModel):
         min_length=1,
         max_length=500,
     )
+    # Hang up once nothing has been exchanged for this long: no caller words
+    # reached the model and the agent did not finish an utterance. Unlike the
+    # check-ins it ignores the caller-speech detectors, so hold music, noise
+    # or an IVR cannot keep the call open, and it applies to inbound and
+    # outbound calls alike (only `enabled` gates it). 0 disables it.
+    stall_timeout_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
 
     @field_validator("check_in_message", "final_message")
     @classmethod
