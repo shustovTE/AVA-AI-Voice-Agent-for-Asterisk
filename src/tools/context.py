@@ -299,6 +299,14 @@ class PostCallContext:
     campaign_id: Optional[str] = None
     lead_id: Optional[str] = None
     custom_vars: Dict[str, Any] = field(default_factory=dict)  # Outbound lead custom_vars
+    # The dial attempt the call belongs to. An outbound attempt that never
+    # became a call (rejected originate, ring-out, busy, answering machine,
+    # consent declined) is still reported to the post-call tools that opt in:
+    # call_id is then the channel id when there was one, else this id.
+    attempt_id: Optional[str] = None
+    # Why the call, or the dial attempt, failed: the session's error, the
+    # originate error or the hangup cause. Empty when nothing failed.
+    error_message: Optional[str] = None
     
     # System access
     config: Any = None
@@ -324,6 +332,7 @@ class PostCallContext:
             "call_direction": self.call_direction,
             "call_duration": self.call_duration_seconds,
             "call_outcome": self.call_outcome,
+            "error_message": self.error_message or "",
             "call_start_time": self.call_start_time or "",
             "call_end_time": self.call_end_time or "",
             "transcript_json": json.dumps(self.conversation_history),
@@ -332,6 +341,7 @@ class PostCallContext:
             "pre_call_results_json": json.dumps(self.pre_call_results),
             "campaign_id": self.campaign_id or "",
             "lead_id": self.lead_id or "",
+            "attempt_id": self.attempt_id or "",
             "custom_vars_json": json.dumps(self.custom_vars),
         }
         # Flatten pre-call enrichment variables into individual placeholders

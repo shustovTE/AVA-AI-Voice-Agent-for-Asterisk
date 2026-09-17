@@ -949,6 +949,7 @@ _PASSTHROUGH_FIELDS = (
     "summary_max_words",
     "summary_timeout_ms",
     "summary_prompt",
+    "send_on_failed_dial",
     "description",
     "return_raw_json",
     "error_message",
@@ -1027,6 +1028,9 @@ class ManagedToolWrite(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    # Post-call webhooks: also send for an outbound attempt that never became
+    # a call (the engine's default is true).
+    send_on_failed_dial: Optional[bool] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1108,6 +1112,9 @@ class ManagedToolPatch(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    # Post-call webhooks: also send for an outbound attempt that never became
+    # a call (the engine's default is true).
+    send_on_failed_dial: Optional[bool] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None

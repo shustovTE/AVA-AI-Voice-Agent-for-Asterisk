@@ -107,6 +107,27 @@ class WebhookConfig:
     # 0 → don't capture any response body (status code + error only).
     response_body_max_chars: Optional[int] = None
 
+    # Also send for an outbound attempt that never became a call (rejected
+    # originate, ring-out, busy, answering machine, consent declined). The
+    # payload then carries that attempt's ``call_outcome``, ``error_message``
+    # and ``attempt_id`` with an empty transcript and ``call_duration`` 0.
+    # False keeps the webhook to calls the agent actually had.
+    send_on_failed_dial: bool = True
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Read a YAML/API boolean that may arrive as text (``"false"``, ``"0"``)."""
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
 
 class GenericWebhookTool(PostCallTool):
     """
@@ -167,6 +188,10 @@ class GenericWebhookTool(PostCallTool):
     @property
     def definition(self) -> ToolDefinition:
         return self._definition
+
+    def runs_on_failed_dial(self) -> bool:
+        """``send_on_failed_dial`` (default true): report dials that never became a call."""
+        return bool(self.config.send_on_failed_dial)
 
     def get_last_result(self, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Return diagnostics from the last execute() call (HTTP status, body preview, error).
@@ -521,6 +546,7 @@ class GenericWebhookTool(PostCallTool):
             "{call_direction}": context.call_direction or "",
             "{campaign_id}": context.campaign_id or "",
             "{lead_id}": context.lead_id or "",
+            "{attempt_id}": getattr(context, "attempt_id", None) or "",
         }
         
         for placeholder, value in replacements.items():
@@ -650,6 +676,7 @@ def create_webhook_tool(name: str, config_dict: Dict[str, Any]) -> GenericWebhoo
         summary_timeout_ms=config_dict.get('summary_timeout_ms', 15000),
         summary_prompt=config_dict.get('summary_prompt'),
         response_body_max_chars=config_dict.get('response_body_max_chars'),
+        send_on_failed_dial=_as_bool(config_dict.get('send_on_failed_dial'), True),
     )
     
     return GenericWebhookTool(config)

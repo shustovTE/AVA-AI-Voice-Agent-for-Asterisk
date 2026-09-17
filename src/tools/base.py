@@ -542,6 +542,19 @@ class PostCallTool(ABC):
         """
         pass
 
+    def runs_on_failed_dial(self) -> bool:
+        """
+        Whether the tool also runs for an outbound attempt that never became a call.
+
+        A rejected originate, a ring-out, a busy line, an answering machine or
+        a declined consent has no call session, no transcript and no duration.
+        The engine still builds a PostCallContext for it from the attempt (the
+        lead, the campaign, ``call_outcome``, ``error_message``,
+        ``attempt_id``) and runs the post-call tools that answer True here.
+        Tools stay out of it unless they opt in.
+        """
+        return False
+
     def get_last_result(self, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Return execution metadata from the last ``execute()`` call, or None.

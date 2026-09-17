@@ -145,6 +145,10 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
   same number should PATCH the fresh `custom_vars` onto that id first, then
   recycle it.
 
+### Post-call webhooks for every attempt
+
+Every outbound attempt is reported to the post-call webhooks once it is finished, whether or not the agent ever spoke: an answered call reports through its normal cleanup, and an unanswered or failed dial (rejected originate, ring-out, busy, congestion, channel unavailable, answering machine, consent declined or timed out) the moment the attempt is finalized. The same webhooks, the same `payload_template` and the same variables apply. `{call_outcome}` carries the attempt outcome shown in Call Scheduling, `{error_message}` the originate error or hangup cause, `{attempt_id}` the attempt, and `{lead_id}`, `{campaign_id}` and the lead's `custom_vars` identify the lead as for an answered call; transcript and summary are empty and `{call_duration}` is `0`. A webhook that should only see conversations sets `send_on_failed_dial: false`. See *Outbound Dials That Never Became a Call* in `docs/TOOL_CALLING_GUIDE.md`.
+
 ## Testing Checklist (New User)
 
 Use a local extension (e.g., `2765`) and an external number (E.164) to validate:
@@ -152,6 +156,7 @@ Use a local extension (e.g., `2765`) and an external number (E.164) to validate:
 - Consent enabled: press `1` to accept → AI connects; press `2` → call ends; no input → `consent_timeout`.
 - Voicemail enabled: let it ring out or go to voicemail → voicemail drop plays; attempt outcome recorded.
 - HUMAN path: correct Agent/provider chosen; tools (e.g., `hangup_call`) work.
+- Post-call webhook: let a dial ring out (or dial a busy number) → the webhook receives `call_outcome` `no_answer` (or `busy`) with the lead id, `error_message` and an empty transcript; an answered call arrives with its transcript as before.
 - Lead context: add a distinctive non-sensitive value such as
   `"validation_token":"issue613-7f3a"`, reference it in the Agent prompt as
   `{validation_token}` (or ask the Agent to repeat the field from the Lead

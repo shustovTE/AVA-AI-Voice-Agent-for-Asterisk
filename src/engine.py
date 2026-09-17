@@ -2126,6 +2126,15 @@ class Engine:
                     lead_id=lead_id,
                     exc_info=True,
                 )
+        if attempt_id:
+            # ChannelDestroyed sees the fail-closed marker below and does not
+            # report this attempt a second time.
+            await self._outbound_post_call_tools_for_attempt(
+                {**(meta or {}), "attempt_id": attempt_id, "campaign_id": campaign_id, "lead_id": lead_id},
+                outcome="error",
+                error_message=error_message,
+                channel_id=channel_id,
+            )
         seen_outbound = getattr(self, "_seen_outbound_channels", None)
         if seen_outbound is not None:
             seen_outbound.add(channel_id)
@@ -3112,7 +3121,11 @@ class Engine:
                                     outcome="canceled",
                                     error_message="Lead not leased (state transition failed)",
                                 )
-                                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+                                await self._outbound_post_call_tools_for_attempt(
+                                    self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                                    outcome="canceled",
+                                    error_message="Lead not leased (state transition failed)",
+                                )
                                 continue
 
                             await self._outbound_originate_attempt(campaign, lead, attempt_id)
@@ -3301,7 +3314,11 @@ class Engine:
                 await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome="error")
             except Exception:
                 pass
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                outcome="error",
+                error_message=reason,
+            )
             return
 
         channel_id = resp.get("id") if isinstance(resp, dict) else None
@@ -3311,7 +3328,11 @@ class Engine:
                 await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome="error")
             except Exception:
                 pass
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                outcome="error",
+                error_message="originate returned no channel id",
+            )
             return
 
         await self.outbound_store.set_attempt_channel(attempt_id, str(channel_id))
@@ -3484,6 +3505,12 @@ class Engine:
                 self._outbound_attempt_amd.pop(attempt_id, None)
                 if channel_id:
                     self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+                await self._outbound_post_call_tools_for_attempt(
+                    meta,
+                    outcome="no_answer",
+                    error_message="stale originate (no StasisStart)",
+                    channel_id=channel_id or None,
+                )
         except Exception:
             logger.debug("Outbound stale-attempt cleanup failed", exc_info=True)
 
@@ -3784,6 +3811,11 @@ class Engine:
                     )
                 except Exception:
                     pass
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome="voicemail_dropped" if vm_enabled else "machine_detected",
+                channel_id=channel_id,
+            )
 
             # Cleanup mappings and hang up.
             if attempt_id:
@@ -3815,6 +3847,11 @@ class Engine:
                     )
                 except Exception:
                     pass
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome="consent_denied" if consent_result == "denied" else "consent_timeout",
+                channel_id=channel_id,
+            )
             if attempt_id:
                 self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
                 self._outbound_attempt_amd.pop(attempt_id, None)
@@ -3909,6 +3946,7 @@ class Engine:
                 # If we never reached AMD (so we never got an answer/StasisStart), treat as no_answer.
                 outcome = "no_answer"
 
+            hangup_cause = str(event.get("cause_txt") or cause_txt or cause or "") or None
             if attempt_id:
                 await self.outbound_store.finish_attempt(
                     attempt_id,
@@ -3919,7 +3957,7 @@ class Engine:
                     consent_result=(amd or {}).get("consent_result"),
                     context=str((meta or {}).get("context") or "") or None,
                     provider=str((meta or {}).get("provider") or "") or None,
-                    error_message=str(event.get("cause_txt") or cause_txt or cause or "") or None,
+                    error_message=hangup_cause,
                 )
             if lead_id:
                 try:
@@ -3931,8 +3969,119 @@ class Engine:
                 self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
                 self._outbound_attempt_amd.pop(attempt_id, None)
             self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome=outcome,
+                error_message=hangup_cause,
+                channel_id=channel_id,
+            )
         except Exception:
             logger.debug("Outbound ChannelDestroyed handler failed", exc_info=True)
+
+    async def _outbound_post_call_tools_for_attempt(
+        self,
+        meta: Optional[Dict[str, Any]],
+        *,
+        outcome: str,
+        error_message: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Run the post-call tools for an outbound attempt that ended without a call.
+
+        A rejected originate, a ring-out, a busy line, an answering machine or
+        a declined consent never gets a CallSession, so ``_cleanup_call`` and
+        its post-call tools never run for it and a CRM would never hear how
+        the dial ended. Every finished attempt is reported once: a call that
+        reached the agent reports through ``_cleanup_call``, everything else
+        through here. The context is built from the attempt metadata (lead,
+        campaign, custom_vars, ``call_outcome``, ``error_message``,
+        ``attempt_id``; no transcript, duration 0) and only tools that opt in
+        through ``runs_on_failed_dial()`` run. Nothing is written to call
+        history: there is no call record to attach it to. An attempt whose
+        metadata is gone (finalized after an engine restart) is not reported.
+        """
+        from src.tools.context import PostCallContext
+
+        attempt_id = str((meta or {}).get("attempt_id") or "").strip()
+        if not attempt_id:
+            return
+        try:
+            meta = dict(meta or {})
+            context_name = str(meta.get("context") or "").strip() or None
+            routing_method = meta.get("routing_method")
+            tool_registry = self._tool_registry_for_session(None)
+            tools_to_run = [
+                tool
+                for tool in self._post_call_tools_for_context(tool_registry, context_name, routing_method)
+                if self._post_call_tool_runs_on_failed_dial(tool)
+            ]
+            if not tools_to_run:
+                logger.debug(
+                    "No post-call tools opted in for the outbound attempt",
+                    attempt_id=attempt_id,
+                    context=context_name,
+                    call_outcome=outcome,
+                )
+                return
+
+            channel_id = str(channel_id or meta.get("channel_id") or "").strip()
+            call_id = channel_id or attempt_id
+            phone = str(meta.get("phone_number") or "").strip()
+            started_ts = meta.get("originated_at_ts") or meta.get("created_at_ts")
+            call_start_time = None
+            if started_ts:
+                try:
+                    call_start_time = datetime.fromtimestamp(float(started_ts), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    call_start_time = None
+            custom_vars = meta.get("custom_vars")
+            error_text = str(error_message).strip() if error_message else ""
+
+            logger.info(
+                "Executing post-call tools for outbound attempt without a call",
+                call_id=call_id,
+                attempt_id=attempt_id,
+                campaign_id=str(meta.get("campaign_id") or "") or None,
+                lead_id=str(meta.get("lead_id") or "") or None,
+                context=context_name,
+                call_outcome=outcome,
+                error=error_text or None,
+                tools=[t.definition.name for t in tools_to_run],
+            )
+
+            # The same caller fields an answered outbound call's session carries
+            # (see _handle_outbound_amd_result): the lead's number on both
+            # sides, the lead's name or "Outbound <number>".
+            lead_name = str(meta.get("lead_name") or "").strip()
+            post_call_ctx = PostCallContext(
+                call_id=call_id,
+                caller_number=phone,
+                called_number=phone or None,
+                caller_name=lead_name or (f"Outbound {phone}" if phone else "Outbound"),
+                context_name=context_name or "",
+                provider=str(meta.get("provider") or "").strip()
+                or str(getattr(self.config, "default_provider", "") or ""),
+                call_direction="outbound",
+                call_duration_seconds=0,
+                call_outcome=outcome,
+                call_start_time=call_start_time,
+                call_end_time=datetime.now(timezone.utc).isoformat(),
+                campaign_id=str(meta.get("campaign_id") or "") or None,
+                lead_id=str(meta.get("lead_id") or "") or None,
+                custom_vars=dict(custom_vars) if isinstance(custom_vars, dict) else {},
+                attempt_id=attempt_id,
+                error_message=error_text or None,
+                config=self._tool_config_for_session(None),
+                summary_generator=self._post_call_summary_generator(),
+            )
+            await self._run_post_call_tools(call_id, tools_to_run, post_call_ctx, record_history=False)
+        except Exception:
+            logger.error(
+                "Post-call tools for the outbound attempt failed to start",
+                attempt_id=attempt_id,
+                call_outcome=outcome,
+                exc_info=True,
+            )
 
     async def stop(self, graceful_timeout: float = 30.0):
         """Disconnect from ARI and stop the engine.
@@ -21565,6 +21714,42 @@ class Engine:
         
         return results
 
+    def _post_call_tools_for_context(
+        self,
+        tool_registry: Any,
+        context_name: Optional[str],
+        routing_method: Optional[str] = None,
+    ) -> List[Any]:
+        """Post-call tools of an agent context: its own plus the global ones minus its opt-outs."""
+        from src.tools.base import ToolPhase
+
+        ctx_config = None
+        if context_name:
+            ctx_config = self.transport_orchestrator.get_context_config(context_name, routing_method)
+        post_call_tool_names = list(getattr(ctx_config, 'post_call_tools', None) or []) if ctx_config else []
+        disabled_global = list(getattr(ctx_config, 'disable_global_post_call_tools', None) or []) if ctx_config else []
+        return tool_registry.get_tools_for_context(
+            phase=ToolPhase.POST_CALL,
+            context_tool_names=post_call_tool_names,
+            disabled_global_tools=disabled_global,
+        )
+
+    @staticmethod
+    def _post_call_tool_runs_on_failed_dial(tool: Any) -> bool:
+        """Whether a post-call tool opted in to outbound attempts that never became a call."""
+        probe = getattr(tool, "runs_on_failed_dial", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug(
+                "runs_on_failed_dial failed",
+                tool=getattr(getattr(tool, "definition", None), "name", None),
+                exc_info=True,
+            )
+            return False
+
     async def _execute_post_call_tools(
         self,
         call_id: str,
@@ -21578,6 +21763,10 @@ class Engine:
         
         Post-call tools send data to external systems (webhooks, CRM updates).
         They run asynchronously and do not block call cleanup.
+
+        An outbound attempt that never became a call has no session and never
+        gets here: ``_outbound_post_call_tools_for_attempt`` reports it from
+        the attempt metadata instead.
         
         Args:
             call_id: Call identifier
@@ -21585,25 +21774,13 @@ class Engine:
             call_duration_seconds: Pre-calculated call duration in seconds
             call_outcome: How the call ended (caller_hangup, agent_hangup, transferred)
         """
-        from src.tools.base import ToolPhase
         from src.tools.context import PostCallContext
         tool_registry = self._tool_registry_for_session(session)
         
         try:
-            # Get context config for this call
-            ctx_config = None
-            if session.context_name:
-                ctx_config = self.transport_orchestrator.get_context_config(
-                    session.context_name, getattr(session, "routing_method", None))
-
-            # Get post-call tools for this context (context-specific + global minus opt-outs)
-            post_call_tool_names = list(getattr(ctx_config, 'post_call_tools', None) or []) if ctx_config else []
-            disabled_global = list(getattr(ctx_config, 'disable_global_post_call_tools', None) or []) if ctx_config else []
-            
-            tools_to_run = tool_registry.get_tools_for_context(
-                phase=ToolPhase.POST_CALL,
-                context_tool_names=post_call_tool_names,
-                disabled_global_tools=disabled_global,
+            # Post-call tools for this context (context-specific + global minus opt-outs)
+            tools_to_run = self._post_call_tools_for_context(
+                tool_registry, session.context_name, getattr(session, "routing_method", None)
             )
             
             if not tools_to_run:
@@ -21619,6 +21796,7 @@ class Engine:
                        call_outcome=call_outcome)
             
             # Build post-call context
+            session_error = getattr(session, 'error_message', None)
             post_call_ctx = PostCallContext(
                 call_id=call_id,
                 caller_number=session.caller_number or "",
@@ -21638,176 +21816,197 @@ class Engine:
                 campaign_id=getattr(session, 'outbound_campaign_id', None),
                 lead_id=getattr(session, 'outbound_lead_id', None),
                 custom_vars=dict(getattr(session, 'outbound_custom_vars', {}) or {}),
+                attempt_id=str(getattr(session, 'outbound_attempt_id', None) or '') or None,
+                error_message=str(session_error) if session_error else None,
                 config=self._tool_config_for_session(session),
                 summary_generator=self._post_call_summary_generator(),
             )
-            
-            # Capture execution metadata in call_records.post_call_tool_calls
-            # so the admin UI can show what happened. We write a `pending`
-            # placeholder per tool BEFORE scheduling (so a killed engine still
-            # shows what was supposed to run), then update with the result.
-            try:
-                from src.core.call_history import get_call_history_store
-                history_store = get_call_history_store()
-            except Exception:
-                history_store = None
-            phase = "post_call"
 
-            async def run_post_call_tool(tool, started_at_iso: str):
-                tool_name = tool.definition.name
-                tool_kind = type(tool).__name__
-                tool_start = time.time()
-                # Per-tool budget: configured timeout + 1s grace; defaults to 6s.
-                timeout_ms = getattr(tool.definition, "timeout_ms", None) or 5000
-                tool_timeout = timeout_ms / 1000.0 + 1.0
-                status = "ok"
-                error_message = None
-                try:
-                    await asyncio.wait_for(tool.execute(post_call_ctx), timeout=tool_timeout)
-                except asyncio.TimeoutError:
-                    status = "timeout"
-                    error_message = f"exceeded {tool_timeout:.1f}s budget"
-                    logger.warning(
-                        "Post-call tool timed out",
-                        call_id=call_id,
-                        tool=tool_name,
-                        timeout_s=tool_timeout,
-                    )
-                except Exception as e:
-                    status = "error"
-                    error_message = f"{e.__class__.__name__}: {e}"
-                    logger.error(
-                        "Post-call tool failed",
-                        call_id=call_id,
-                        tool=tool_name,
-                        error=str(e),
-                        exc_info=True,
-                    )
-                duration_ms = round((time.time() - tool_start) * 1000, 2)
-                logger.info(
-                    "Post-call tool completed",
-                    call_id=call_id,
-                    tool=tool_name,
-                    duration_ms=duration_ms,
-                    status=status,
-                )
-                # Merge any tool-specific diagnostics (HTTP status, body preview, etc.)
-                tool_extra = {}
-                try:
-                    if hasattr(tool, "get_last_result"):
-                        try:
-                            last = tool.get_last_result(call_id=call_id)
-                        except TypeError:
-                            # Backward-compat: third-party overrides without call_id arg
-                            last = tool.get_last_result()
-                    else:
-                        last = None
-                    if isinstance(last, dict):
-                        # Tool's recorded status wins for skipped/error/timeout — the tool
-                        # knows about non-2xx HTTP responses that didn't raise an exception
-                        # (GenericWebhookTool catches them internally). Without this, a 502
-                        # from the wrapper would still show as 'ok' in the modal.
-                        tool_reported = last.get("status")
-                        if tool_reported in ("skipped", "error", "timeout"):
-                            status = tool_reported
-                        for k in (
-                            "http_status",
-                            "response_summary",
-                            "started_at",
-                            "finished_at",
-                            "duration_ms",
-                            "summary_provider",
-                            "summary_model",
-                            "summary_status",
-                            "summary_duration_ms",
-                            "summary_error_code",
-                        ):
-                            if last.get(k) is not None:
-                                tool_extra[k] = last[k]
-                        if last.get("error_message") and not error_message:
-                            error_message = last["error_message"]
-                except Exception:
-                    logger.debug("get_last_result failed", call_id=call_id, tool=tool_name, exc_info=True)
-                # Engine-side fallback for finished_at — tools that don't report it
-                # via get_last_result still get a real timestamp instead of NULL.
-                finished_at_iso = datetime.now(timezone.utc).isoformat()
-                # Persist final state.
-                if history_store is not None:
-                    try:
-                        await history_store.update_phase_tool(
-                            call_id=call_id,
-                            phase=phase,
-                            tool_name=tool_name,
-                            started_at=started_at_iso,
-                            updates={
-                                "kind": tool_kind,
-                                "phase": phase,
-                                "status": status,
-                                "duration_ms": tool_extra.get("duration_ms", duration_ms),
-                                "started_at": tool_extra.get("started_at", started_at_iso),
-                                "finished_at": tool_extra.get("finished_at") or finished_at_iso,
-                                "http_status": tool_extra.get("http_status"),
-                                "response_summary": tool_extra.get("response_summary"),
-                                "summary_provider": tool_extra.get("summary_provider"),
-                                "summary_model": tool_extra.get("summary_model"),
-                                "summary_status": tool_extra.get("summary_status"),
-                                "summary_duration_ms": tool_extra.get("summary_duration_ms"),
-                                "summary_error_code": tool_extra.get("summary_error_code"),
-                                "error_message": error_message,
-                                "attempt": 1,
-                            },
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to update post-call tool history",
-                            call_id=call_id, tool=tool_name, exc_info=True,
-                        )
-
-            # Write `pending` placeholders BEFORE scheduling tasks. This way the
-            # row reflects what was supposed to run even if the engine dies before
-            # any task completes. Captured `started_at` is the matching key for
-            # the later update_phase_tool call.
-            tool_starts = {}
-            if history_store is not None:
-                for tool in tools_to_run:
-                    started_at_iso = datetime.now(timezone.utc).isoformat()
-                    tool_starts[tool.definition.name] = started_at_iso
-                    try:
-                        await history_store.append_phase_tool(
-                            call_id=call_id,
-                            phase=phase,
-                            record={
-                                "name": tool.definition.name,
-                                "kind": type(tool).__name__,
-                                "phase": phase,
-                                "status": "pending",
-                                "started_at": started_at_iso,
-                                "finished_at": None,
-                                "duration_ms": None,
-                                "attempt": 1,
-                            },
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to record pending post-call tool",
-                            call_id=call_id, tool=tool.definition.name, exc_info=True,
-                        )
-
-            # Create fire-and-forget tasks for all post-call tools
-            for tool in tools_to_run:
-                started_at_iso = tool_starts.get(tool.definition.name) or datetime.now(timezone.utc).isoformat()
-                self._fire_and_forget(
-                    run_post_call_tool(tool, started_at_iso),
-                    name=f"post-call-{tool.definition.name}-{call_id}"
-                )
-
-            logger.info("Post-call tools fired", call_id=call_id, count=len(tools_to_run))
+            await self._run_post_call_tools(call_id, tools_to_run, post_call_ctx)
             
         except Exception as e:
             logger.error("Post-call tool execution setup failed",
                         call_id=call_id,
                         error=str(e),
                         exc_info=True)
+
+    async def _run_post_call_tools(
+        self,
+        call_id: str,
+        tools_to_run: List[Any],
+        post_call_ctx: Any,
+        *,
+        record_history: bool = True,
+    ) -> None:
+        """Fire the given post-call tools with one shared context (fire-and-forget).
+
+        With ``record_history`` every tool gets a ``pending`` placeholder in
+        the call record's ``post_call_tool_calls`` before it is scheduled and
+        its result afterwards. An outbound attempt that never became a call
+        has no call record and passes False.
+        """
+        # Capture execution metadata in call_records.post_call_tool_calls
+        # so the admin UI can show what happened. We write a `pending`
+        # placeholder per tool BEFORE scheduling (so a killed engine still
+        # shows what was supposed to run), then update with the result.
+        history_store = None
+        if record_history:
+            try:
+                from src.core.call_history import get_call_history_store
+                history_store = get_call_history_store()
+            except Exception:
+                history_store = None
+        phase = "post_call"
+
+        async def run_post_call_tool(tool, started_at_iso: str):
+            tool_name = tool.definition.name
+            tool_kind = type(tool).__name__
+            tool_start = time.time()
+            # Per-tool budget: configured timeout + 1s grace; defaults to 6s.
+            timeout_ms = getattr(tool.definition, "timeout_ms", None) or 5000
+            tool_timeout = timeout_ms / 1000.0 + 1.0
+            status = "ok"
+            error_message = None
+            try:
+                await asyncio.wait_for(tool.execute(post_call_ctx), timeout=tool_timeout)
+            except asyncio.TimeoutError:
+                status = "timeout"
+                error_message = f"exceeded {tool_timeout:.1f}s budget"
+                logger.warning(
+                    "Post-call tool timed out",
+                    call_id=call_id,
+                    tool=tool_name,
+                    timeout_s=tool_timeout,
+                )
+            except Exception as e:
+                status = "error"
+                error_message = f"{e.__class__.__name__}: {e}"
+                logger.error(
+                    "Post-call tool failed",
+                    call_id=call_id,
+                    tool=tool_name,
+                    error=str(e),
+                    exc_info=True,
+                )
+            duration_ms = round((time.time() - tool_start) * 1000, 2)
+            logger.info(
+                "Post-call tool completed",
+                call_id=call_id,
+                tool=tool_name,
+                duration_ms=duration_ms,
+                status=status,
+            )
+            # Merge any tool-specific diagnostics (HTTP status, body preview, etc.)
+            tool_extra = {}
+            try:
+                if hasattr(tool, "get_last_result"):
+                    try:
+                        last = tool.get_last_result(call_id=call_id)
+                    except TypeError:
+                        # Backward-compat: third-party overrides without call_id arg
+                        last = tool.get_last_result()
+                else:
+                    last = None
+                if isinstance(last, dict):
+                    # Tool's recorded status wins for skipped/error/timeout — the tool
+                    # knows about non-2xx HTTP responses that didn't raise an exception
+                    # (GenericWebhookTool catches them internally). Without this, a 502
+                    # from the wrapper would still show as 'ok' in the modal.
+                    tool_reported = last.get("status")
+                    if tool_reported in ("skipped", "error", "timeout"):
+                        status = tool_reported
+                    for k in (
+                        "http_status",
+                        "response_summary",
+                        "started_at",
+                        "finished_at",
+                        "duration_ms",
+                        "summary_provider",
+                        "summary_model",
+                        "summary_status",
+                        "summary_duration_ms",
+                        "summary_error_code",
+                    ):
+                        if last.get(k) is not None:
+                            tool_extra[k] = last[k]
+                    if last.get("error_message") and not error_message:
+                        error_message = last["error_message"]
+            except Exception:
+                logger.debug("get_last_result failed", call_id=call_id, tool=tool_name, exc_info=True)
+            # Engine-side fallback for finished_at — tools that don't report it
+            # via get_last_result still get a real timestamp instead of NULL.
+            finished_at_iso = datetime.now(timezone.utc).isoformat()
+            # Persist final state.
+            if history_store is not None:
+                try:
+                    await history_store.update_phase_tool(
+                        call_id=call_id,
+                        phase=phase,
+                        tool_name=tool_name,
+                        started_at=started_at_iso,
+                        updates={
+                            "kind": tool_kind,
+                            "phase": phase,
+                            "status": status,
+                            "duration_ms": tool_extra.get("duration_ms", duration_ms),
+                            "started_at": tool_extra.get("started_at", started_at_iso),
+                            "finished_at": tool_extra.get("finished_at") or finished_at_iso,
+                            "http_status": tool_extra.get("http_status"),
+                            "response_summary": tool_extra.get("response_summary"),
+                            "summary_provider": tool_extra.get("summary_provider"),
+                            "summary_model": tool_extra.get("summary_model"),
+                            "summary_status": tool_extra.get("summary_status"),
+                            "summary_duration_ms": tool_extra.get("summary_duration_ms"),
+                            "summary_error_code": tool_extra.get("summary_error_code"),
+                            "error_message": error_message,
+                            "attempt": 1,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to update post-call tool history",
+                        call_id=call_id, tool=tool_name, exc_info=True,
+                    )
+
+        # Write `pending` placeholders BEFORE scheduling tasks. This way the
+        # row reflects what was supposed to run even if the engine dies before
+        # any task completes. Captured `started_at` is the matching key for
+        # the later update_phase_tool call.
+        tool_starts = {}
+        if history_store is not None:
+            for tool in tools_to_run:
+                started_at_iso = datetime.now(timezone.utc).isoformat()
+                tool_starts[tool.definition.name] = started_at_iso
+                try:
+                    await history_store.append_phase_tool(
+                        call_id=call_id,
+                        phase=phase,
+                        record={
+                            "name": tool.definition.name,
+                            "kind": type(tool).__name__,
+                            "phase": phase,
+                            "status": "pending",
+                            "started_at": started_at_iso,
+                            "finished_at": None,
+                            "duration_ms": None,
+                            "attempt": 1,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to record pending post-call tool",
+                        call_id=call_id, tool=tool.definition.name, exc_info=True,
+                    )
+
+        # Create fire-and-forget tasks for all post-call tools
+        for tool in tools_to_run:
+            started_at_iso = tool_starts.get(tool.definition.name) or datetime.now(timezone.utc).isoformat()
+            self._fire_and_forget(
+                run_post_call_tool(tool, started_at_iso),
+                name=f"post-call-{tool.definition.name}-{call_id}"
+            )
+
+        logger.info("Post-call tools fired", call_id=call_id, count=len(tools_to_run))
 
     def _post_call_summary_generator(self):
         """Return the provider-backed summary callback for post-call contexts."""

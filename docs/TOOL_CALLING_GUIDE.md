@@ -774,7 +774,8 @@ Existing webhook definitions that enable summaries but omit `summary_provider` k
 | `{provider}` | string | AI provider (deepgram, openai_realtime, etc.) |
 | `{call_direction}` | string | "inbound" or "outbound" |
 | `{call_duration}` | number | Duration in seconds |
-| `{call_outcome}` | string | Outcome (completed, transferred, etc.) |
+| `{call_outcome}` | string | Outcome (completed, transferred, etc.; for an outbound dial that never became a call, the attempt outcome: `no_answer`, `busy`, `voicemail_dropped`, …, see below) |
+| `{error_message}` | string | Why the call or the dial failed: the session error, the originate error or the hangup cause (`User busy`); empty otherwise |
 | `{call_start_time}` | string | ISO timestamp |
 | `{call_end_time}` | string | ISO timestamp |
 | `{transcript_json}` | JSON | Full conversation as JSON array |
@@ -782,8 +783,46 @@ Existing webhook definitions that enable summaries but omit `summary_provider` k
 | `{summary_json}` | JSON | AI-generated summary as a JSON string (safe for unquoted insertion) |
 | `{campaign_id}` | string | Outbound campaign ID |
 | `{lead_id}` | string | Outbound lead ID |
+| `{attempt_id}` | string | Outbound dial attempt ID (the attempt shown in Call Scheduling); empty for inbound calls |
+| `{custom_vars_json}` | JSON | The outbound lead's `custom_vars` object; each key is also its own `{placeholder}` |
 
 **Note**: `{transcript_json}` is inserted as raw JSON (not quoted), so place it directly in the template without quotes.
+
+`{call_id}`, `{caller_number}`, `{called_number}`, `{caller_name}`, `{context_name}`, `{provider}`, `{call_direction}`, `{campaign_id}`, `{lead_id}` and `{attempt_id}` are also substituted in the URL and in header values.
+
+### Outbound Dials That Never Became a Call
+
+Post-call tools used to run only from a call's cleanup, which needs a call session, so an outbound attempt that was rejected by Asterisk, rang out, met a busy line, an answering machine or a declined consent finished in the scheduler and told nobody. Every finished outbound attempt now reaches the post-call webhooks exactly once: an answered call through its normal cleanup, everything else the moment the attempt is finalized. The same webhooks run (the global ones and the ones the lead's Agent lists under `post_call_tools`, minus its `disable_global_post_call_tools`) with the same `payload_template` and the same variables; only the values differ:
+
+| Variable | Value for a dial that never became a call |
+|----------|-------------------------------------------|
+| `{call_id}` | The Asterisk channel id when one was created, otherwise the attempt id |
+| `{attempt_id}` | The attempt id |
+| `{call_outcome}` | `no_answer`, `busy`, `congestion`, `chanunavail`, `canceled`, `error`, `voicemail_dropped`, `machine_detected`, `consent_denied`, `consent_timeout` |
+| `{error_message}` | The originate error or the hangup cause text (`User busy`, `No answer`); empty for an answering machine or a declined consent |
+| `{caller_number}`, `{called_number}` | The lead's number, as for an answered outbound call |
+| `{caller_name}` | The lead's name, or `Outbound <number>` |
+| `{call_direction}` | `outbound` |
+| `{call_duration}` | `0` |
+| `{call_start_time}`, `{call_end_time}` | When the dial was placed and when the attempt was finalized |
+| `{transcript_json}`, `{tool_calls_json}`, `{pre_call_results_json}` | `[]`, `[]`, `{}` |
+| `{summary}`, `{summary_json}` | Empty; `generate_summary` is skipped on an empty transcript |
+| `{campaign_id}`, `{lead_id}`, `{custom_vars_json}` and each custom variable | The lead's, as for an answered call |
+| `{context_name}`, `{provider}` | The lead's Agent and its provider (or the default provider) |
+
+Branch on `{call_outcome}` in the receiving automation (an n8n Switch node, for example) where unanswered dials need different handling from conversations. A webhook that must only see conversations opts out:
+
+```yaml
+tools:
+  crm_note:
+    kind: generic_webhook
+    phase: post_call
+    is_global: true
+    url: "https://crm.example.com/notes"
+    send_on_failed_dial: false   # only calls the agent actually had
+```
+
+The switch is **Send for Failed Outbound Dials** in the webhook editor and `send_on_failed_dial` in the managed tools API. These reports are not written to Call History, since there is no call record to attach them to; the engine logs `Executing post-call tools for outbound attempt without a call` with the attempt, the outcome and the tools, then the usual `Post-call tool completed` line per tool. An attempt finalized by the startup cleanup after an engine restart has no metadata left and is not reported.
 
 ### Post-Call Example Configurations
 

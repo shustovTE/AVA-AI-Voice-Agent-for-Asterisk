@@ -147,6 +147,28 @@ def test_post_call_webhook(client):
     assert r.json()["config"]["method"] == "POST"
 
 
+def test_post_call_webhook_keeps_the_failed_dial_switch(client):
+    r = client.post("/api/tools/managed", json={
+        "name": "crm_hook", "phase": "post_call",
+        "url": "https://hooks.example.com/x", "is_global": True,
+        "send_on_failed_dial": False,
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["config"]["send_on_failed_dial"] is False
+    assert client.cfg_state["cfg"]["tools"]["crm_hook"]["send_on_failed_dial"] is False
+
+    r = client.patch("/api/tools/managed/crm_hook", json={"send_on_failed_dial": True})
+    assert r.status_code == 200, r.text
+    assert client.cfg_state["cfg"]["tools"]["crm_hook"]["send_on_failed_dial"] is True
+
+    # Without the key the engine's default (send) applies; nothing is persisted for it.
+    r = client.post("/api/tools/managed", json={
+        "name": "plain_hook", "phase": "post_call", "url": "https://hooks.example.com/y",
+    })
+    assert r.status_code == 201, r.text
+    assert "send_on_failed_dial" not in client.cfg_state["cfg"]["tools"]["plain_hook"]
+
+
 def test_post_call_rejects_unavailable_explicit_summary_provider(client, monkeypatch):
     async def fake_options():
         return {

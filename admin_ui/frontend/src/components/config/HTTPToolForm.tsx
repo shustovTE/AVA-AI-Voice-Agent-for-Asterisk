@@ -83,6 +83,10 @@ interface HTTPToolConfig {
     summary_provider?: string;
     summary_timeout_ms?: number;
     summary_prompt?: string;
+    // Post-call: also send for an outbound attempt that never became a call
+    // (no answer, busy, rejected originate, answering machine, consent
+    // declined). The engine's default is true.
+    send_on_failed_dial?: boolean;
     // In-call specific fields
     description?: string;
     parameters?: ToolParameter[];
@@ -299,6 +303,7 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
             summary_max_words: phase === 'post_call' ? 100 : undefined,
             summary_timeout_ms: phase === 'post_call' ? 15000 : undefined,
             summary_prompt: phase === 'post_call' ? DEFAULT_SUMMARY_PROMPT : undefined,
+            send_on_failed_dial: phase === 'post_call' ? true : undefined,
             // In-call specific fields
             description: phase === 'in_call' ? '' : undefined,
             parameters: phase === 'in_call' ? [] : undefined,
@@ -1714,6 +1719,19 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                     {/* Post-call specific: Payload Template + Summary */}
                     {phase === 'post_call' && (
                         <>
+                            <div className="border border-border rounded-lg p-3 bg-card/30">
+                                <FormSwitch
+                                    label="Send for Failed Outbound Dials"
+                                    description="Also send this webhook when an outbound dial never reaches the agent (no answer, busy, rejected, answering machine, consent declined). Same payload: {call_outcome} names the result, {error_message} the reason, {attempt_id} the attempt; the transcript is empty and {call_duration} is 0. Off: only calls the agent actually had."
+                                    checked={toolForm.send_on_failed_dial ?? true}
+                                    onChange={e =>
+                                        setToolForm({
+                                            ...toolForm,
+                                            send_on_failed_dial: e.target.checked,
+                                        })
+                                    }
+                                />
+                            </div>
                             <div className="border border-border rounded-lg p-3 bg-card/30">
                                 <FormSwitch
                                     label="Generate AI Summary"

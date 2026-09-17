@@ -419,3 +419,53 @@ describe('HTTPToolForm — enum parameters', () => {
         });
     });
 });
+
+describe('HTTPToolForm — failed outbound dials', () => {
+    const existingWebhook = {
+        crm_webhook: {
+            kind: 'generic_webhook',
+            phase: 'post_call',
+            enabled: true,
+            is_global: true,
+            timeout_ms: 5000,
+            url: 'https://crm.example.com/hook',
+            method: 'POST',
+            headers: {},
+        },
+    };
+
+    it('reports failed dials by default and saves the switch when it is turned off', () => {
+        const onChange = vi.fn();
+        render(<HTTPToolForm config={{}} onChange={onChange} phase="post_call" />);
+        fireEvent.click(screen.getByRole('button', { name: 'Add Webhook' }));
+        fireEvent.change(screen.getByLabelText('Tool Name'), { target: { value: 'crm_webhook' } });
+        fireEvent.change(screen.getByLabelText('URL'), {
+            target: { value: 'https://crm.example.com/hook' },
+        });
+
+        const toggle = screen.getByLabelText('Send for Failed Outbound Dials');
+        expect(toggle).toBeChecked();
+        fireEvent.click(toggle);
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+        expect(onChange).toHaveBeenCalledOnce();
+        expect(onChange.mock.calls[0][0].crm_webhook.send_on_failed_dial).toBe(false);
+    });
+
+    it('opens a webhook saved before the switch existed as reporting failed dials, like the engine does', () => {
+        const onChange = vi.fn();
+        render(<HTTPToolForm config={existingWebhook} onChange={onChange} phase="post_call" />);
+        fireEvent.click(screen.getByRole('button', { name: 'Edit crm_webhook' }));
+
+        expect(screen.getByLabelText('Send for Failed Outbound Dials')).toBeChecked();
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+        expect(onChange.mock.calls[0][0].crm_webhook.send_on_failed_dial).toBeUndefined();
+    });
+
+    it('does not offer the switch to pre-call lookups or in-call tools', () => {
+        renderForm('pre_call');
+        fireEvent.click(screen.getByRole('button', { name: 'Add Lookup' }));
+        expect(screen.queryByLabelText('Send for Failed Outbound Dials')).toBeNull();
+    });
+});
