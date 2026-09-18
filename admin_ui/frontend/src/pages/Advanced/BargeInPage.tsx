@@ -255,6 +255,7 @@ const BargeInPage = () => {
                                         <li><strong>Energy Threshold:</strong> Increase if barge-in is too sensitive (500-1200 typical)</li>
                                         <li><strong>Provider Output Suppress:</strong> Increase if provider resumes speaking pre-barge audio (800-1600ms typical)</li>
                                         <li><strong>Post-TTS Protection:</strong> Increase if you see immediate re-triggers after TTS ends (200-600ms typical)</li>
+                                        <li><strong>Talk-Detect / Silero Initial Protection:</strong> Lower (300-500ms) so callers can interrupt a reply sooner; raise it if the agent cuts itself off right after it starts speaking (echo on the line)</li>
                                     </ul>
                                 </div>
                             </div>
@@ -286,7 +287,14 @@ const BargeInPage = () => {
                                         type="number"
                                         value={bargeInConfig.greeting_protection_ms ?? 0}
                                         onChange={(e) => updateBargeInConfig('greeting_protection_ms', parseInt(e.target.value))}
-                                        tooltip="Extra guard window during the initial greeting turn (useful if greetings are short and prone to false triggers)."
+                                        tooltip="Extra guard window during the initial greeting turn (useful if greetings are short and prone to false triggers). Replaces the talk-detect / Silero window below for the greeting when it is longer."
+                                    />
+                                    <FormInput
+                                        label="Talk-Detect / Silero Initial Protection (ms)"
+                                        type="number"
+                                        value={bargeInConfig.talk_detect_initial_protection_ms ?? 1500}
+                                        onChange={(e) => updateBargeInConfig('talk_detect_initial_protection_ms', parseInt(e.target.value))}
+                                        tooltip="Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk TALK_DETECT and Silero VAD. The caller's audio stays gated (silence reaches the recognizer) until a barge-in opens it, so this is the earliest a caller can interrupt a reply. It rejects phone echo of the agent's own voice; 0 lets the caller interrupt from the first millisecond. Lower it only on lines with working echo cancellation."
                                     />
                                 </div>
                             </div>

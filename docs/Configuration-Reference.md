@@ -552,6 +552,8 @@ Controls interruption of TTS playback when the caller speaks.
 - barge_in.energy_threshold: 1000–3000. RMS energy threshold; raise on noisy lines.
 - barge_in.cooldown_ms: 500–1500 ms. Ignore new barge‑ins after one triggers.
 - barge_in.post_tts_end_protection_ms: 250–500 ms. Short guard to avoid clipping the start of the next caller utterance.
+- barge_in.talk_detect_initial_protection_ms: default 1500. Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk `TALK_DETECT` and Silero VAD. The caller's frames stay gated until a barge-in opens them, so this is the earliest a caller can interrupt a reply; it rejects phone echo of the agent's own voice at the start of a reply. `0` lets the caller interrupt from the first millisecond (only sensible with echo cancellation on the line). The Barge-In page exposes it as *Talk-Detect / Silero Initial Protection*.
+- barge_in.greeting_protection_ms: default 0. Replaces the window above for the greeting turn when it is longer (it never shortens it).
 - barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only (local file playback) minimum talk duration before triggering barge-in.
 - barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold (more sensitive than full-agent mode).
 - barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.
