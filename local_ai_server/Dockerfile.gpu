@@ -18,11 +18,15 @@ ARG MELOTTS_GIT_REF=209145371cff8fc3bd60d7be902ea69cbdb7965a
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# python3-dev: Ubuntu's python3-pip only recommends it, and --no-install-recommends
+# leaves the image without Python.h; T-one's kenlm (source-only on PyPI) and any other
+# package that compiles a C extension need the headers.
 RUN apt-get -o Acquire::Retries=5 update && \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-venv \
         python3-pip \
+        python3-dev \
         build-essential \
         cmake \
         git \
