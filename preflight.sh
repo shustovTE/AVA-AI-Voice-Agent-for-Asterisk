@@ -1499,6 +1499,18 @@ check_selinux() {
 # ============================================================================
 # Environment File
 # ============================================================================
+# docker-compose.yml is the operator's local copy (ignored by git) of docker-compose.example.yml.
+check_compose_file() {
+    if [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+        log_ok "docker-compose.yml exists (local copy; compare with docker-compose.example.yml after a pull)"
+    elif [ -f "$SCRIPT_DIR/docker-compose.example.yml" ]; then
+        cp "$SCRIPT_DIR/docker-compose.example.yml" "$SCRIPT_DIR/docker-compose.yml"
+        log_ok "Created docker-compose.yml from docker-compose.example.yml"
+    else
+        log_warn "docker-compose.example.yml not found"
+    fi
+}
+
 check_env() {
     if [ -f "$SCRIPT_DIR/.env" ]; then
         log_ok ".env file exists"
@@ -2822,6 +2834,7 @@ main() {
     check_secrets_permissions  # AAVA-191: Vertex AI credentials directory
     check_selinux
     check_env
+    check_compose_file
     check_host_project_root
     check_network
 

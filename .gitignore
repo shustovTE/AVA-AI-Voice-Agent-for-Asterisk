@@ -88,9 +88,14 @@ celerybeat-schedule
 # SageMath parsed files
 *.sage.py
 
-# Server-local Docker Compose tweaks (GPU device, image names, extra services):
-# put them in docker-compose.override.yml, which Compose merges automatically,
-# instead of editing the tracked docker-compose.yml.
+# Docker Compose: docker-compose.yml is the operator's local copy of the tracked
+# docker-compose.example.yml (install.sh / preflight.sh create it), so it can
+# carry GPU devices, image names or extra services without conflicting with a
+# pull. Override files are local too.
+docker-compose.yml
+docker-compose.yaml
+compose.yml
+compose.yaml
 docker-compose.override.yml
 compose.override.yml
 compose.override.yaml

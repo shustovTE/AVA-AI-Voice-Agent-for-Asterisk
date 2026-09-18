@@ -724,6 +724,16 @@ docker compose -p asterisk-ai-voice-agent up --build -d
 > - `GPU_AVAILABLE=false` → `minimal` mode (STT + TTS only; LLM loaded on demand)
 > Override with `LOCAL_AI_MODE=full` or `LOCAL_AI_MODE=minimal` in `.env`.
 
+### Step 2.6: Your `docker-compose.yml` is local
+
+`install.sh` and `preflight.sh` create `docker-compose.yml` from the tracked template `docker-compose.example.yml`, and git ignores the copy. Edit it freely (GPU device reservations, image names, extra services such as a vLLM next to the stack): a `git pull` never stops on it. After a pull, pick up template changes by hand:
+
+```bash
+diff docker-compose.example.yml docker-compose.yml
+```
+
+Admin UI, `preflight.sh` and the Makefile use the template only while `docker-compose.yml` is missing.
+
 ## 3. Verifying the Installation
 
 After starting the service, you can check that it is running correctly.

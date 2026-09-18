@@ -1,4 +1,12 @@
-# Asterisk AI Voice Agent - Main Services
+# Asterisk AI Voice Agent - Main Services (TEMPLATE)
+#
+# The stack runs from docker-compose.yml, which install.sh / preflight.sh create
+# from this file and git ignores, so it can carry local changes (GPU device
+# reservations, image names, extra services such as a vLLM) without ever
+# stopping a `git pull`. After a pull, pick up template changes with:
+#   diff docker-compose.example.yml docker-compose.yml
+# Admin UI and the Makefile use this template only while docker-compose.yml
+# is missing.
 #
 # DEFAULT NETWORK MODE: Host (for telephony/low-latency)
 # - Direct access to host network (127.0.0.1 reaches Asterisk)

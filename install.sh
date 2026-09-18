@@ -443,6 +443,20 @@ maybe_run_preflight() {
 }
 
 # --- Env file helpers ---
+ensure_compose_file() {
+    # docker-compose.yml is the operator's local copy (ignored by git) of the tracked template.
+    if [ -f docker-compose.yml ]; then
+        return 0
+    fi
+    if [ -f docker-compose.example.yml ]; then
+        cp docker-compose.example.yml docker-compose.yml
+        print_success "Created docker-compose.yml from docker-compose.example.yml (local copy, not tracked by git)"
+    else
+        print_error "docker-compose.example.yml not found. Cannot create docker-compose.yml"
+        exit 1
+    fi
+}
+
 ensure_env_file() {
     if [ ! -f .env ]; then
         if [ -f .env.example ]; then
@@ -868,12 +882,14 @@ configure_env() {
     # Support non-interactive mode for CI/CD
     if [ "${INSTALL_NONINTERACTIVE:-0}" = "1" ]; then
         print_info "Running in non-interactive mode (INSTALL_NONINTERACTIVE=1)"
+        ensure_compose_file
         ensure_env_file
         print_info "Using existing .env configuration or defaults"
         return 0
     fi
     
     print_info "Starting interactive configuration (.env updates)..."
+    ensure_compose_file
     ensure_env_file
     ensure_docker_sock_env
 
