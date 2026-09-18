@@ -171,12 +171,12 @@ const STT_SUBTYPES: ProviderSubtype[] = [
   {
     id: 'local',
     label: 'Local AI Server',
-    description: 'STT running inside the local-ai-server container (Vosk, Sherpa, Kroko, Faster-Whisper)',
+    description: 'STT running inside the local-ai-server container (Vosk, Sherpa, Kroko, Faster-Whisper, Whisper.cpp, T-one, GigaAM v3 / NeMo via onnx-asr)',
     yamlType: 'local',
     fields: [
       { key: 'ws_url', label: 'WebSocket URL', type: 'text', required: true, default: 'ws://127.0.0.1:8765', placeholder: 'ws://127.0.0.1:8765' },
       { key: 'auth_token', label: 'Auth Token', type: 'password', required: false },
-      { key: 'stt_backend', label: 'STT Backend', type: 'combobox', required: false, default: 'vosk', suggestions: ['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp'] },
+      { key: 'stt_backend', label: 'STT Backend', type: 'combobox', required: false, default: 'vosk', suggestions: ['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp', 'tone', 'onnx_asr'] },
       { key: 'chunk_ms', label: 'Chunk Size (ms)', type: 'number', required: false, default: 320 },
     ],
   },

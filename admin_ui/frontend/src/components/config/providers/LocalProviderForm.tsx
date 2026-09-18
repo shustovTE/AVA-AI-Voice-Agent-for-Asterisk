@@ -120,6 +120,19 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
     const isTTS = isFullAgent || name.includes('tts') || caps.includes('tts');
     const isLLM = isFullAgent || name.includes('llm') || caps.includes('llm') || (!name.includes('stt') && !name.includes('tts'));
 
+    // Labels for the backends the local AI server API reports (its keys are the raw backend ids).
+    const STT_BACKEND_LABELS: Record<string, string> = {
+        vosk: 'Vosk (Local)',
+        kroko: 'Kroko',
+        sherpa: 'Sherpa-ONNX (Local)',
+        tone: 'T-one',
+        onnx_asr: 'GigaAM v3 / NeMo (onnx-asr)',
+        faster_whisper: 'Faster-Whisper',
+        whisper_cpp: 'Whisper.cpp',
+    };
+    const sttBackendLabel = (backend: string) =>
+        STT_BACKEND_LABELS[backend] || backend.charAt(0).toUpperCase() + backend.slice(1);
+
     // Helpers to find model details
     const getModelPathPlaceholder = (backend: string, type: 'stt' | 'tts') => {
         if (loading) return "Loading...";
@@ -605,7 +618,7 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                                 {/* Dynamic options based on available backends */}
                                 {!loading && Object.keys(rawModelData.stt).map(backend => (
                                     <option key={backend} value={backend}>
-                                        {backend.charAt(0).toUpperCase() + backend.slice(1)}
+                                        {sttBackendLabel(backend)}
                                     </option>
                                 ))}
 

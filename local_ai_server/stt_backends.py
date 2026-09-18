@@ -904,7 +904,23 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
             local_dir = self.model_dir
             offline = bool(self.explicit_model_path)
             if not offline:
-                os.makedirs(local_dir, exist_ok=True)
+                try:
+                    os.makedirs(local_dir, exist_ok=True)
+                except PermissionError as exc:
+                    # The models volume is bind-mounted from the host; the container runs
+                    # as an unprivileged user, so a root-owned ./models cannot take the cache.
+                    uid = os.getuid() if hasattr(os, "getuid") else "the container user"
+                    logging.error(
+                        f"❌ {self.LOG_TAG} - Cannot create the model cache directory %s: %s. "
+                        "The models volume (./models on the host) is not writable by the container "
+                        "user (uid %s). On the host run: sudo mkdir -p models/stt && sudo chown -R %s models "
+                        "(or point ONNX_ASR_CACHE_DIR at a writable directory), then restart local_ai_server.",
+                        local_dir,
+                        exc,
+                        uid,
+                        uid,
+                    )
+                    return False
             logging.info(
                 f"📥 {self.LOG_TAG} - Loading model %s (dir=%s quantization=%s providers=%s%s)",
                 self.model,

@@ -265,6 +265,30 @@ def test_initialize_explains_a_missing_package_or_vad(tmp_path, caplog):
     assert "Silero VAD model not found" in caplog.text
 
 
+def test_initialize_explains_an_unwritable_models_volume(tmp_path, caplog, monkeypatch):
+    """A root-owned ./models bind mount: the error names the uid and the host command instead of a bare errno."""
+    vad = tmp_path / "silero_vad.onnx"
+    vad.write_bytes(b"vad")
+    backend = _backend(vad_model_path=str(vad), cache_dir="/app/models/stt/onnx-asr", device="cpu")
+    _FakeManager.instances.clear()
+
+    def denied(path, exist_ok=False):
+        raise PermissionError(13, "Permission denied", "/app/models/stt")
+
+    monkeypatch.setattr(_load("stt_backends").os, "makedirs", denied)
+    with patch.dict(
+        sys.modules,
+        {"onnx_asr": _fake_onnx_asr(), "sherpa_onnx": _fake_sherpa(), "onnxruntime": _fake_onnxruntime(["CPUExecutionProvider"])},
+    ):
+        assert backend.initialize() is False
+
+    assert _FakeManager.instances == []  # nothing was downloaded or loaded
+    assert "not writable by the container user" in caplog.text
+    assert "sudo chown -R" in caplog.text
+    assert "/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc" in caplog.text
+    assert backend._initialized is False
+
+
 def test_a_vad_segment_is_decoded_by_the_onnx_asr_model():
     backend = _backend()
     backend.recognizer = _FakeRecognizer("  Привет, мир!  ")

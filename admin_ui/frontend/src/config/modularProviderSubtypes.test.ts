@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { MODULAR_SUBTYPES, inferSubtype } from './modularProviderSubtypes';
 
+describe('modular STT provider subtypes', () => {
+    it('suggests every backend the local AI server can run, T-one and onnx-asr included', () => {
+        const local = MODULAR_SUBTYPES.stt.find(subtype => subtype.id === 'local');
+        const backendField = local?.fields.find(field => field.key === 'stt_backend');
+
+        expect(backendField?.type).toBe('combobox');
+        expect(backendField?.suggestions).toEqual(
+            expect.arrayContaining(['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp', 'tone', 'onnx_asr'])
+        );
+    });
+});
+
 describe('modular LLM provider subtypes', () => {
     it('offers a first-class DeepSeek preset with current official defaults', () => {
         const deepseek = MODULAR_SUBTYPES.llm.find(subtype => subtype.id === 'deepseek');
