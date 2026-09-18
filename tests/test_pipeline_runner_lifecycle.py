@@ -862,6 +862,54 @@ async def test_cleanup_suppresses_output_from_cancellation_resistant_llm(monkeyp
     assert call_id not in engine._pipeline_tasks
 
 
+class _StreamingOnlyStubSTT(_StreamingStubSTT):
+    """An adapter whose recognizer answers only at phrase end (onnx-asr, T-one): buffered mode cannot work."""
+
+    def __init__(self):
+        super().__init__()
+        self.asked_with = None
+
+    def requires_streaming(self, options=None):
+        self.asked_with = dict(options or {})
+        return True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runner_keeps_a_streaming_only_recognizer_streaming(monkeypatch):
+    config_data = {
+        "default_provider": "local",
+        "providers": {"local": {"enabled": True}},
+        "asterisk": {"host": "127.0.0.1", "port": 8088, "username": "u", "password": "p", "app_name": "ai-voice-agent"},
+        "llm": {"initial_greeting": "", "prompt": "You are helpful", "model": "gpt-4o"},
+        "pipelines": {"buffered": {}},
+        "active_pipeline": "buffered",
+        "audio_transport": "externalmedia",
+    }
+    engine = Engine(AppConfig(**config_data))
+    engine.pipeline_orchestrator._started = True
+    stt = _StreamingOnlyStubSTT()
+    configured_options = {"streaming": False, "chunk_ms": 80}
+    resolution = _StubResolution(stt_adapter=stt, stt_options=configured_options)
+    monkeypatch.setattr(engine.pipeline_orchestrator, "get_pipeline", lambda *args, **kwargs: resolution)
+
+    from src.core.models import CallSession
+    call_id = "call-buffered-refused"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "buffered"
+    await engine.session_store.upsert_call(session)
+    await engine._ensure_pipeline_runner(session, forced=True)
+
+    # The stream was opened (transcribe() would have raised) and the stored config was not mutated.
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+    assert stt.asked_with["streaming"] is False
+    assert stt.start_options["streaming"] is True
+    assert configured_options["streaming"] is False
+    await engine._pipeline_queues[call_id].put(b"\x00\x00" * 1280)
+    await asyncio.wait_for(stt.audio_sent.wait(), timeout=2)
+
+    await engine._cleanup_call(call_id)
+
+
 @pytest.mark.asyncio
 async def test_pipeline_runner_uses_canonical_streaming_stt_audio_contract(monkeypatch):
     config_data = {

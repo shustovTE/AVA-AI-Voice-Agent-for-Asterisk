@@ -75,6 +75,23 @@ async def _collect_async(iterator):
     return [item async for item in iterator]
 
 
+def test_local_stt_adapter_names_the_backends_that_cannot_run_buffered():
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalSTTAdapter("local_stt", app_config, provider_config, {"mode": "stt"})
+    assert adapter.requires_streaming() is False  # vosk answers per chunk
+
+    for backend in ("onnx_asr", "tone"):
+        adapter = LocalSTTAdapter(
+            "local_stt", app_config, provider_config.model_copy(update={"stt_backend": backend}), {"mode": "stt"}
+        )
+        assert adapter.requires_streaming() is True
+        assert adapter.requires_streaming({"streaming": False}) is True
+    # A per-pipeline override of the backend is honoured too.
+    assert adapter.requires_streaming({"stt_backend": "vosk"}) is False
+    assert LocalSTTAdapter("local_stt", app_config, provider_config, {}).requires_streaming({"stt_backend": "ONNX_ASR"}) is True
+
+
 @pytest.mark.asyncio
 async def test_local_stt_adapter_transcribes(monkeypatch):
     app_config = _build_app_config()

@@ -15861,6 +15861,27 @@ class Engine:
                     except Exception:
                         stt_options["chunk_ms"] = 160
 
+            if not bool(stt_options.get("streaming", True)) and streaming_supported:
+                # A recognizer that answers only when a phrase ends cannot serve the buffered
+                # path (one transcribe() per chunk, each waiting for a final): keep it streaming.
+                requires_streaming = getattr(pipeline.stt_adapter, "requires_streaming", False)
+                try:
+                    requires_streaming = (
+                        bool(requires_streaming(stt_options)) if callable(requires_streaming) else bool(requires_streaming)
+                    )
+                except Exception:
+                    requires_streaming = False
+                if requires_streaming:
+                    logger.warning(
+                        "Buffered STT (options.stt.streaming=false) is not supported by this recognizer; using streaming",
+                        call_id=call_id,
+                        component=getattr(pipeline.stt_adapter, "component_key", "unknown"),
+                        stt_backend=stt_options.get("stt_backend") or getattr(
+                            getattr(pipeline.stt_adapter, "_provider_config", None), "stt_backend", None
+                        ),
+                    )
+                    stt_options["streaming"] = True
+
             requested_streaming = bool(stt_options.get("streaming", True))
             if requested_streaming and streaming_supported:
                 configured_format = stt_options.get("stream_format")

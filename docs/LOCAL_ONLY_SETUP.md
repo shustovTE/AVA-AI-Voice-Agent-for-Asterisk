@@ -608,6 +608,7 @@ Models are **not bundled** in Docker images. Download them via:
 - Latency: about 100–300 ms per 5-second phrase on a GPU, 0.5–1.5 s on a CPU; both are added after the caller stops. Raise `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms` on the engine so the turn waits for the recognizer's final on a CPU.
 - GPU memory: the model needs about 1 GB next to whatever else uses the GPU (a vLLM on the same card must leave that much free, for example `--gpu-memory-utilization 0.85`).
 - Status shows `onnx-asr (<model>, cuda|cpu)`; the log lines are tagged `ONNX-ASR`.
+- Keep the pipeline's `options.stt.streaming` at `true` (the default for `local_stt`). The buffered mode sends 160 ms chunks and waits for a final per chunk, which a phrase-level recognizer never gives; the engine detects `stt_backend: onnx_asr` (and `tone`) in the provider block, logs `Buffered STT ... is not supported by this recognizer; using streaming` and stays streaming.
 
 **Kroko Embedded** (optional, requires rebuild):
 - `docker compose build --build-arg INCLUDE_KROKO_EMBEDDED=true local_ai_server`

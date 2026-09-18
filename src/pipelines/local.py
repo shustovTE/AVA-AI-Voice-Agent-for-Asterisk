@@ -619,6 +619,11 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
     """# Milestone7: STT adapter backed by the local AI server."""
 
     supports_streaming = True
+    # Recognizers that hand back a result only when a phrase ends (GigaAM / NeMo through onnx-asr
+    # behind the Silero VAD gate, the T-one streaming CTC pipeline): the buffered path sends 160 ms
+    # chunks and waits for a final per chunk, so it stalls for the whole response timeout each time
+    # and the dialog never receives a transcript. The engine keeps such a provider streaming.
+    STREAMING_ONLY_BACKENDS = frozenset({"onnx_asr", "tone"})
 
     def __init__(
         self,
@@ -635,6 +640,11 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             default_mode="stt",
         )
         self._resample_states: Dict[str, Optional[tuple]] = {}
+
+    def requires_streaming(self, options: Optional[Dict[str, Any]] = None) -> bool:
+        """True when the configured local STT backend cannot serve the buffered (chunked) path."""
+        backend = (options or {}).get("stt_backend") or self._provider_defaults.get("stt_backend") or ""
+        return str(backend).strip().lower() in self.STREAMING_ONLY_BACKENDS
 
     async def start_stream(
         self,
