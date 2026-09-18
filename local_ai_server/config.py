@@ -63,6 +63,27 @@ def _env_with_legacy_alias(primary: str, legacy: str, default: str) -> str:
     return default
 
 
+def normalize_onnx_asr_model(model: str, model_path: str = "") -> tuple[str, str]:
+    """Return (model name, model directory) for the onnx_asr backend.
+
+    A directory given where a model name belongs (``ONNX_ASR_MODEL=/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc``)
+    would be read by onnx-asr as a Hugging Face repo id and fail; its last component is the model name instead
+    (``__`` stands for ``/`` in the cache layout). The directory becomes the model directory only when it holds
+    files; an empty or missing one leaves the name to be downloaded into the cache as usual. A Hugging Face
+    repo id such as ``t-tech/t-one`` is a name, not a path.
+    """
+    model = (model or "").strip()
+    model_path = (model_path or "").strip()
+    looks_like_dir = bool(model) and (os.path.isabs(model) or ("/" in model and os.path.isdir(model)))
+    if looks_like_dir:
+        directory = model.rstrip("/")
+        name = os.path.basename(directory).replace("__", "/")
+        if not model_path and os.path.isdir(directory) and os.listdir(directory):
+            model_path = directory
+        model = name
+    return model, model_path
+
+
 @dataclass(frozen=True)
 class LocalAIConfig:
     runtime_mode: str = "full"
@@ -262,6 +283,9 @@ class LocalAIConfig:
             or "5000"
         )
 
+        onnx_asr_model, onnx_asr_model_path = normalize_onnx_asr_model(
+            os.getenv("ONNX_ASR_MODEL", "gigaam-v3-e2e-ctc"), os.getenv("ONNX_ASR_MODEL_PATH", "")
+        )
         return cls(
             runtime_mode=runtime_mode,
             ws_host=os.getenv("LOCAL_WS_HOST", "127.0.0.1"),
@@ -283,8 +307,8 @@ class LocalAIConfig:
             tone_model_path=os.getenv("TONE_MODEL_PATH", "/app/models/stt/t-one"),
             tone_decoder_type=(os.getenv("TONE_DECODER_TYPE", "beam_search") or "beam_search").strip().lower(),
             tone_kenlm_path=os.getenv("TONE_KENLM_PATH", ""),
-            onnx_asr_model=(os.getenv("ONNX_ASR_MODEL", "gigaam-v3-e2e-ctc") or "gigaam-v3-e2e-ctc").strip(),
-            onnx_asr_model_path=(os.getenv("ONNX_ASR_MODEL_PATH", "") or "").strip(),
+            onnx_asr_model=onnx_asr_model or "gigaam-v3-e2e-ctc",
+            onnx_asr_model_path=onnx_asr_model_path,
             onnx_asr_cache_dir=(
                 os.getenv("ONNX_ASR_CACHE_DIR", "/app/models/stt/onnx-asr") or "/app/models/stt/onnx-asr"
             ).strip(),

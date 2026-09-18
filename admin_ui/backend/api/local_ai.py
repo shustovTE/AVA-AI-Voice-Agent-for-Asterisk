@@ -238,6 +238,16 @@ def _normalize_switch_request(request: SwitchModelRequest) -> SwitchModelRequest
     return request
 
 
+
+def _onnx_asr_model_name(value: Optional[str]) -> str:
+    """The onnx-asr model name from a UI value; a container directory such as
+    /app/models/stt/onnx-asr/gigaam-v3-e2e-ctc yields its last component (``__`` stands for ``/``)."""
+    text = (value or "").strip()
+    if text.startswith("/"):
+        text = os.path.basename(text.rstrip("/")).replace("__", "/")
+    return text
+
+
 def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[Dict[str, str], Dict[str, Any]]:
     """
     Pure mapping from SwitchModelRequest -> env_updates/yaml_updates.
@@ -315,7 +325,7 @@ def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[D
                     env_updates["TONE_KENLM_PATH"] = request.tone_kenlm_path
                     yaml_updates["tone_kenlm_path"] = request.tone_kenlm_path
             elif request.backend == "onnx_asr":
-                onnx_model = (request.onnx_asr_model or request.model_path or "").strip()
+                onnx_model = _onnx_asr_model_name(request.onnx_asr_model or request.model_path)
                 if onnx_model:
                     env_updates["ONNX_ASR_MODEL"] = onnx_model
                     yaml_updates["onnx_asr_model"] = onnx_model
@@ -460,7 +470,7 @@ def _build_local_ai_ws_switch_payload(request: SwitchModelRequest) -> Optional[D
             if request.tone_kenlm_path:
                 payload["tone_kenlm_path"] = request.tone_kenlm_path
         if request.backend == "onnx_asr":
-            onnx_model = (request.onnx_asr_model or request.model_path or "").strip()
+            onnx_model = _onnx_asr_model_name(request.onnx_asr_model or request.model_path)
             if onnx_model:
                 payload["onnx_asr_model"] = onnx_model
             if request.onnx_asr_model_path is not None:
@@ -641,6 +651,8 @@ async def list_available_models():
                         if not os.path.isdir(cached_path) or not os.listdir(cached_path):
                             continue
                         model_name = cached.replace("__", "/")
+                        if model_name.startswith("/"):
+                            continue  # a cache directory named after a path, not a model
                         stt_models["onnx_asr"].append(ModelInfo(
                             id=f"onnx_asr_{cached}",
                             name=f"{model_name} (downloaded)",
@@ -1651,7 +1663,7 @@ async def rebuild_local_ai_server(request: RebuildRequest):
             elif request.stt_backend == "tone":
                 env_updates["TONE_MODEL_PATH"] = request.stt_model
             elif request.stt_backend == "onnx_asr":
-                env_updates["ONNX_ASR_MODEL"] = request.stt_model
+                env_updates["ONNX_ASR_MODEL"] = _onnx_asr_model_name(request.stt_model)
             elif request.stt_backend == "vosk":
                 env_updates["LOCAL_STT_MODEL_PATH"] = request.stt_model
 

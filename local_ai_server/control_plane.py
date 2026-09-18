@@ -4,7 +4,7 @@ import os
 from dataclasses import replace
 from typing import Any, Dict, List, Tuple
 
-from config import LocalAIConfig
+from config import LocalAIConfig, normalize_onnx_asr_model
 
 
 _STT_CONFIG_MAP = {
@@ -156,9 +156,12 @@ def apply_switch_model_request(
             new_config = replace(new_config, tone_model_path=stt_path)
             changed.append(f"tone_model_path={os.path.basename(stt_path)}")
         elif new_config.stt_backend == "onnx_asr":
-            # For onnx-asr the "model path" is the model name (auto-downloaded).
-            new_config = replace(new_config, onnx_asr_model=str(stt_path).strip())
-            changed.append(f"onnx_asr_model={str(stt_path).strip()}")
+            # For onnx-asr the "model path" is the model name (auto-downloaded); a directory
+            # given instead is taken apart into the name and, when it holds files, the directory.
+            model_name, model_dir = normalize_onnx_asr_model(str(stt_path), new_config.onnx_asr_model_path)
+            if model_name:
+                new_config = replace(new_config, onnx_asr_model=model_name, onnx_asr_model_path=model_dir)
+                changed.append(f"onnx_asr_model={model_name}")
         else:
             new_config = replace(new_config, stt_model_path=stt_path)
             changed.append(f"stt_model_path={os.path.basename(stt_path)}")
@@ -221,7 +224,9 @@ def apply_switch_model_request(
         changed.append(f"tone_kenlm_path={os.path.basename(value)}")
 
     if "onnx_asr_model" in data:
-        value = str(data["onnx_asr_model"] or "").strip()
+        value, model_dir = normalize_onnx_asr_model(str(data["onnx_asr_model"] or ""), new_config.onnx_asr_model_path)
+        if model_dir and model_dir != new_config.onnx_asr_model_path:
+            new_config = replace(new_config, onnx_asr_model_path=model_dir)
         if value:
             new_config = replace(new_config, onnx_asr_model=value)
             changed.append(f"onnx_asr_model={value}")

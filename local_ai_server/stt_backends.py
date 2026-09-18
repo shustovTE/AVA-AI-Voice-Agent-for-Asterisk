@@ -826,8 +826,20 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
         vad_min_silence_ms: int = 500,
         vad_min_speech_ms: int = 250,
     ):
-        self.model = (model or "").strip() or self.DEFAULT_MODEL
-        self.explicit_model_path = (model_path or "").strip()
+        from config import normalize_onnx_asr_model  # local import: config is light, stt_backends is not
+
+        model_name, model_dir = normalize_onnx_asr_model(model, model_path)
+        if model_name != (model or "").strip():
+            logging.warning(
+                f"⚠️ {self.LOG_TAG} - ONNX_ASR_MODEL=%r is a directory, not a model name; using %r"
+                " as the model name%s. Set ONNX_ASR_MODEL to the name and ONNX_ASR_MODEL_PATH to a directory "
+                "with the files if you meant a custom location.",
+                model,
+                model_name,
+                f" and {model_dir!r} as the model directory" if model_dir else "",
+            )
+        self.model = model_name or self.DEFAULT_MODEL
+        self.explicit_model_path = model_dir
         self.cache_dir = (cache_dir or "").strip() or self.DEFAULT_CACHE_DIR
         self.quantization = (quantization or "").strip().lower() or None
         if self.quantization in ("fp32", "float32", "none"):

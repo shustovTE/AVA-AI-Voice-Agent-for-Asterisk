@@ -163,6 +163,27 @@ def test_config_reads_the_onnx_asr_environment(monkeypatch):
     assert cfg.onnx_asr_device == "cuda"
 
 
+
+def test_config_takes_a_directory_in_onnx_asr_model_apart(monkeypatch, tmp_path):
+    """ONNX_ASR_MODEL=/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc is a directory, which onnx-asr would read as a repo id."""
+    # A missing or empty directory: the name is kept, nothing goes offline.
+    cfg = _config(monkeypatch, ONNX_ASR_MODEL=str(tmp_path / "onnx-asr" / "gigaam-v3-e2e-ctc"))
+    assert cfg.onnx_asr_model == "gigaam-v3-e2e-ctc" and cfg.onnx_asr_model_path == ""
+
+    # A directory with files becomes the model directory of the model named after it.
+    model_dir = tmp_path / "onnx-asr" / "t-tech__t-one"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text("{}")
+    cfg = _config(monkeypatch, ONNX_ASR_MODEL=str(model_dir))
+    assert cfg.onnx_asr_model == "t-tech/t-one" and cfg.onnx_asr_model_path == str(model_dir)
+
+    # An explicit ONNX_ASR_MODEL_PATH wins over the directory in the name; a repo id is a name.
+    cfg = _config(monkeypatch, ONNX_ASR_MODEL=str(model_dir), ONNX_ASR_MODEL_PATH="/data/custom")
+    assert cfg.onnx_asr_model == "t-tech/t-one" and cfg.onnx_asr_model_path == "/data/custom"
+    cfg = _config(monkeypatch, ONNX_ASR_MODEL="alphacep/vosk-model-ru")
+    assert cfg.onnx_asr_model == "alphacep/vosk-model-ru" and cfg.onnx_asr_model_path == ""
+
+
 # --- the backend --------------------------------------------------------------------
 
 
@@ -420,6 +441,31 @@ def test_the_registry_advertises_the_backend():
     assert stt_pkg is not None
 
 
+
+def test_the_control_plane_takes_a_directory_given_as_the_model_apart(tmp_path):
+    config = _load("config")
+    control_plane = _load("control_plane")
+    cfg = config.LocalAIConfig(stt_backend="onnx_asr")
+
+    by_path, changed = control_plane.apply_switch_model_request(cfg, {"stt_model_path": "/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc"})
+    assert by_path.onnx_asr_model == "gigaam-v3-e2e-ctc" and by_path.onnx_asr_model_path == ""
+    assert "onnx_asr_model=gigaam-v3-e2e-ctc" in changed
+
+    model_dir = tmp_path / "gigaam-v3-rnnt"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+    by_model, changed = control_plane.apply_switch_model_request(cfg, {"onnx_asr_model": str(model_dir)})
+    assert by_model.onnx_asr_model == "gigaam-v3-rnnt" and by_model.onnx_asr_model_path == str(model_dir)
+
+
+def test_the_backend_warns_about_a_directory_given_as_the_model(caplog):
+    backend = _backend(model="/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc", cache_dir="/app/models/stt/onnx-asr")
+    assert backend.model == "gigaam-v3-e2e-ctc"
+    assert backend.explicit_model_path == ""
+    assert backend.model_dir == "/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc"
+    assert "is a directory, not a model name" in caplog.text
+
+
 # --- the Admin UI backend --------------------------------------------------------------
 
 
@@ -455,6 +501,15 @@ class TestAdminUi:
         # The explicit model field wins over the generic path; unset knobs are not sent.
         req = api.SwitchModelRequest(model_type="stt", backend="onnx_asr", model_path="x", onnx_asr_model="gigaam-v3-ctc")
         assert api._build_local_ai_ws_switch_payload(req) == {"type": "switch_model", "stt_backend": "onnx_asr", "onnx_asr_model": "gigaam-v3-ctc"}
+
+        # A container directory sent where the name belongs (the cache layout, or a hand-typed path)
+        # is reduced to the model name; the env never carries a path in ONNX_ASR_MODEL.
+        req = api.SwitchModelRequest(model_type="stt", backend="onnx_asr", model_path="/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc")
+        env, yaml_updates = api._build_local_ai_env_and_yaml_updates(req)
+        assert env["ONNX_ASR_MODEL"] == "gigaam-v3-e2e-ctc" and "ONNX_ASR_MODEL_PATH" not in env
+        assert yaml_updates["onnx_asr_model"] == "gigaam-v3-e2e-ctc"
+        assert api._build_local_ai_ws_switch_payload(req)["onnx_asr_model"] == "gigaam-v3-e2e-ctc"
+        assert api._onnx_asr_model_name("/app/models/stt/onnx-asr/t-tech__t-one/") == "t-tech/t-one"
 
     def test_rebuild_request_and_build_arg_maps_know_the_backend(self):
         api = self._api()
