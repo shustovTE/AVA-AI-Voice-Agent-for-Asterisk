@@ -60,7 +60,8 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
         pip install --no-cache-dir vosk==0.3.45; \
     fi
 
-RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
+# sherpa-onnx also provides the Silero VAD gate of the onnx_asr backend, so INCLUDE_ONNX_ASR=true pulls it in.
+RUN if [ "$INCLUDE_SHERPA" = "true" ] || [ "$INCLUDE_ONNX_ASR" = "true" ]; then \
         SHERPA_REQUIREMENT="$(grep -m 1 '^sherpa-onnx==' requirements.txt || true)"; \
         if [ -z "$SHERPA_REQUIREMENT" ]; then \
             echo "❌ INCLUDE_SHERPA=true but requirements.txt has no sherpa-onnx entry" >&2; \

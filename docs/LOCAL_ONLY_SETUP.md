@@ -596,7 +596,7 @@ Models are **not bundled** in Docker images. Download them via:
 - Recommended for Russian community validation when you want the upstream T-one path instead of Sherpa/Whisper.
 
 **GigaAM v3 / NeMo FastConformer RU via onnx-asr** (Russian, offline, VAD-gated; GPU recommended):
-- Requires rebuild: `docker compose build --build-arg INCLUDE_ONNX_ASR=true local_ai_server` (the GPU image, `docker-compose.gpu.yml`, installs `onnxruntime-gpu`; the CPU image installs the CPU runtime)
+- Requires rebuild: `docker compose build --build-arg INCLUDE_ONNX_ASR=true local_ai_server` (the GPU image, `docker-compose.gpu.yml`, installs `onnxruntime-gpu`; the CPU image installs the CPU runtime). `sherpa-onnx`, which provides the Silero VAD gate, is installed along with it, so `INCLUDE_SHERPA` may stay off.
 - Set `LOCAL_STT_BACKEND=onnx_asr` and pick the model with `ONNX_ASR_MODEL`:
   - `gigaam-v3-e2e-ctc` (default; punctuation and number normalization built in, fastest), `gigaam-v3-e2e-rnnt` (slightly more accurate, slower)
   - `gigaam-v3-ctc`, `gigaam-v3-rnnt` (plain lowercase text)
