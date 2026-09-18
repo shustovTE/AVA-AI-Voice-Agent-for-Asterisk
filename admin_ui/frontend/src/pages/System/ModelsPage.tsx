@@ -61,7 +61,11 @@ interface DownloadProgress {
 }
 
 interface ActiveModels {
-    stt: { backend: string; path: string; loaded: boolean; display?: string; language?: string | null; device?: string | null; compute_type?: string | null; sherpa_model_type?: string | null; tone_decoder_type?: string | null };
+    stt: {
+        backend: string; path: string; loaded: boolean; display?: string; language?: string | null; device?: string | null;
+        compute_type?: string | null; sherpa_model_type?: string | null; tone_decoder_type?: string | null;
+        onnx_asr_model?: string | null; onnx_asr_device?: string | null; onnx_asr_quantization?: string | null;
+    };
     tts: { backend: string; path: string; loaded: boolean; display?: string };
     llm: {
         path: string;
@@ -217,6 +221,9 @@ const ModelsPage = () => {
                 compute_type: details?.models?.stt?.compute_type || null,
                 sherpa_model_type: details?.models?.stt?.sherpa_model_type || null,
                 tone_decoder_type: details?.models?.stt?.tone_decoder_type || null,
+                onnx_asr_model: details?.models?.stt?.onnx_asr_model || null,
+                onnx_asr_device: details?.models?.stt?.onnx_asr_device || null,
+                onnx_asr_quantization: details?.models?.stt?.onnx_asr_quantization || null,
             },
             tts: {
                 backend: details?.models?.tts?.backend || 'unknown',
@@ -1362,7 +1369,7 @@ const ModelsPage = () => {
                                                         </label>
                                                         <select
                                                             className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.onnx_asr_device ? 'border-yellow-500' : 'border-border'}`}
-                                                            value={pendingSttExtra.onnx_asr_device ?? (activeModels.stt as any).onnx_asr_device ?? 'auto'}
+                                                            value={pendingSttExtra.onnx_asr_device ?? activeModels.stt.onnx_asr_device ?? 'auto'}
                                                             onChange={(e) => {
                                                                 setPendingSttExtra(prev => ({ ...prev, onnx_asr_device: e.target.value }));
                                                                 if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
@@ -1378,7 +1385,7 @@ const ModelsPage = () => {
                                                         <label className="text-[10px] text-muted-foreground">Quantization</label>
                                                         <select
                                                             className={`w-full text-xs p-1.5 rounded border bg-background ${pendingSttExtra.onnx_asr_quantization !== undefined ? 'border-yellow-500' : 'border-border'}`}
-                                                            value={pendingSttExtra.onnx_asr_quantization ?? ((activeModels.stt as any).onnx_asr_quantization === 'int8' ? 'int8' : '')}
+                                                            value={pendingSttExtra.onnx_asr_quantization ?? (activeModels.stt.onnx_asr_quantization === 'int8' ? 'int8' : '')}
                                                             onChange={(e) => {
                                                                 setPendingSttExtra(prev => ({ ...prev, onnx_asr_quantization: e.target.value }));
                                                                 if (!pendingChanges.stt) setPendingChanges(prev => ({ ...prev, stt: selectedStt }));
