@@ -632,7 +632,47 @@ class NoInputWatchdog:
             _NO_INPUT_EVENTS.labels("watchdog_error").inc()
 
     async def _finish_for_stall(self, state: _CallState) -> None:
-        """Hang up a call in which nothing has been exchanged for the stall timeout."""
+        """Speak the final message, then hang up a call in which nothing has been exchanged for the stall timeout."""
+        exchange_before = state.last_exchange_at
+        if state.policy.final_message:
+            state.phase = "stall_announcement"
+            state.deadline = None
+            state.self_announcement = True
+            logger.info(
+                "Conversation stalled; speaking the final message",
+                call_id=state.call_id,
+                stall_timeout_sec=state.policy.stall_timeout_sec,
+                since_exchange_sec=round(self._clock() - state.last_exchange_at, 1),
+                last_exchange_source=state.last_exchange_source,
+                caller_sound_active=state.input_active,
+            )
+            try:
+                spoken = await self._announce(
+                    state.call_id,
+                    state.policy.final_message,
+                    "final",
+                )
+                if not spoken:
+                    _NO_INPUT_EVENTS.labels("announcement_failed").inc()
+            except Exception:
+                logger.error(
+                    "Conversation stall final announcement failed",
+                    call_id=state.call_id,
+                    exc_info=True,
+                )
+                _NO_INPUT_EVENTS.labels("announcement_failed").inc()
+            finally:
+                state.self_announcement = False
+
+            # A caller turn handed to the model during the announcement is an
+            # exchange: the conversation moved after all, so the call goes on.
+            if state.last_exchange_at > exchange_before:
+                state.phase = "waiting"
+                state.output_active = False
+                self._reset_initial_deadline(state)
+                _NO_INPUT_EVENTS.labels("caller_resumed").inc()
+                return
+
         state.terminal = True
         state.phase = "stall_hangup"
         state.deadline = None

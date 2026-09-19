@@ -900,10 +900,43 @@ async def test_stall_timer_hangs_up_while_the_line_carries_sound():
         await watchdog.note_activity("music", "engine:silero_vad_barge_in")
         assert hangups == []
         await _wait_until(lambda: hangups == ["music"])
-        assert announcements == []
+        assert announcements == ["final"]  # the final message is spoken before the hangup
         assert watchdog.snapshot("music")["phase"] == "stall_hangup"
     finally:
         await watchdog.stop("music")
+
+
+@pytest.mark.asyncio
+async def test_a_caller_turn_during_the_stall_final_message_keeps_the_call_alive():
+    hangups = []
+    phases_seen = []
+
+    async def announce(call_id, text, kind):
+        phases_seen.append(watchdog.snapshot(call_id)["phase"])
+        if len(phases_seen) == 1:
+            # The recognizer hands the model a caller turn while the final message plays.
+            await watchdog.note_processing(call_id, True)
+            await watchdog.note_processing(call_id, False)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    policy = NoInputPolicy(initial_timeout_sec=10, grace_timeout_sec=10, stall_timeout_sec=0.06)
+    await watchdog.register("late", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("late")
+        await _wait_until(lambda: phases_seen == ["stall_announcement"])
+        await asyncio.sleep(0.04)
+        assert hangups == []
+        assert watchdog.snapshot("late")["phase"] == "waiting"
+        assert watchdog.has_call("late") is True
+        # Nothing exchanged afterwards: the stall timer counts again from that turn and fires.
+        await _wait_until(lambda: hangups == ["late"])
+        assert phases_seen == ["stall_announcement", "stall_announcement"]
+    finally:
+        await watchdog.stop("late")
 
 
 @pytest.mark.asyncio
@@ -925,7 +958,7 @@ async def test_stall_timer_runs_for_outbound_calls_without_check_ins():
         assert watchdog.snapshot("outbound")["inactivity_enabled"] is False
         await watchdog.mark_ready("outbound")
         await _wait_until(lambda: hangups == ["outbound"])
-        assert announcements == []
+        assert announcements == ["final"]
     finally:
         await watchdog.stop("outbound")
 

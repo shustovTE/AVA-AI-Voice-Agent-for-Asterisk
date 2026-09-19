@@ -15368,6 +15368,28 @@ class Engine:
             if getattr(session, "pipeline_name", None) and getattr(self, "pipeline_orchestrator", None):
                 pipeline = self.pipeline_orchestrator.get_pipeline(call_id, session.pipeline_name)
             if pipeline and getattr(pipeline, "tts_adapter", None):
+                if self._pipeline_tts_uses_streaming(pipeline):
+                    # The same negotiated media stream (AudioSocket / ExternalMedia) as
+                    # every reply. The file player below needs the media directory on
+                    # the Asterisk host, which a split-server deployment does not have,
+                    # and it takes 8 kHz mu-law only.
+                    await self._stream_pipeline_tts_text(
+                        call_id,
+                        session,
+                        pipeline,
+                        message,
+                        playback_type=f"no-input-{kind}",
+                    )
+                    session = await self.session_store.get_by_call_id(call_id)
+                    if session:
+                        session.conversation_history.append({
+                            **_ts_msg("assistant", message),
+                            "event": f"no_input_{kind}",
+                        })
+                        await self._save_session(session)
+                    await asyncio.sleep(0.25)
+                    delivery_complete = True
+                    return True
                 audio = bytearray()
                 async for chunk in pipeline.tts_adapter.synthesize(
                     call_id,
