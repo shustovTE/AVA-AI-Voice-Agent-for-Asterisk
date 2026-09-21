@@ -178,6 +178,15 @@ const STT_SUBTYPES: ProviderSubtype[] = [
       { key: 'auth_token', label: 'Auth Token', type: 'password', required: false },
       { key: 'stt_backend', label: 'STT Backend', type: 'combobox', required: false, default: 'vosk', suggestions: ['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp', 'tone', 'onnx_asr'] },
       { key: 'chunk_ms', label: 'Chunk Size (ms)', type: 'number', required: false, default: 320 },
+      {
+        key: 'stt_input_resampler',
+        label: 'Input Upsampler (8 → 16 kHz)',
+        type: 'combobox',
+        required: false,
+        default: 'fir',
+        suggestions: ['fir', 'linear'],
+        tooltip: 'How 8 kHz caller audio is brought to the 16 kHz the recognizer decodes: fir (polyphase windowed-sinc, flat telephone band, no spectral images; recommended) or linear (the previous interpolation, which mirrors the band above 4 kHz).',
+      },
     ],
   },
 ];

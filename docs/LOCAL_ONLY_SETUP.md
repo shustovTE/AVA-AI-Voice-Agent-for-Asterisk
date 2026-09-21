@@ -576,12 +576,14 @@ Models are **not bundled** in Docker images. Download them via:
 - `sherpa-onnx-zipformer-ru-2024-09-18` (Russian follow-up after English passes)
 - Use with `SHERPA_MODEL_TYPE=offline`
 - Offline mode requires a non-streaming transducer model. Do not point offline mode at `sherpa-onnx-streaming-*` models.
-- Typical offline tuning knobs:
+- Typical offline tuning knobs (shared with the `onnx_asr` backend; all on the Env page under the backend's settings):
   - `SHERPA_VAD_MODEL_PATH=/app/models/vad/silero_vad.onnx`
   - `SHERPA_VAD_THRESHOLD=0.35`
   - `SHERPA_VAD_MIN_SILENCE_MS=700`
   - `SHERPA_VAD_MIN_SPEECH_MS=200`
-  - `SHERPA_OFFLINE_PREROLL_MS=350`
+  - `SHERPA_OFFLINE_PREROLL_MS=350` and `SHERPA_OFFLINE_POSTROLL_MS=300`: stream audio taken before the VAD's start and after its end of a phrase (see *Phrase segmenting* below)
+  - `SHERPA_OFFLINE_NORMALIZE_DBFS=-20` and `SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB=24`: loudness each phrase is brought to before decoding (`0` turns it off)
+  - `LOCAL_STT_RESAMPLER=fir`: how 8 kHz client audio is brought to 16 kHz (`ratecv` restores the linear interpolation)
   - `SHERPA_OFFLINE_DEBUG_SEGMENTS=true` for targeted diagnostics only
 - See [Sherpa-ONNX Models](https://github.com/k2-fsa/sherpa-onnx/releases)
 
@@ -604,7 +606,13 @@ Models are **not bundled** in Docker images. Download them via:
   - any other name the [onnx-asr](https://github.com/istupakov/onnx-asr) package knows (for example `gigaam-multilingual-ctc`)
 - The model (about 1 GB in fp32) is downloaded from Hugging Face by the server on first start into `ONNX_ASR_CACHE_DIR` (`/app/models/stt/onnx-asr/<model>`, on the `./models` volume, so it is kept across restarts). To skip the download, place the files (`config.json`, the `.onnx`, the vocabulary) in a directory and set `ONNX_ASR_MODEL_PATH`.
 - `ONNX_ASR_DEVICE=auto` runs on CUDA when `onnxruntime-gpu` sees a GPU and on the CPU otherwise; `ONNX_ASR_QUANTIZATION=int8` takes a quarter of the memory and is faster on a CPU.
-- These models decode whole phrases: the caller's audio is cut into phrases by the same Silero VAD gate as Sherpa offline (`SHERPA_VAD_MODEL_PATH`, `SHERPA_VAD_THRESHOLD`, `SHERPA_VAD_MIN_SILENCE_MS`, `SHERPA_VAD_MIN_SPEECH_MS`, `SHERPA_OFFLINE_PREROLL_MS` apply; the VAD model is downloaded automatically), and each phrase is recognized once the caller pauses. There are no partial results; the engine's own Silero VAD still decides the end of the caller's turn and barge-in.
+- These models decode whole phrases: the caller's audio is cut into phrases by the same Silero VAD gate as Sherpa offline (`SHERPA_VAD_MODEL_PATH`, `SHERPA_VAD_THRESHOLD`, `SHERPA_VAD_MIN_SILENCE_MS`, `SHERPA_VAD_MIN_SPEECH_MS` apply; the VAD model is downloaded automatically), widened and normalized as described under *Phrase segmenting* below, and each phrase is recognized once the caller pauses. There are no partial results; the engine's own Silero VAD still decides the end of the caller's turn and barge-in. GigaAM v3 has no voice activity detection of its own.
+- Short replies («да», «нет», a number) are where these models err most. Start from `SHERPA_VAD_THRESHOLD=0.28`, `SHERPA_VAD_MIN_SPEECH_MS=120`, keep `SHERPA_VAD_MIN_SILENCE_MS=700`, and compare `gigaam-v3-e2e-rnnt` against the default CTC model on the same calls; the `VAD segment[...]` log lines show each phrase's duration, the pre-/post-roll added, the gain applied and its level.
+
+**Phrase segmenting** (Sherpa offline and `onnx_asr`):
+- The Silero VAD opens a phrase about 64 ms before the first window it called speech and closes it where the closing silence began, so the phrase alone starts abruptly and ends before the last consonant has decayed. The server keeps the recent stream per session by absolute sample position and widens every phrase with the audio that really came before it (`SHERPA_OFFLINE_PREROLL_MS`, 350) and after it (`SHERPA_OFFLINE_POSTROLL_MS`, 300; at most the min-silence window is available, and a phrase flushed at the end of the stream is padded with silence). The VAD is recreated after every final; the stream memory is not, so the pre-roll of the next phrase is real audio.
+- Telephone audio often reaches the recognizer at −35…−45 dBFS. Each phrase is brought to `SHERPA_OFFLINE_NORMALIZE_DBFS` (−20 dBFS RMS, measured on the speech part; the gain applies to the whole widened phrase) with at most `SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB` (24) of boost and peaks kept below full scale. `0` turns the normalization off.
+- The engine's local provider brings the caller's 8 kHz audio to 16 kHz before sending it; it now uses a polyphase windowed-sinc FIR (`providers.<name>.stt_input_resampler: fir`, the default; `linear` restores the previous interpolation, which rolled the band off by 2–3 dB at 3 kHz and mirrored it above 4 kHz). A client that still sends 8 kHz to the server gets the same FIR there (`LOCAL_STT_RESAMPLER=fir`; `ratecv` keeps `audioop`'s interpolation).
 - Latency: about 100–300 ms per 5-second phrase on a GPU, 0.5–1.5 s on a CPU; both are added after the caller stops. Raise `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms` on the engine so the turn waits for the recognizer's final on a CPU.
 - GPU memory: the model needs about 1 GB next to whatever else uses the GPU (a vLLM on the same card must leave that much free, for example `--gpu-memory-utilization 0.85`).
 - Status shows `onnx-asr (<model>, cuda|cpu)`; the log lines are tagged `ONNX-ASR`.

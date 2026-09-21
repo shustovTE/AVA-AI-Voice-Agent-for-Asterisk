@@ -24,7 +24,27 @@ _PCM_SAMPLE_WIDTH = 2
 _BANDLIMITED_STATE_TAG = "bandlimited_fir_v1"
 _BANDLIMITED_FILTER_TAPS = 255
 _BANDLIMITED_CUTOFF_FRACTION_OF_TARGET = 0.45
+# Polyphase interpolation filter for integer upsampling (``mode="fir"``): a
+# Kaiser-windowed sinc with the cut-off at the source Nyquist frequency, so the
+# spectral images that linear interpolation lets through (a 3 kHz phone tone
+# mirrored to 5 kHz at about -13 dB) are removed while the telephone band stays
+# flat. 48 taps per output phase: about 90 dB of image rejection at a 3 ms delay.
+_FIR_UPSAMPLE_STATE_TAG = "fir_upsample_v1"
+_FIR_UPSAMPLE_TAPS_PER_PHASE = 48
+_FIR_UPSAMPLE_KAISER_BETA = 8.0
 OUTPUT_RESAMPLER_MODES = frozenset({"linear", "bandlimited"})
+RESAMPLE_MODES = frozenset({"linear", "bandlimited", "fir"})
+# How the local provider brings 8 kHz caller audio to the recognizer's 16 kHz.
+STT_INPUT_RESAMPLER_MODES = frozenset({"fir", "linear"})
+DEFAULT_STT_INPUT_RESAMPLER = "fir"
+
+
+def resolve_stt_input_resampler(raw_value: Optional[str]) -> str:
+    """Return the STT ingress upsampler mode, ``fir`` unless ``linear`` is asked for."""
+    value = str(raw_value or "").strip().lower()
+    if value in STT_INPUT_RESAMPLER_MODES:
+        return value
+    return DEFAULT_STT_INPUT_RESAMPLER
 
 
 def resolve_output_resampler_policy(
@@ -122,6 +142,70 @@ def _resample_bandlimited_integer_downsample(
     return resampled.tobytes(), new_state
 
 
+@lru_cache(maxsize=16)
+def _fir_upsample_phases(factor: int) -> tuple:
+    """Polyphase components of the interpolation low-pass for an integer ``factor``.
+
+    The prototype is designed at the target rate with the cut-off at the source
+    Nyquist frequency (``0.5 / factor`` cycles per output sample), Kaiser-windowed,
+    and scaled to a DC gain of ``factor`` to make up for the zero-stuffing it
+    stands in for. Phase ``p`` holds every ``factor``-th tap starting at ``p``:
+    output sample ``n * factor + p`` is the dot product of phase ``p`` with the
+    source samples ``x[n], x[n-1], ...``.
+    """
+    n_taps = factor * _FIR_UPSAMPLE_TAPS_PER_PHASE
+    center = (n_taps - 1) / 2.0
+    positions = np.arange(n_taps, dtype=np.float64) - center
+    cutoff_cycles_per_sample = 0.5 / factor
+    taps = 2.0 * cutoff_cycles_per_sample * np.sinc(2.0 * cutoff_cycles_per_sample * positions)
+    taps *= np.kaiser(n_taps, _FIR_UPSAMPLE_KAISER_BETA)
+    taps *= factor / np.sum(taps)
+    phases = []
+    for phase in range(factor):
+        component = np.ascontiguousarray(taps[phase::factor])
+        component.setflags(write=False)
+        phases.append(component)
+    return tuple(phases)
+
+
+def _resample_fir_integer_upsample(
+    audio: np.ndarray,
+    source_rate: int,
+    target_rate: int,
+    state: Optional[tuple],
+) -> Tuple[bytes, tuple]:
+    """Stateful polyphase FIR interpolation by an integer factor (8 kHz -> 16 kHz)."""
+    factor = target_rate // source_rate
+    phases = _fir_upsample_phases(factor)
+    history_size = _FIR_UPSAMPLE_TAPS_PER_PHASE - 1
+    history = np.zeros(history_size, dtype=np.float64)
+
+    if (
+        isinstance(state, tuple)
+        and len(state) == 4
+        and state[0] == _FIR_UPSAMPLE_STATE_TAG
+        and state[1] == source_rate
+        and state[2] == target_rate
+    ):
+        try:
+            candidate_history = np.asarray(state[3], dtype=np.float64)
+            if candidate_history.shape == (history_size,):
+                history = candidate_history
+        except (TypeError, ValueError):
+            history = np.zeros(history_size, dtype=np.float64)
+
+    extended = np.concatenate((history, audio))
+    resampled = np.empty(len(audio) * factor, dtype=np.float64)
+    for phase, taps in enumerate(phases):
+        # ``valid`` with the history prepended yields one output per source
+        # sample, each looking back over the previous ``taps`` source samples.
+        resampled[phase::factor] = np.convolve(extended, taps, mode="valid")
+    new_history = extended[-history_size:].copy()
+    new_state = (_FIR_UPSAMPLE_STATE_TAG, source_rate, target_rate, new_history)
+    resampled = np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
+    return resampled.tobytes(), new_state
+
+
 def mulaw_to_pcm16le(data: bytes) -> bytes:
     """
     Convert μ-law audio data (8-bit) to PCM16 little-endian samples.
@@ -176,6 +260,11 @@ def resample_audio(
     downsampling. Non-integer ratios and upsampling retain the legacy linear
     behavior so this experimental mode cannot disrupt unsupported paths.
 
+    ``mode="fir"`` is alias-safe in both directions for integer ratios: integer
+    upsampling runs a stateful polyphase windowed-sinc interpolator (no spectral
+    images, flat telephone band, about 3 ms of delay), integer downsampling is
+    the ``bandlimited`` path, and non-integer ratios fall back to linear.
+
     The state tuple carries ``(prev_last_sample_float,)`` so that the
     boundary between consecutive chunks is interpolated correctly.
 
@@ -198,9 +287,9 @@ def resample_audio(
             f"got sample_width={sample_width}."
         )
     normalized_mode = str(mode or "linear").strip().lower()
-    if normalized_mode not in ("linear", "bandlimited"):
+    if normalized_mode not in RESAMPLE_MODES:
         raise ValueError(
-            f"Unsupported resample mode {mode!r}; expected 'linear' or 'bandlimited'."
+            f"Unsupported resample mode {mode!r}; expected 'linear', 'bandlimited' or 'fir'."
         )
     if not pcm_bytes or source_rate == target_rate:
         return pcm_bytes, state
@@ -208,13 +297,19 @@ def resample_audio(
     audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
     n_in = len(audio)
     if (
-        normalized_mode == "bandlimited"
+        normalized_mode in ("bandlimited", "fir")
         and source_rate > target_rate
         and source_rate % target_rate == 0
     ):
         return _resample_bandlimited_integer_downsample(
             audio, source_rate, target_rate, state
         )
+    if (
+        normalized_mode == "fir"
+        and target_rate > source_rate
+        and target_rate % source_rate == 0
+    ):
+        return _resample_fir_integer_upsample(audio, source_rate, target_rate, state)
 
     n_out = int(round(n_in * target_rate / source_rate))
     if n_out == 0:

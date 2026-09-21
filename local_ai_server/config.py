@@ -34,6 +34,14 @@ def _parse_int(raw: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _parse_stt_resampler(raw: Optional[str]) -> str:
+    """``LOCAL_STT_RESAMPLER``: ``fir`` (polyphase windowed-sinc) unless ``ratecv`` is asked for."""
+    value = (raw or "").strip().lower()
+    if value in ("fir", "ratecv"):
+        return value
+    return "fir"
+
+
 def llama_chat_format_override(raw: Optional[str]) -> Optional[str]:
     """Return the explicit llama.cpp chat handler, if one was requested.
 
@@ -104,6 +112,14 @@ class LocalAIConfig:
     sherpa_vad_min_silence_ms: int = 700
     sherpa_vad_min_speech_ms: int = 200
     sherpa_offline_preroll_ms: int = 350
+    # VAD-gated offline recognizers (Sherpa offline, onnx-asr): audio kept after a
+    # segment's end, the loudness a segment is brought to before decoding (RMS of
+    # its speech part in dBFS; 0 turns it off) with the largest boost allowed, and
+    # how 8 kHz client audio is brought to 16 kHz (fir | ratecv).
+    sherpa_offline_postroll_ms: int = 300
+    sherpa_offline_normalize_dbfs: float = -20.0
+    sherpa_offline_normalize_max_gain_db: float = 24.0
+    local_stt_resampler: str = "fir"
     tone_model_path: str = "/app/models/stt/t-one"
     tone_decoder_type: str = "beam_search"
     tone_kenlm_path: str = ""
@@ -304,6 +320,12 @@ class LocalAIConfig:
             sherpa_vad_min_silence_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SILENCE_MS"), 700),
             sherpa_vad_min_speech_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SPEECH_MS"), 200),
             sherpa_offline_preroll_ms=_parse_int(os.getenv("SHERPA_OFFLINE_PREROLL_MS"), 350),
+            sherpa_offline_postroll_ms=_parse_int(os.getenv("SHERPA_OFFLINE_POSTROLL_MS"), 300),
+            sherpa_offline_normalize_dbfs=_parse_float(os.getenv("SHERPA_OFFLINE_NORMALIZE_DBFS"), -20.0),
+            sherpa_offline_normalize_max_gain_db=_parse_float(
+                os.getenv("SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB"), 24.0
+            ),
+            local_stt_resampler=_parse_stt_resampler(os.getenv("LOCAL_STT_RESAMPLER")),
             tone_model_path=os.getenv("TONE_MODEL_PATH", "/app/models/stt/t-one"),
             tone_decoder_type=(os.getenv("TONE_DECODER_TYPE", "beam_search") or "beam_search").strip().lower(),
             tone_kenlm_path=os.getenv("TONE_KENLM_PATH", ""),

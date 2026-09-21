@@ -922,6 +922,7 @@ Config notes:
 ### Local provider (pipelines)
 
 - Local STT/LLM/TTS parameters live under pipeline `options`. The engine plays `llm.initial_greeting` first if configured.
+- `providers.<name>.stt_input_resampler`: how the caller's 8 kHz audio is brought to the 16 kHz the local recognizers decode before it is sent to the Local AI Server. `fir` (default) is a polyphase windowed-sinc interpolator: flat telephone band, no spectral images, about 3 ms of delay. `linear` restores the previous interpolation, which rolls the band off by 2–3 dB at 3 kHz and mirrors it above 4 kHz (a 3 kHz tone at 5 kHz, about −13 dB), which an offline recognizer such as GigaAM v3 sees in its features. Applies to the `local` STT provider of a pipeline and to the full local agent; the Providers page exposes it as **STT Input Upsampler**.
 
 ### Google Live (monolithic agent)
 

@@ -92,8 +92,9 @@ def _fake_onnxruntime(providers):
 
 
 class _FakeSpeechSegment:
-    def __init__(self, samples):
+    def __init__(self, samples, start=0):
         self.samples = samples
+        self.start = start  # sherpa-onnx: the segment's first sample, counted from the VAD's first sample
 
 
 class _FakeVAD:
@@ -189,7 +190,15 @@ def test_config_takes_a_directory_in_onnx_asr_model_apart(monkeypatch, tmp_path)
 
 def test_the_backend_is_the_offline_vad_gate_with_an_onnx_asr_model():
     sb = _load("stt_backends")
-    backend = _backend(preroll_ms=350, vad_threshold=0.35, vad_min_silence_ms=700, vad_min_speech_ms=200)
+    backend = _backend(
+        preroll_ms=350,
+        vad_threshold=0.35,
+        vad_min_silence_ms=700,
+        vad_min_speech_ms=200,
+        postroll_ms=300,
+        normalize_dbfs=-20,
+        normalize_max_gain_db=18,
+    )
 
     assert isinstance(backend, sb.SherpaOfflineSTTBackend)
     assert backend.LOG_TAG == "ONNX-ASR"
@@ -198,6 +207,13 @@ def test_the_backend_is_the_offline_vad_gate_with_an_onnx_asr_model():
     assert backend.quantization is None
     assert backend.device == "auto"
     assert (backend.preroll_ms, backend.vad_threshold, backend.vad_min_silence_ms, backend.vad_min_speech_ms) == (350, 0.35, 700, 200)
+    assert (backend.postroll_ms, backend.normalize_dbfs, backend.normalize_max_gain_db) == (300, -20.0, 18.0)
+    # The decode floor follows the VAD's own minimum, so a phrase the VAD accepted is never dropped.
+    assert backend._min_audio_length == 3200
+    assert backend.tuning_summary() == (
+        "(preroll_ms=350 postroll_ms=300 threshold=0.35 min_silence_ms=700 min_speech_ms=200 "
+        "normalize_dbfs=-20.0 max_gain_db=18)"
+    )
     # The Sherpa offline backend keeps its own tag.
     assert sb.SherpaOfflineSTTBackend.LOG_TAG == "SHERPA-OFFLINE"
 
@@ -336,6 +352,107 @@ def test_finalize_flushes_the_vad_and_decodes_the_trailing_speech():
     assert backend.finalize(vad) == {"type": "final", "text": "до свидания"}
     assert vad.flushed is True
     assert backend.finalize(_FakeVAD()) is None
+
+
+def _ready_backend(text="да", **overrides):
+    backend = _backend(**overrides)
+    backend.recognizer = _FakeRecognizer(text)
+    backend._vad_config = "fake"
+    backend._initialized = True
+    return backend
+
+
+def _pcm16(value: float, samples: int) -> bytes:
+    return np.full(samples, int(value * 32768), dtype=np.int16).tobytes()
+
+
+def test_a_segment_is_widened_with_the_stream_audio_around_it_before_decoding():
+    """Pre-roll is what the caller said before the VAD opened, post-roll what followed the VAD's cut.
+
+    Both come from the session's stream memory by absolute position, not from the
+    tail of the stream (which, when a segment is closed, is the silence that closed it).
+    """
+    backend = _ready_backend(preroll_ms=100, postroll_ms=50)
+    context = backend.create_session_context()
+    context.bind_vad()
+    # 100 ms "before" at 0.25, 500 ms of speech at 0.5, 100 ms "after" at -0.25, all through an empty VAD.
+    stream = _pcm16(0.25, 1600) + _pcm16(0.5, 8000) + _pcm16(-0.25, 1600)
+    assert backend.process_audio(_FakeVAD(), stream, context) is None
+    assert context.total_samples == 11200
+
+    speech = np.full(8000, 0.5, dtype=np.float32).tolist()
+    result = backend.process_audio(_FakeVAD([_FakeSpeechSegment(speech, start=1600)]), b"", context)
+
+    assert result == {"type": "final", "text": "да"}
+    waveform, _ = backend.recognizer.calls[0]
+    assert len(waveform) == 1600 + 8000 + 800
+    assert np.allclose(waveform[:1600], 0.25, atol=1e-4)  # 100 ms of pre-roll from before the phrase
+    assert np.allclose(waveform[1600:9600], 0.5, atol=1e-4)  # the VAD's own speech
+    assert np.allclose(waveform[9600:], -0.25, atol=1e-4)  # 50 ms of post-roll from after it
+
+
+def test_a_vad_created_after_a_final_is_mapped_onto_the_stream_where_it_started():
+    """The server recreates the VAD after every final; its sample 0 sits where the stream is by then."""
+    backend = _ready_backend(preroll_ms=100, postroll_ms=0)
+    context = backend.create_session_context()
+    context.bind_vad()
+    assert backend.process_audio(_FakeVAD(), _pcm16(0.1, 16_000), context) is None  # one second, first VAD
+    context.bind_vad()  # a new VAD: its sample 0 is stream sample 16000
+    assert backend.process_audio(_FakeVAD(), _pcm16(0.3, 16_000), context) is None
+
+    speech = np.full(4000, 0.5, dtype=np.float32).tolist()
+    backend.process_audio(_FakeVAD([_FakeSpeechSegment(speech, start=800)]), b"", context)
+
+    waveform, _ = backend.recognizer.calls[0]
+    # The segment starts at stream sample 16800; its 1600-sample pre-roll spans both seconds.
+    assert len(waveform) == 1600 + 4000
+    assert np.allclose(waveform[:800], 0.1, atol=1e-4)
+    assert np.allclose(waveform[800:1600], 0.3, atol=1e-4)
+
+
+def test_finalize_pads_the_post_roll_of_a_flushed_segment_with_silence():
+    """A flushed segment ends at the last sample fed: nothing follows it, so its post-roll is zeros."""
+    backend = _ready_backend(preroll_ms=0, postroll_ms=100)
+    context = backend.create_session_context()
+    context.bind_vad()
+    backend.process_audio(_FakeVAD(), _pcm16(0.5, 8000), context)
+
+    speech = np.full(8000, 0.5, dtype=np.float32).tolist()
+    vad = _FakeVAD([_FakeSpeechSegment(speech, start=0)])
+    assert backend.finalize(vad, context) == {"type": "final", "text": "да"}
+
+    waveform, _ = backend.recognizer.calls[0]
+    assert len(waveform) == 8000 + 1600
+    assert np.allclose(waveform[:8000], 0.5, atol=1e-4)
+    assert np.all(waveform[8000:] == 0.0)
+
+
+def test_without_a_context_a_segment_is_decoded_as_the_vad_cut_it():
+    backend = _ready_backend(preroll_ms=350, postroll_ms=300)
+    speech = np.full(8000, 0.5, dtype=np.float32).tolist()
+    assert backend.process_audio(_FakeVAD([_FakeSpeechSegment(speech, start=0)]), b"", None) == {"type": "final", "text": "да"}
+    waveform, _ = backend.recognizer.calls[0]
+    assert len(waveform) == 8000
+
+
+def test_quiet_speech_is_brought_to_the_loudness_target_before_decoding():
+    """Telephone speech at -40 dBFS is boosted to -20 dBFS; the boost is capped; 0 turns it off."""
+    backend = _ready_backend(preroll_ms=0, postroll_ms=0, normalize_dbfs=-20.0, normalize_max_gain_db=24.0)
+    quiet = (0.01 * np.sqrt(2) * np.sin(2 * np.pi * 300 * np.arange(8000) / 16_000)).astype(np.float32)  # -40 dBFS RMS
+
+    backend.process_audio(_FakeVAD([_FakeSpeechSegment(quiet.tolist(), start=0)]), b"", None)
+    waveform, _ = backend.recognizer.calls[0]
+    assert 20 * np.log10(np.sqrt(np.mean(waveform.astype(np.float64) ** 2))) == pytest.approx(-20.0, abs=0.2)
+
+    faint = (quiet / 100).astype(np.float32)  # -80 dBFS: only the 24 dB cap is applied
+    backend.process_audio(_FakeVAD([_FakeSpeechSegment(faint.tolist(), start=0)]), b"", None)
+    waveform, _ = backend.recognizer.calls[1]
+    assert 20 * np.log10(np.sqrt(np.mean(waveform.astype(np.float64) ** 2))) == pytest.approx(-56.0, abs=0.2)
+
+    off = _ready_backend(preroll_ms=0, postroll_ms=0, normalize_dbfs=0)
+    off.process_audio(_FakeVAD([_FakeSpeechSegment(quiet.tolist(), start=0)]), b"", None)
+    waveform, _ = off.recognizer.calls[0]
+    assert np.allclose(waveform, quiet)
 
 
 def test_shutdown_releases_the_model():
@@ -539,14 +656,25 @@ class TestAdminUi:
 # --- the server ---------------------------------------------------------------------
 
 
+class _FakeContext:
+    """What the server needs from OfflineSegmentContext: to be bound to each new VAD and handed to the backend."""
+
+    def __init__(self):
+        self.bound = 0
+
+    def bind_vad(self):
+        self.bound += 1
+
+
 class _FakeServerBackend:
-    """What the server needs from OnnxAsrSTTBackend: a VAD per session, decode, finalize, shutdown."""
+    """What the server needs from OnnxAsrSTTBackend: a VAD and a stream memory per session, decode, finalize, shutdown."""
 
     def __init__(self, results=None, trailing=None):
         self.results = list(results or [])
         self.trailing = trailing
         self.process_calls = []
         self.finalize_calls = []
+        self.contexts = []
         self.shutdown_calls = 0
         self.providers = ["CPUExecutionProvider"]
         self.model_dir = "/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc"
@@ -554,12 +682,17 @@ class _FakeServerBackend:
     def create_session_vad(self):
         return object()
 
-    def process_audio(self, vad, pcm16, preroll_pcm16=None):
-        self.process_calls.append((vad, pcm16, preroll_pcm16))
+    def create_session_context(self):
+        context = _FakeContext()
+        self.contexts.append(context)
+        return context
+
+    def process_audio(self, vad, pcm16, context=None):
+        self.process_calls.append((vad, pcm16, context))
         return self.results.pop(0) if self.results else None
 
-    def finalize(self, vad):
-        self.finalize_calls.append(vad)
+    def finalize(self, vad, context=None):
+        self.finalize_calls.append((vad, context))
         return self.trailing
 
     def shutdown(self):
@@ -578,6 +711,10 @@ def _server(**attrs):
         sherpa_vad_threshold=0.35,
         sherpa_vad_min_silence_ms=700,
         sherpa_vad_min_speech_ms=200,
+        sherpa_offline_postroll_ms=300,
+        sherpa_offline_normalize_dbfs=-20.0,
+        sherpa_offline_normalize_max_gain_db=24.0,
+        local_stt_resampler="fir",
     )
     server.onnx_asr_backend = None
     server.sherpa_backend = None
@@ -609,17 +746,24 @@ async def test_audio_flows_through_a_per_session_vad_to_final_transcripts():
 
     assert await server._process_stt_stream_onnx_asr(session, frame, 16_000) == []
     assert session.onnx_asr_vad is not None
-    assert session.stt_segment_preroll == frame  # kept for the next phrase's pre-roll
+    # The session's stream memory is created with the first chunk and bound to the new VAD
+    # before that chunk is fed, so the VAD's sample 0 is known in the stream.
+    context = session.stt_context
+    assert context is backend.contexts[0] and context.bound == 1
+    assert backend.process_calls[0] == (session.onnx_asr_vad, frame, context)
 
     updates = await server._process_stt_stream_onnx_asr(session, frame, 16_000)
     assert updates == [{"text": "Здравствуйте", "is_final": True, "is_partial": False, "confidence": None}]
-    assert session.stt_segment_preroll == b""
     assert len(backend.process_calls) == 2
-    vad, pcm16, preroll = backend.process_calls[1]
-    assert vad is session.onnx_asr_vad and pcm16 == frame and preroll == frame + frame
-    # The same VAD serves the whole session; a reset drops it.
+    vad, pcm16, passed = backend.process_calls[1]
+    assert vad is session.onnx_asr_vad and pcm16 == frame and passed is context
+    # A reset drops the VAD but keeps the stream memory: the next phrase's pre-roll is
+    # the audio that really preceded it. The VAD created for the next chunk is bound to it.
     server._reset_stt_session(session, "")
-    assert session.onnx_asr_vad is None
+    assert session.onnx_asr_vad is None and session.stt_context is context
+    await server._process_stt_stream_onnx_asr(session, frame, 16_000)
+    assert session.onnx_asr_vad is not None
+    assert backend.contexts == [context] and context.bound == 2
 
 
 @pytest.mark.asyncio
@@ -637,12 +781,35 @@ async def test_trailing_speech_is_flushed_before_the_agent_speaks():
     server._emit_stt_result.assert_not_awaited()
 
     session.onnx_asr_vad = object()
+    session.stt_context = _FakeContext()
     await server._flush_onnx_asr_trailing("ws", session)
-    assert backend.finalize_calls == [session.onnx_asr_vad]
+    assert backend.finalize_calls == [(session.onnx_asr_vad, session.stt_context)]
     server._emit_stt_result.assert_awaited_once()
     args, kwargs = server._emit_stt_result.await_args
     assert args[:3] == ("ws", "до свидания", session) and args[3] == "req-9"
     assert kwargs == {"source_mode": "stt", "is_final": True, "is_partial": False, "confidence": None}
+
+
+@pytest.mark.asyncio
+async def test_eight_khz_clients_are_upsampled_by_the_fir_by_default_and_by_ratecv_on_request():
+    """The engine sends 16 kHz; a client that still sends 8 kHz gets the per-session FIR upsampler."""
+    server_mod, server = _server()
+    server.audio_processor = server_mod.AudioProcessor()
+    frame_8k = np.rint(8000 * np.sin(2 * np.pi * 1000 * np.arange(1600) / 8000)).astype(np.int16).tobytes()
+
+    session = server_mod.SessionContext(call_id="call-8k")
+    assert await server._offline_stt_ingress(session, frame_8k, 16_000) is frame_8k  # already 16 kHz
+    upsampled = await server._offline_stt_ingress(session, frame_8k, 8000)
+    assert len(upsampled) == 2 * len(frame_8k)
+    assert isinstance(session.stt_upsampler, server_mod.FirUpsampler)
+    upsampler = session.stt_upsampler
+    await server._offline_stt_ingress(session, frame_8k, 8000)
+    assert session.stt_upsampler is upsampler  # one stateful upsampler per session
+
+    server.config.local_stt_resampler = "ratecv"
+    session = server_mod.SessionContext(call_id="call-8k-legacy")
+    legacy = await server._offline_stt_ingress(session, frame_8k, 8000)
+    assert abs(len(legacy) - 2 * len(frame_8k)) <= 4 and session.stt_upsampler is None  # ratecv drops a sample
 
 
 @pytest.mark.asyncio
@@ -686,6 +853,9 @@ async def test_loading_creates_the_backend_from_the_config_and_releases_it_on_sw
         "vad_threshold": 0.35,
         "vad_min_silence_ms": 700,
         "vad_min_speech_ms": 200,
+        "postroll_ms": 300,
+        "normalize_dbfs": -20.0,
+        "normalize_max_gain_db": 24.0,
     }
     assert server.startup_errors == {}
 

@@ -335,13 +335,91 @@ class SherpaONNXSTTBackend:
         logging.info("🛑 SHERPA - Recognizer shutdown")
 
 
+class OfflineSegmentContext:
+    """Per-session memory of the stream a VAD-gated offline recognizer was fed.
+
+    A Silero VAD segment starts about 64 ms before the first window the VAD
+    called speech and ends where the closing silence began, so decoded on its
+    own it opens abruptly and loses the last consonant of a short phrase. This
+    ring keeps the recent 16 kHz stream by absolute sample position, so a
+    segment can be widened with the audio that really preceded it (pre-roll)
+    and followed it (post-roll). ``SpeechSegment.start`` counts from the first
+    sample its VAD instance received, so ``bind_vad()`` records where that
+    sample sits in the stream whenever a VAD is created.
+    """
+
+    def __init__(self, sample_rate: int, capacity_seconds: float):
+        self.sample_rate = max(1, int(sample_rate))
+        self.capacity = max(1, int(self.sample_rate * float(capacity_seconds)))
+        self._ring = np.zeros(self.capacity, dtype=np.int16)
+        # Samples fed so far; the absolute position of the next sample appended.
+        self.total_samples = 0
+        # Absolute position of sample 0 of the VAD instance currently in use.
+        self.vad_base_sample = 0
+
+    def bind_vad(self) -> None:
+        """The next sample appended is sample 0 of a freshly created VAD."""
+        self.vad_base_sample = self.total_samples
+
+    def absolute(self, vad_sample_index: int) -> int:
+        """Stream position of a sample index reported by the bound VAD."""
+        return self.vad_base_sample + int(vad_sample_index)
+
+    @property
+    def oldest_sample(self) -> int:
+        return max(0, self.total_samples - self.capacity)
+
+    def append(self, pcm16_audio: bytes) -> None:
+        if not pcm16_audio:
+            return
+        samples = np.frombuffer(pcm16_audio[: len(pcm16_audio) & ~1], dtype=np.int16)
+        count = len(samples)
+        if count == 0:
+            return
+        if count >= self.capacity:
+            # Only the last ``capacity`` samples survive; keep them where their
+            # absolute positions land so ``read()`` stays position-addressed.
+            first_kept = self.total_samples + count - self.capacity
+            positions = (first_kept + np.arange(self.capacity)) % self.capacity
+            self._ring[positions] = samples[-self.capacity:]
+        else:
+            position = self.total_samples % self.capacity
+            first = min(count, self.capacity - position)
+            self._ring[position:position + first] = samples[:first]
+            if first < count:
+                self._ring[: count - first] = samples[first:]
+        self.total_samples += count
+
+    def read(self, start: int, end: int) -> np.ndarray:
+        """Float32 samples of ``[start, end)``; digital silence where the stream holds no audio.
+
+        Positions before the stream began or already overwritten, and positions
+        past the last sample fed (the post-roll of a segment flushed at the end
+        of the stream), come back as zeros.
+        """
+        start = int(start)
+        end = int(end)
+        if end <= start:
+            return np.zeros(0, dtype=np.float32)
+        out = np.zeros(end - start, dtype=np.float32)
+        low = max(start, self.oldest_sample)
+        high = min(end, self.total_samples)
+        if high > low:
+            positions = np.arange(low, high) % self.capacity
+            out[low - start: high - start] = self._ring[positions].astype(np.float32) / 32768.0
+        return out
+
+
 class SherpaOfflineSTTBackend:
     """
     Offline (non-streaming) STT backend using sherpa-onnx OfflineRecognizer + Silero VAD.
 
     Used for models that only support offline/batch inference (e.g., GigaAM for Russian).
     Silero VAD detects speech segments, and each complete segment is transcribed via
-    OfflineRecognizer.from_transducer().
+    OfflineRecognizer.from_transducer(). Before decoding, a segment is widened with
+    the stream audio around it (``preroll_ms`` before its start, ``postroll_ms``
+    after its end, read from the session's ``OfflineSegmentContext``) and, when
+    ``normalize_dbfs`` is set, brought to that loudness.
 
     The OfflineRecognizer is shared across sessions (thread-safe for decode_stream).
     VAD instances are per-session to prevent cross-session contamination — create one
@@ -353,6 +431,9 @@ class SherpaOfflineSTTBackend:
     """
 
     LOG_TAG = "SHERPA-OFFLINE"
+    # The VAD closes a segment by force at this length, so a session's stream
+    # memory must cover it plus the closing silence and the context around it.
+    VAD_MAX_SPEECH_S = 20.0
 
     def __init__(
         self,
@@ -363,19 +444,31 @@ class SherpaOfflineSTTBackend:
         vad_threshold: float = 0.5,
         vad_min_silence_ms: int = 500,
         vad_min_speech_ms: int = 250,
+        postroll_ms: int = 0,
+        normalize_dbfs: float = 0.0,
+        normalize_max_gain_db: float = 24.0,
     ):
         self.model_path = model_path
         self.vad_model_path = vad_model_path
         self.sample_rate = sample_rate
         self.preroll_ms = max(0, int(preroll_ms))
         self._preroll_samples = int(self.sample_rate * (self.preroll_ms / 1000.0))
+        self.postroll_ms = max(0, int(postroll_ms))
+        self._postroll_samples = int(self.sample_rate * (self.postroll_ms / 1000.0))
         self.vad_threshold = max(0.0, min(1.0, float(vad_threshold)))
         self.vad_min_silence_ms = max(0, int(vad_min_silence_ms))
         self.vad_min_speech_ms = max(0, int(vad_min_speech_ms))
+        # Loudness target for a decoded segment: the RMS of its speech part in
+        # dBFS. Zero (or a positive value) turns the normalization off.
+        self.normalize_dbfs = self._parse_normalize_dbfs(normalize_dbfs)
+        self.normalize_max_gain_db = max(0.0, float(normalize_max_gain_db or 0.0))
         self.recognizer = None
         self._vad_config = None  # Stored for per-session VAD creation
         self._initialized = False
-        self._min_audio_length = int(sample_rate * 0.25)
+        # A segment whose speech part is shorter than this is not decoded. Never
+        # above the VAD's own minimum, so a phrase the VAD accepted is not
+        # dropped here when SHERPA_VAD_MIN_SPEECH_MS is lowered for short replies.
+        self._min_audio_length = int(sample_rate * min(0.25, max(0.05, self.vad_min_speech_ms / 1000.0)))
         self._debug_segments = str(os.getenv("SHERPA_OFFLINE_DEBUG_SEGMENTS", "")).strip().lower() in {
             "1",
             "true",
@@ -455,13 +548,9 @@ class SherpaOfflineSTTBackend:
 
             self._initialized = True
             logging.info(
-                f"✅ {self.LOG_TAG} - OfflineRecognizer + Silero VAD initialized with model %s "
-                "(preroll_ms=%d threshold=%.2f min_silence_ms=%d min_speech_ms=%d)",
+                f"✅ {self.LOG_TAG} - OfflineRecognizer + Silero VAD initialized with model %s %s",
                 self.model_path,
-                self.preroll_ms,
-                self.vad_threshold,
-                self.vad_min_silence_ms,
-                self.vad_min_speech_ms,
+                self.tuning_summary(),
             )
             return True
         except ImportError:
@@ -478,7 +567,7 @@ class SherpaOfflineSTTBackend:
         self._vad_config.silero_vad.threshold = self.vad_threshold
         self._vad_config.silero_vad.min_silence_duration = self.vad_min_silence_ms / 1000.0
         self._vad_config.silero_vad.min_speech_duration = self.vad_min_speech_ms / 1000.0
-        self._vad_config.silero_vad.max_speech_duration = 20.0
+        self._vad_config.silero_vad.max_speech_duration = self.VAD_MAX_SPEECH_S
         self._vad_config.sample_rate = self.sample_rate
 
         # Validate VAD config by creating (and discarding) a test instance.
@@ -499,6 +588,40 @@ class SherpaOfflineSTTBackend:
         except Exception as exc:
             logging.error(f"❌ {self.LOG_TAG} - Failed to create session VAD: %s", exc)
             return None
+
+    def create_session_context(self) -> OfflineSegmentContext:
+        """Stream memory for one session, long enough for the longest VAD segment and its context.
+
+        Kept for the whole session (a VAD is recreated after every final; the
+        context is not) and passed to ``process_audio()`` / ``finalize()``.
+        Call ``bind_vad()`` on it whenever a new VAD is created for the session.
+        """
+        horizon_s = (
+            self.VAD_MAX_SPEECH_S
+            + (self.vad_min_silence_ms + self.preroll_ms + self.postroll_ms) / 1000.0
+            + 1.0
+        )
+        return OfflineSegmentContext(self.sample_rate, horizon_s)
+
+    @staticmethod
+    def _parse_normalize_dbfs(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(parsed) or parsed >= 0.0:
+            return 0.0
+        return parsed
+
+    def tuning_summary(self) -> str:
+        """The segmenting knobs in effect, for the start-up log line."""
+        normalize = f"{self.normalize_dbfs:.1f}" if self.normalize_dbfs < 0.0 else "off"
+        return (
+            f"(preroll_ms={self.preroll_ms} postroll_ms={self.postroll_ms} "
+            f"threshold={self.vad_threshold:.2f} min_silence_ms={self.vad_min_silence_ms} "
+            f"min_speech_ms={self.vad_min_speech_ms} normalize_dbfs={normalize} "
+            f"max_gain_db={self.normalize_max_gain_db:.0f})"
+        )
 
     # ------------------------------------------------------------------
     # File helpers
@@ -571,36 +694,76 @@ class SherpaOfflineSTTBackend:
         samples = np.frombuffer(pcm16_audio, dtype=np.int16)
         return samples.astype(np.float32) / 32768.0
 
-    def _merge_preroll(
+    @staticmethod
+    def _segment_start(speech_segment: Any) -> Optional[int]:
+        """Start of a VAD segment in its VAD's sample count; None when the binding has no ``start``."""
+        start = getattr(speech_segment, "start", None)
+        if start is None:
+            return None
+        try:
+            return int(start)
+        except (TypeError, ValueError):
+            return None
+
+    def _extend_segment(
         self,
         speech_samples: np.ndarray,
-        preroll_pcm16: Optional[bytes],
-    ) -> np.ndarray:
-        if self._preroll_samples <= 0 or not preroll_pcm16:
-            return speech_samples
+        segment_start: Optional[int],
+        context: Optional[OfflineSegmentContext],
+    ) -> tuple:
+        """Widen a VAD segment with the stream audio that came before and after it.
 
-        preroll_samples = self._pcm16_to_float32(preroll_pcm16)
-        if len(preroll_samples) == 0:
-            return speech_samples
+        Returns the widened samples, the slice of them holding the VAD's own
+        speech, and the pre-roll and post-roll sample counts that were added.
+        Without a context (or a segment start) the segment is decoded as is.
+        """
+        speech_slice = slice(0, len(speech_samples))
+        if (
+            context is None
+            or segment_start is None
+            or (self._preroll_samples <= 0 and self._postroll_samples <= 0)
+        ):
+            return speech_samples, speech_slice, 0, 0
+        absolute_start = context.absolute(segment_start)
+        absolute_end = absolute_start + len(speech_samples)
+        empty = np.zeros(0, dtype=np.float32)
+        pre = (
+            context.read(absolute_start - self._preroll_samples, absolute_start)
+            if self._preroll_samples > 0
+            else empty
+        )
+        post = (
+            context.read(absolute_end, absolute_end + self._postroll_samples)
+            if self._postroll_samples > 0
+            else empty
+        )
+        widened = np.concatenate([pre, speech_samples, post]).astype(np.float32, copy=False)
+        return widened, slice(len(pre), len(pre) + len(speech_samples)), len(pre), len(post)
 
-        # Keep only the requested preroll window and remove any exact overlap with
-        # the segment prefix so we don't duplicate audio when the VAD already kept
-        # part of the utterance.
-        preroll_samples = preroll_samples[-self._preroll_samples:]
-        max_overlap = min(len(preroll_samples), len(speech_samples))
-        overlap = 0
-        for candidate in range(max_overlap, 0, -1):
-            if np.allclose(preroll_samples[-candidate:], speech_samples[:candidate], atol=1e-4):
-                overlap = candidate
-                break
+    def _normalize_segment(self, samples: np.ndarray, speech_slice: slice) -> tuple:
+        """Bring the speech part of a segment to ``normalize_dbfs`` RMS.
 
-        if overlap:
-            preroll_samples = preroll_samples[:-overlap]
-
-        if len(preroll_samples) == 0:
-            return speech_samples
-
-        return np.concatenate([preroll_samples, speech_samples]).astype(np.float32, copy=False)
+        The gain is applied to the whole widened segment, boosted by at most
+        ``normalize_max_gain_db`` and reduced so no sample clips. Returns the
+        samples and the gain applied in dB (0.0 when nothing was done).
+        """
+        if self.normalize_dbfs >= 0.0 or len(samples) == 0:
+            return samples, 0.0
+        speech = samples[speech_slice]
+        if len(speech) == 0:
+            return samples, 0.0
+        rms = float(np.sqrt(np.mean(speech.astype(np.float64) ** 2)))
+        if not np.isfinite(rms) or rms <= 1e-6:
+            return samples, 0.0
+        gain_db = min(self.normalize_dbfs - 20.0 * float(np.log10(rms)), self.normalize_max_gain_db)
+        gain = 10.0 ** (gain_db / 20.0)
+        peak = float(np.max(np.abs(samples))) * gain
+        if peak > 0.99:
+            gain *= 0.99 / peak
+            gain_db = 20.0 * float(np.log10(gain))
+        if abs(gain_db) < 0.05:
+            return samples, 0.0
+        return (samples * np.float32(gain)).astype(np.float32, copy=False), gain_db
 
     def _validate_segment_samples(self, speech_samples: np.ndarray) -> Optional[str]:
         if len(speech_samples) == 0:
@@ -612,9 +775,15 @@ class SherpaOfflineSTTBackend:
             return f"out-of-range samples (max_abs={max_abs:.6f})"
         return None
 
-    def _log_segment(self, seg_idx: int, stats: Dict[str, Any], validation_error: Optional[str]) -> None:
+    def _log_segment(
+        self,
+        seg_idx: int,
+        stats: Dict[str, Any],
+        validation_error: Optional[str],
+        extra: str = "",
+    ) -> None:
         level = logging.warning if validation_error else logging.info
-        suffix = f" validation={validation_error}" if validation_error else " validation=ok"
+        suffix = (f" validation={validation_error}" if validation_error else " validation=ok") + extra
         if self._debug_segments:
             level(
                 f"🔍 {self.LOG_TAG} VAD segment[%d] - samples=%d duration_ms=%d rms=%.6f "
@@ -646,21 +815,86 @@ class SherpaOfflineSTTBackend:
             suffix,
         )
 
+    def _decode_segments(
+        self,
+        vad: Any,
+        context: Optional[OfflineSegmentContext],
+        *,
+        stage: str,
+    ) -> List[str]:
+        """Pop every queued VAD segment; widen, validate, normalize and decode each one."""
+        texts: List[str] = []
+        seg_idx = 0
+        while not vad.empty():
+            speech_segment = vad.front
+            speech_samples = self._copy_segment_samples(speech_segment)
+            segment_start = self._segment_start(speech_segment)
+            vad.pop()
+            speech_len = len(speech_samples)
+            samples, speech_slice, pre_count, post_count = self._extend_segment(
+                speech_samples, segment_start, context
+            )
+            validation_error = self._validate_segment_samples(samples)
+            gain_db = 0.0
+            if not validation_error:
+                samples, gain_db = self._normalize_segment(samples, speech_slice)
+            stats = self._segment_stats(samples)
+            extra = " speech_ms=%d pre_ms=%d post_ms=%d gain_db=%+.1f" % (
+                speech_len * 1000 // self.sample_rate,
+                pre_count * 1000 // self.sample_rate,
+                post_count * 1000 // self.sample_rate,
+                gain_db,
+            )
+            self._log_segment(seg_idx, stats, validation_error, extra)
+            seg_idx += 1
+
+            if validation_error:
+                logging.warning(
+                    f"⚠️ {self.LOG_TAG} - %s segment[%d] rejected before decode: %s",
+                    stage,
+                    seg_idx - 1,
+                    validation_error,
+                )
+                continue
+
+            if speech_len < self._min_audio_length:
+                logging.info(
+                    f"🔍 {self.LOG_TAG} VAD segment skipped (too short): %d < %d samples",
+                    speech_len, self._min_audio_length,
+                )
+                continue
+
+            text = self._transcribe_segment(samples)
+            logging.info(
+                f"🔍 {self.LOG_TAG} transcribe seg[%d] result: '%s' (empty=%s)",
+                seg_idx - 1, text or "", not text,
+            )
+            if text:
+                texts.append(text)
+        return texts
+
     def process_audio(
         self,
         vad: Any,
         pcm16_audio: bytes,
-        preroll_pcm16: Optional[bytes] = None,
+        context: Optional[OfflineSegmentContext] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Feed audio through a per-session VAD; transcribe complete speech segments."""
+        """Feed audio through a per-session VAD; transcribe complete speech segments.
+
+        ``context`` is the session's stream memory from ``create_session_context()``:
+        the audio is appended to it, and each segment the VAD closes is widened
+        with the pre-roll and post-roll read from it before decoding.
+        """
         if not self._initialized or self.recognizer is None or vad is None:
             return None
 
         try:
+            if context is not None:
+                context.append(pcm16_audio)
             samples = np.frombuffer(pcm16_audio, dtype=np.int16)
             float_samples = samples.astype(np.float32) / 32768.0
 
-            rms = float(np.sqrt(np.mean(float_samples ** 2)))
+            rms = float(np.sqrt(np.mean(float_samples ** 2))) if len(float_samples) else 0.0
             self._vad_chunk_count += 1
             if rms > 0.002 or self._vad_chunk_count % 100 == 1:
                 logging.debug(
@@ -670,90 +904,37 @@ class SherpaOfflineSTTBackend:
 
             vad.accept_waveform(float_samples)
 
-            has_segments = not vad.empty()
-            if has_segments:
+            if not vad.empty():
                 logging.info(
                     f"🔍 {self.LOG_TAG} VAD - Speech segment(s) detected at chunk=%d",
                     self._vad_chunk_count,
                 )
 
-            # Process ALL queued speech segments (not just the first).
-            texts = []
-            seg_idx = 0
-            while not vad.empty():
-                speech_segment = vad.front
-                speech_samples = self._copy_segment_samples(speech_segment)
-                vad.pop()
-                speech_samples = self._merge_preroll(speech_samples, preroll_pcm16)
-                validation_error = self._validate_segment_samples(speech_samples)
-                stats = self._segment_stats(speech_samples)
-                self._log_segment(seg_idx, stats, validation_error)
-                seg_idx += 1
-
-                if validation_error:
-                    logging.warning(
-                        f"⚠️ {self.LOG_TAG} - Segment[%d] rejected before decode: %s",
-                        seg_idx - 1,
-                        validation_error,
-                    )
-                    continue
-
-                if len(speech_samples) < self._min_audio_length:
-                    logging.info(
-                        f"🔍 {self.LOG_TAG} VAD segment skipped (too short): %d < %d samples",
-                        len(speech_samples), self._min_audio_length,
-                    )
-                    continue
-
-                text = self._transcribe_segment(speech_samples)
-                logging.info(
-                    f"🔍 {self.LOG_TAG} transcribe seg[%d] result: '%s' (empty=%s)",
-                    seg_idx - 1, text or "", text is None or text == "",
-                )
-                if text:
-                    texts.append(text)
-
+            texts = self._decode_segments(vad, context, stage="Segment")
             if texts:
                 return {"type": "final", "text": " ".join(texts)}
-
             return None
 
         except Exception as exc:
             logging.error(f"❌ {self.LOG_TAG} - Process error: %s", exc)
             return None
 
-    def finalize(self, vad: Any) -> Optional[Dict[str, Any]]:
-        """Flush remaining speech from a per-session VAD and transcribe it."""
+    def finalize(
+        self,
+        vad: Any,
+        context: Optional[OfflineSegmentContext] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Flush remaining speech from a per-session VAD and transcribe it.
+
+        A flushed segment ends at the last sample fed, so its post-roll is
+        digital silence from the context.
+        """
         if not self._initialized or self.recognizer is None or vad is None:
             return None
 
         try:
             vad.flush()
-
-            texts = []
-            seg_idx = 0
-            while not vad.empty():
-                speech_segment = vad.front
-                speech_samples = self._copy_segment_samples(speech_segment)
-                vad.pop()
-                validation_error = self._validate_segment_samples(speech_samples)
-                stats = self._segment_stats(speech_samples)
-                self._log_segment(seg_idx, stats, validation_error)
-                seg_idx += 1
-                if validation_error:
-                    logging.warning(
-                        f"⚠️ {self.LOG_TAG} - Finalize segment[%d] rejected before decode: %s",
-                        seg_idx - 1,
-                        validation_error,
-                    )
-                    continue
-                if len(speech_samples) < self._min_audio_length:
-                    continue
-
-                text = self._transcribe_segment(speech_samples)
-                if text:
-                    texts.append(text)
-
+            texts = self._decode_segments(vad, context, stage="Finalize")
             if texts:
                 return {"type": "final", "text": " ".join(texts)}
             return None
@@ -825,6 +1006,9 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
         vad_threshold: float = 0.5,
         vad_min_silence_ms: int = 500,
         vad_min_speech_ms: int = 250,
+        postroll_ms: int = 0,
+        normalize_dbfs: float = 0.0,
+        normalize_max_gain_db: float = 24.0,
     ):
         from config import normalize_onnx_asr_model  # local import: config is light, stt_backends is not
 
@@ -856,6 +1040,9 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
             vad_threshold=vad_threshold,
             vad_min_silence_ms=vad_min_silence_ms,
             vad_min_speech_ms=vad_min_speech_ms,
+            postroll_ms=postroll_ms,
+            normalize_dbfs=normalize_dbfs,
+            normalize_max_gain_db=normalize_max_gain_db,
         )
 
     @property
@@ -953,14 +1140,10 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
 
             self._initialized = True
             logging.info(
-                f"✅ {self.LOG_TAG} - Model %s + Silero VAD initialized on %s "
-                "(preroll_ms=%d threshold=%.2f min_silence_ms=%d min_speech_ms=%d)",
+                f"✅ {self.LOG_TAG} - Model %s + Silero VAD initialized on %s %s",
                 self.model,
                 self.providers[0],
-                self.preroll_ms,
-                self.vad_threshold,
-                self.vad_min_silence_ms,
-                self.vad_min_speech_ms,
+                self.tuning_summary(),
             )
             return True
         except Exception as exc:

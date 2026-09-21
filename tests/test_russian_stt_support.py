@@ -79,6 +79,10 @@ class TestConfigNewFields:
         assert cfg.sherpa_vad_min_silence_ms == 700
         assert cfg.sherpa_vad_min_speech_ms == 200
         assert cfg.sherpa_offline_preroll_ms == 350
+        assert cfg.sherpa_offline_postroll_ms == 300
+        assert cfg.sherpa_offline_normalize_dbfs == pytest.approx(-20.0)
+        assert cfg.sherpa_offline_normalize_max_gain_db == pytest.approx(24.0)
+        assert cfg.local_stt_resampler == "fir"
 
     def test_sherpa_offline_tuning_reads_env(self, monkeypatch):
         cfg = self._load_config(
@@ -87,11 +91,23 @@ class TestConfigNewFields:
             SHERPA_VAD_MIN_SILENCE_MS="850",
             SHERPA_VAD_MIN_SPEECH_MS="300",
             SHERPA_OFFLINE_PREROLL_MS="500",
+            SHERPA_OFFLINE_POSTROLL_MS="450",
+            SHERPA_OFFLINE_NORMALIZE_DBFS="-23",
+            SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB="12",
+            LOCAL_STT_RESAMPLER=" RateCV ",
         )
         assert cfg.sherpa_vad_threshold == pytest.approx(0.42)
         assert cfg.sherpa_vad_min_silence_ms == 850
         assert cfg.sherpa_vad_min_speech_ms == 300
         assert cfg.sherpa_offline_preroll_ms == 500
+        assert cfg.sherpa_offline_postroll_ms == 450
+        assert cfg.sherpa_offline_normalize_dbfs == pytest.approx(-23.0)
+        assert cfg.sherpa_offline_normalize_max_gain_db == pytest.approx(12.0)
+        assert cfg.local_stt_resampler == "ratecv"
+
+    def test_stt_resampler_falls_back_to_fir_on_an_unknown_value(self, monkeypatch):
+        cfg = self._load_config(monkeypatch, LOCAL_STT_RESAMPLER="sox")
+        assert cfg.local_stt_resampler == "fir"
 
 
 # ---------------------------------------------------------------------------
@@ -414,8 +430,9 @@ def _load_stt_backends():
 
 class _FakeSpeechSegment:
     """Simulates a sherpa_onnx speech segment returned by VoiceActivityDetector."""
-    def __init__(self, samples):
+    def __init__(self, samples, start=0):
         self.samples = samples
+        self.start = start
 
 
 class _ArrayPoisonedSamples:
@@ -623,11 +640,14 @@ class TestSherpaOfflineBackendSessionVAD:
         assert result is None
         backend._transcribe_segment.assert_not_called()
 
-    def test_process_audio_prepends_preroll_without_duplicate_overlap(self):
+    def test_process_audio_widens_a_segment_with_the_stream_around_it(self):
+        """The 350 ms before the VAD's start come from the session's stream memory, by position."""
         backend = self._make_backend()
-        seg = [0.10, 0.20, 0.30, 0.40]
-        preroll = [0.01, 0.02, 0.10, 0.20]
-        vad = _FakeVAD(segments=[_FakeSpeechSegment(seg * 4000)])
+        context = backend.create_session_context()
+        context.bind_vad()
+        before = (np.full(5600, 0.02, dtype=np.float32) * 32768.0).astype(np.int16).tobytes()  # 350 ms
+        speech = (np.full(16000, 0.10, dtype=np.float32) * 32768.0).astype(np.int16).tobytes()
+        assert backend.process_audio(_FakeVAD(), before + speech, context) is None
         captured = {}
 
         def _capture(samples):
@@ -635,17 +655,16 @@ class TestSherpaOfflineBackendSessionVAD:
             return "hello world"
 
         backend._transcribe_segment = _capture
-        preroll_pcm16 = (np.array(preroll * 1000, dtype=np.float32) * 32768.0).astype(np.int16).tobytes()
+        vad = _FakeVAD(segments=[_FakeSpeechSegment([0.10] * 16000, start=5600)])
 
-        result = backend.process_audio(vad, b"\x00\x00" * 160, preroll_pcm16=preroll_pcm16)
+        result = backend.process_audio(vad, b"", context)
 
         assert result == {"type": "final", "text": "hello world"}
-        assert "samples" in captured
-        assert captured["samples"][0] == pytest.approx(0.01, abs=1e-3)
-        assert captured["samples"][1] == pytest.approx(0.02, abs=1e-3)
-        assert captured["samples"][2] == pytest.approx(0.10, abs=1e-3)
+        assert len(captured["samples"]) == 5600 + 16000  # no post-roll was configured
+        assert np.allclose(captured["samples"][:5600], 0.02, atol=1e-3)
+        assert np.allclose(captured["samples"][5600:], 0.10, atol=1e-3)
 
-    def test_process_audio_without_preroll_does_not_prepend_audio(self):
+    def test_process_audio_without_a_context_decodes_the_segment_as_cut(self):
         backend = self._make_backend()
         speech = [0.10] * 16000
         vad = _FakeVAD(segments=[_FakeSpeechSegment(speech)])
@@ -656,7 +675,7 @@ class TestSherpaOfflineBackendSessionVAD:
             return "hello world"
 
         backend._transcribe_segment = _capture
-        result = backend.process_audio(vad, b"\x00\x00" * 160, preroll_pcm16=b"")
+        result = backend.process_audio(vad, b"\x00\x00" * 160)
 
         assert result == {"type": "final", "text": "hello world"}
         assert len(captured["samples"]) == len(speech)

@@ -10,6 +10,7 @@ from src.audio import (
     pcm16le_to_mulaw,
     resample_audio,
     resolve_output_resampler_policy,
+    resolve_stt_input_resampler,
 )
 
 
@@ -241,6 +242,87 @@ def test_bandlimited_mode_falls_back_to_legacy_for_upsampling():
     )
     assert candidate == legacy
     assert candidate_state == legacy_state
+
+
+# ── FIR upsampling (the STT ingress) ─────────────────────────────────
+
+
+def _band_energy_db(pcm: bytes, rate: int, low_hz: float, high_hz: float) -> float:
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)[1024:]
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(len(samples))))
+    freqs = np.fft.rfftfreq(len(samples), 1.0 / rate)
+    band = (freqs >= low_hz) & (freqs <= high_hz)
+    return 20.0 * np.log10(np.sqrt(np.sum(spectrum[band] ** 2)) / max(np.sqrt(np.sum(spectrum ** 2)), 1e-12))
+
+
+def _tone(rate: int, hz: float, seconds: float = 0.5) -> bytes:
+    positions = np.arange(int(rate * seconds), dtype=np.float64)
+    return np.rint(10000.0 * np.sin(2.0 * np.pi * hz * positions / rate)).astype("<i2").tobytes()
+
+
+def test_fir_upsample_8k_to_16k_exact_size_and_24k():
+    pcm = np.arange(-160, 160, dtype="<i2").tobytes()
+    out, state = resample_audio(pcm, 8000, 16000, mode="fir")
+    assert len(out) == 2 * len(pcm)
+    assert state[0] == "fir_upsample_v1"
+    out, _ = resample_audio(pcm, 8000, 24000, mode="fir")
+    assert len(out) == 3 * len(pcm)
+
+
+def test_fir_upsample_removes_the_images_linear_interpolation_leaves():
+    """A 3 kHz phone tone must not come back mirrored at 5 kHz, and must keep its level."""
+    tone = _tone(8000, 3000.0)
+    legacy, _ = resample_audio(tone, 8000, 16000)
+    fir, _ = resample_audio(tone, 8000, 16000, mode="fir")
+
+    assert _band_energy_db(legacy, 16000, 4500, 8000) > -10.0  # the image linear interpolation leaves
+    assert _band_energy_db(fir, 16000, 4500, 8000) < -80.0
+    for hz in (300.0, 1000.0, 3000.0, 3400.0):
+        out, _ = resample_audio(_tone(8000, hz), 8000, 16000, mode="fir")
+        rms = np.sqrt(np.mean(np.frombuffer(out, dtype="<i2").astype(np.float64)[1024:] ** 2))
+        assert abs(20.0 * np.log10(rms / (10000.0 / np.sqrt(2.0)))) < 0.1
+
+
+def test_fir_upsample_streaming_matches_one_shot_for_irregular_chunks():
+    rng = np.random.default_rng(20260921)
+    samples = rng.integers(-20000, 20001, size=2407, dtype=np.int16)
+    pcm = samples.astype("<i2", copy=False).tobytes()
+    one_shot, _ = resample_audio(pcm, 8000, 16000, mode="fir")
+
+    state = None
+    chunks = []
+    offset = 0
+    for sample_count in (17, 301, 2, 479, 91, 603, 914):
+        converted, state = resample_audio(
+            pcm[offset * 2 : (offset + sample_count) * 2], 8000, 16000, state=state, mode="fir"
+        )
+        chunks.append(converted)
+        offset += sample_count
+
+    assert offset == len(samples)
+    assert b"".join(chunks) == one_shot
+
+
+def test_fir_mode_downsamples_like_bandlimited_and_falls_back_to_linear_otherwise():
+    pcm = _tone(24000, 1000.0)
+    fir, _ = resample_audio(pcm, 24000, 8000, mode="fir")
+    bandlimited, _ = resample_audio(pcm, 24000, 8000, mode="bandlimited")
+    assert fir == bandlimited
+
+    pcm = np.arange(-160, 160, dtype="<i2").tobytes()
+    fir, fir_state = resample_audio(pcm, 8000, 11025, mode="fir")
+    linear, linear_state = resample_audio(pcm, 8000, 11025)
+    assert fir == linear and fir_state == linear_state
+    # A stale FIR state handed to the linear path is ignored, not misread as a sample.
+    out, _ = resample_audio(pcm, 8000, 16000, state=("fir_upsample_v1", 8000, 16000, np.zeros(47)))
+    assert out == resample_audio(pcm, 8000, 16000)[0]
+
+
+def test_stt_input_resampler_resolution():
+    assert resolve_stt_input_resampler(None) == "fir"
+    assert resolve_stt_input_resampler("") == "fir"
+    assert resolve_stt_input_resampler(" Linear ") == "linear"
+    assert resolve_stt_input_resampler("bandlimited") == "fir"
 
 
 # ── Edge cases ────────────────────────────────────────────────────────

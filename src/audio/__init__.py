@@ -10,6 +10,7 @@ from .resampler import (
     resample_audio,
     convert_pcm16le_to_target_format,
     resolve_output_resampler_policy,
+    resolve_stt_input_resampler,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "resample_audio",
     "convert_pcm16le_to_target_format",
     "resolve_output_resampler_policy",
+    "resolve_stt_input_resampler",
 ]

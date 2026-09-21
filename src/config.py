@@ -149,6 +149,12 @@ class LocalProviderConfig(BaseModel):
     
     # STT Backend selection: vosk | kroko | sherpa
     stt_backend: str = Field(default="vosk")
+    # How 8 kHz caller audio is brought to the recognizer's 16 kHz before it is
+    # sent to the Local AI Server: "fir" (polyphase windowed-sinc interpolation,
+    # no spectral images, flat telephone band) or "linear" (the legacy
+    # interpolation, which mirrors a 3 kHz tone to 5 kHz at about -13 dB and
+    # rolls the band off by 2-3 dB).
+    stt_input_resampler: Literal["fir", "linear"] = Field(default="fir")
     # Vosk STT model path
     stt_model: Optional[str] = None
     # Kroko STT settings

@@ -8,8 +8,87 @@ import subprocess
 import tempfile
 import wave
 from dataclasses import dataclass
+from functools import lru_cache
+
+import numpy as np
 
 from constants import ULAW_SAMPLE_RATE
+
+# Interpolation low-pass of ``FirUpsampler``: 48 taps per output phase and a
+# Kaiser window (beta 8) give about 90 dB of image rejection with the cut-off
+# at the source Nyquist frequency and a delay of about 3 ms at 16 kHz.
+_FIR_UPSAMPLE_TAPS_PER_PHASE = 48
+_FIR_UPSAMPLE_KAISER_BETA = 8.0
+STT_RESAMPLER_MODES = ("fir", "ratecv")
+DEFAULT_STT_RESAMPLER = "fir"
+
+
+@lru_cache(maxsize=8)
+def _fir_upsample_phases(factor: int) -> tuple:
+    """Polyphase components of the interpolation low-pass for an integer ``factor``.
+
+    The prototype is designed at the output rate with its cut-off at the source
+    Nyquist frequency (``0.5 / factor`` cycles per output sample), Kaiser-windowed
+    and scaled to a DC gain of ``factor`` to make up for the zero-stuffing it
+    stands in for. Phase ``p`` holds every ``factor``-th tap from ``p`` on: output
+    sample ``n * factor + p`` is its dot product with ``x[n], x[n-1], ...``.
+    """
+    n_taps = factor * _FIR_UPSAMPLE_TAPS_PER_PHASE
+    center = (n_taps - 1) / 2.0
+    positions = np.arange(n_taps, dtype=np.float64) - center
+    cutoff = 0.5 / factor
+    taps = 2.0 * cutoff * np.sinc(2.0 * cutoff * positions)
+    taps *= np.kaiser(n_taps, _FIR_UPSAMPLE_KAISER_BETA)
+    taps *= factor / np.sum(taps)
+    phases = []
+    for phase in range(factor):
+        component = np.ascontiguousarray(taps[phase::factor])
+        component.setflags(write=False)
+        phases.append(component)
+    return tuple(phases)
+
+
+class FirUpsampler:
+    """Stateful polyphase windowed-sinc upsampler for an integer rate ratio.
+
+    Brings 8 kHz caller audio to a recognizer's 16 kHz without the spectral
+    images that the linear interpolation of ``audioop.ratecv`` leaves behind
+    (a 3 kHz telephone tone mirrored to 5 kHz at about -8 dB, the band rolled
+    off by 2-3 dB). It keeps the last taps of input between calls, so audio
+    fed chunk by chunk comes out identical to the same audio fed at once.
+    """
+
+    def __init__(self, input_rate: int, output_rate: int):
+        input_rate = int(input_rate)
+        output_rate = int(output_rate)
+        if input_rate <= 0 or output_rate <= input_rate or output_rate % input_rate:
+            raise ValueError(
+                f"FirUpsampler needs an integer upsampling ratio, got {input_rate} -> {output_rate}"
+            )
+        self.input_rate = input_rate
+        self.output_rate = output_rate
+        self.factor = output_rate // input_rate
+        self._phases = _fir_upsample_phases(self.factor)
+        self._history = np.zeros(_FIR_UPSAMPLE_TAPS_PER_PHASE - 1, dtype=np.float64)
+
+    def process(self, pcm16_audio: bytes) -> bytes:
+        """Upsample one chunk of mono PCM16; returns ``factor`` times as many samples."""
+        if not pcm16_audio:
+            return b""
+        audio = np.frombuffer(pcm16_audio[: len(pcm16_audio) & ~1], dtype=np.int16).astype(np.float64)
+        if len(audio) == 0:
+            return b""
+        extended = np.concatenate((self._history, audio))
+        resampled = np.empty(len(audio) * self.factor, dtype=np.float64)
+        for phase, taps in enumerate(self._phases):
+            # ``valid`` with the history prepended yields one output per source
+            # sample, each looking back over the previous ``taps`` source samples.
+            resampled[phase::self.factor] = np.convolve(extended, taps, mode="valid")
+        self._history = extended[-len(self._history):].copy()
+        return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16).tobytes()
+
+    def reset(self) -> None:
+        self._history[:] = 0.0
 
 
 @dataclass(frozen=True)

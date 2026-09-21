@@ -624,7 +624,8 @@ const EnvPage = () => {
         // Local AI Server - Sherpa offline/VAD
         'SHERPA_MODEL_TYPE', 'SHERPA_VAD_MODEL_PATH', 'SHERPA_VAD_THRESHOLD',
         'SHERPA_VAD_MIN_SILENCE_MS', 'SHERPA_VAD_MIN_SPEECH_MS', 'SHERPA_OFFLINE_PREROLL_MS',
-        'SHERPA_OFFLINE_DEBUG_SEGMENTS',
+        'SHERPA_OFFLINE_POSTROLL_MS', 'SHERPA_OFFLINE_NORMALIZE_DBFS', 'SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB',
+        'LOCAL_STT_RESAMPLER', 'SHERPA_OFFLINE_DEBUG_SEGMENTS',
         // Local AI Server - Tone STT
         'TONE_MODEL_PATH', 'TONE_DECODER_TYPE', 'TONE_KENLM_PATH', 'INCLUDE_TONE',
         'ONNX_ASR_MODEL', 'ONNX_ASR_MODEL_PATH', 'ONNX_ASR_CACHE_DIR', 'ONNX_ASR_QUANTIZATION', 'ONNX_ASR_DEVICE', 'INCLUDE_ONNX_ASR',
@@ -650,6 +651,71 @@ const EnvPage = () => {
     const logFilePathTooltip = logFilePath.startsWith(defaultContainerMediaPrefix) || !logFilePath
         ? `This is a path inside the ai_engine container. With the default docker-compose mount (./asterisk_media → /mnt/asterisk_media), the host file is ${hostLogPathHint}. You can confirm mounts in Admin → Docker Services.`
         : 'This is a path inside the ai_engine container. To find the host file location, confirm the ai_engine mounts in Admin → Docker Services.';
+
+    // The phrase segmenter shared by the VAD-gated offline recognizers (Sherpa offline, onnx-asr):
+    // the Silero VAD gate, the audio kept around a phrase, its loudness and the 8 kHz ingress.
+    const renderOfflineSegmenterFields = (prefix: string) => (
+        <>
+            <FormInput
+                label={`${prefix} VAD Model Path`}
+                value={env['SHERPA_VAD_MODEL_PATH'] || '/app/models/vad/silero_vad.onnx'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MODEL_PATH', e.target.value)}
+                tooltip="Path to the Silero VAD ONNX model that cuts the caller's audio into phrases before offline decoding. Downloaded automatically when missing."
+            />
+            <FormInput
+                label={`${prefix} VAD Threshold`}
+                value={env['SHERPA_VAD_THRESHOLD'] || '0.35'}
+                onChange={(e) => updateEnv('SHERPA_VAD_THRESHOLD', e.target.value)}
+                tooltip="Speech probability at which the phrase VAD opens (0-1). Lower values hear softer speech and quiet consonants earlier but can admit more noise; 0.25-0.35 suits telephone audio."
+            />
+            <FormInput
+                label={`${prefix} VAD Min Silence (ms)`}
+                value={env['SHERPA_VAD_MIN_SILENCE_MS'] || '700'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MIN_SILENCE_MS', e.target.value)}
+                tooltip="Silence that closes a phrase. Higher values keep a phrase with a pause in one piece; the recognizer's result arrives this long after the caller stops, so keep the pipeline's end_of_turn_vad_final_wait_ms above it."
+            />
+            <FormInput
+                label={`${prefix} VAD Min Speech (ms)`}
+                value={env['SHERPA_VAD_MIN_SPEECH_MS'] || '200'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MIN_SPEECH_MS', e.target.value)}
+                tooltip="Voiced duration before the VAD accepts a phrase; a shorter reply is dropped. 120-200 ms for one-word replies (yes, no, numbers)."
+            />
+            <FormInput
+                label={`${prefix} Pre-roll (ms)`}
+                value={env['SHERPA_OFFLINE_PREROLL_MS'] || '350'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_PREROLL_MS', e.target.value)}
+                tooltip="Audio taken from the stream before the VAD's start of a phrase, so the first consonant the VAD missed is decoded. 0 turns it off."
+            />
+            <FormInput
+                label={`${prefix} Post-roll (ms)`}
+                value={env['SHERPA_OFFLINE_POSTROLL_MS'] || '300'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_POSTROLL_MS', e.target.value)}
+                tooltip="Audio taken from the stream after the VAD's end of a phrase (the VAD cuts where the closing silence began), so the last consonant is decoded. At most the min-silence window is available; 0 turns it off."
+            />
+            <FormInput
+                label={`${prefix} Loudness Target (dBFS)`}
+                value={env['SHERPA_OFFLINE_NORMALIZE_DBFS'] || '-20'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_NORMALIZE_DBFS', e.target.value)}
+                tooltip="Each phrase is brought to this RMS level (measured on the speech part) before decoding, since telephone audio often reaches the recognizer at -35...-45 dBFS. -20 is a common ASR level; 0 turns the normalization off."
+            />
+            <FormInput
+                label={`${prefix} Max Gain (dB)`}
+                value={env['SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB'] || '24'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB', e.target.value)}
+                tooltip="Largest boost the loudness normalization may apply, so faint noise is not amplified without limit. Peaks are always kept below full scale."
+            />
+            <FormSelect
+                label="Local STT 8 kHz Upsampler"
+                value={env['LOCAL_STT_RESAMPLER'] || 'fir'}
+                onChange={(e) => updateEnv('LOCAL_STT_RESAMPLER', e.target.value)}
+                options={[
+                    { value: 'fir', label: 'FIR (polyphase windowed-sinc, alias-safe)' },
+                    { value: 'ratecv', label: 'ratecv (legacy linear interpolation)' },
+                ]}
+                tooltip="How the server brings 8 kHz client audio to the recognizer's 16 kHz. The engine already sends 16 kHz (see the local provider's STT Input Upsampler), so this applies to clients that still send 8 kHz. Linear interpolation mirrors the top of the telephone band above 4 kHz; the FIR does not."
+            />
+        </>
+    );
 
     return (
         <div className="space-y-6">
@@ -1571,40 +1637,7 @@ const EnvPage = () => {
                                         ? 'Path to a non-streaming Sherpa transducer model directory such as sherpa-onnx-zipformer-en-2023-06-26.'
                                         : 'Path to a streaming Sherpa model directory.'}
                                 />
-                                {(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline' && (
-                                    <>
-                                        <FormInput
-                                            label="Sherpa VAD Model Path"
-                                            value={env['SHERPA_VAD_MODEL_PATH'] || '/app/models/vad/silero_vad.onnx'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MODEL_PATH', e.target.value)}
-                                            tooltip="Path to the Silero VAD ONNX model used to segment speech before offline decoding."
-                                        />
-                                        <FormInput
-                                            label="Sherpa VAD Threshold"
-                                            value={env['SHERPA_VAD_THRESHOLD'] || '0.35'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_THRESHOLD', e.target.value)}
-                                            tooltip="Speech sensitivity for Sherpa offline Silero VAD. Lower values hear softer speech earlier but can admit more noise."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Min Silence (ms)"
-                                            value={env['SHERPA_VAD_MIN_SILENCE_MS'] || '700'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SILENCE_MS', e.target.value)}
-                                            tooltip="Silence required before Sherpa offline closes a segment. Higher values reduce short-phrase fragmentation."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Min Speech (ms)"
-                                            value={env['SHERPA_VAD_MIN_SPEECH_MS'] || '200'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SPEECH_MS', e.target.value)}
-                                            tooltip="Minimum voiced duration before Sherpa offline accepts a speech segment."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Offline Preroll (ms)"
-                                            value={env['SHERPA_OFFLINE_PREROLL_MS'] || '350'}
-                                            onChange={(e) => updateEnv('SHERPA_OFFLINE_PREROLL_MS', e.target.value)}
-                                            tooltip="Audio padding retained before VAD start so Sherpa offline does not clip the beginning of utterances."
-                                        />
-                                    </>
-                                )}
+                                {(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline' && renderOfflineSegmenterFields('Sherpa')}
                             </>
                         )}
 
@@ -1651,6 +1684,7 @@ const EnvPage = () => {
                                     onChange={(e) => updateEnv('ONNX_ASR_MODEL_PATH', e.target.value)}
                                     tooltip="Directory that already holds the model files (config.json, the .onnx and the vocabulary). Leave empty to download into ONNX_ASR_CACHE_DIR (/app/models/stt/onnx-asr) on first start."
                                 />
+                                {renderOfflineSegmenterFields('onnx-asr')}
                             </>
                         )}
 

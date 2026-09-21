@@ -635,6 +635,31 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                             </select>
                         </div>
 
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">STT Input Upsampler (8 → 16 kHz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>STT Input Upsampler</strong> — how the caller's 8 kHz telephone audio is brought to the 16 kHz the local recognizers decode, before it is sent to the Local AI Server.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><code>fir</code> — polyphase windowed-sinc interpolation: flat telephone band, no spectral images, about 3 ms of delay. Recommended for GigaAM v3, Sherpa and Whisper.</li>
+                                                <li><code>linear</code> — the previous linear interpolation: rolls the band off by 2–3 dB at 3 kHz and mirrors it above 4 kHz (a 3 kHz tone shows up at 5 kHz at about −13 dB), which the recognizer sees as noise.</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
+                            <select
+                                className="w-full p-2 rounded border border-input bg-background"
+                                value={config.stt_input_resampler || 'fir'}
+                                onChange={(e) => handleChange('stt_input_resampler', e.target.value)}
+                            >
+                                <option value="fir">FIR (alias-safe, recommended)</option>
+                                <option value="linear">Linear (legacy)</option>
+                            </select>
+                        </div>
+
                         {/* Vosk settings */}
                         {config.stt_backend === 'vosk' && (
                             <div className="space-y-2">

@@ -65,6 +65,12 @@ class SessionContext:
     # lock so a trailing flush never races a decode running in a worker thread.
     onnx_asr_vad: Optional[Any] = None
     onnx_asr_lock: Optional[Any] = None
+    # VAD-gated offline STT (Sherpa offline, onnx-asr): the stream memory that
+    # widens a VAD segment with the audio really before and after it (kept for
+    # the whole session; only the VAD is recreated after a final) and the
+    # per-session 8 kHz -> 16 kHz FIR upsampler for clients that send 8 kHz.
+    stt_context: Optional[Any] = None
+    stt_upsampler: Optional[Any] = None
     # T-one session state
     tone_state: Optional[Any] = None
     tone_buffer_8k: bytes = b""
