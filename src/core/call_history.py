@@ -492,6 +492,42 @@ class CallHistoryStore:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _sync)
 
+    async def update_conversation_history(
+        self, call_id: str, conversation_history: List[Dict[str, Any]]
+    ) -> bool:
+        """Replace the stored transcript of an existing call record.
+
+        The record is written once, before the post-call tools run, but the
+        conversation can still grow after that write (the caller's last words
+        recorded after a hangup), so the engine syncs the transcript again at
+        the end of the call's cleanup. Returns False when no row exists.
+        """
+        if not self._enabled:
+            return False
+
+        def _sync():
+            with self._lock:
+                conn = self._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE call_records SET conversation_history = ? WHERE call_id = ?",
+                        (json.dumps(list(conversation_history or [])), call_id),
+                    )
+                    conn.commit()
+                    return cur.rowcount > 0
+                except Exception as exc:
+                    logger.error(
+                        "update_conversation_history failed",
+                        extra={"call_id": call_id, "error": str(exc)},
+                    )
+                    return False
+                finally:
+                    conn.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _sync)
+
     async def get(self, record_id: str) -> Optional[CallRecord]:
         """
         Get a call record by ID.

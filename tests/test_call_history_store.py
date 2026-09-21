@@ -341,3 +341,22 @@ async def test_store_warmup_initializes_off_loop(tmp_path, monkeypatch):
     # Initialized off-loop: subsequent persist sees a ready store, no sync init.
     assert store._initialized is True
     assert ch.get_call_history_store() is store
+
+
+@pytest.mark.asyncio
+async def test_update_conversation_history_rewrites_an_existing_record_only(tmp_path, monkeypatch):
+    """The transcript is synced again after the write when the conversation grows during cleanup."""
+    monkeypatch.setenv("CALL_HISTORY_ENABLED", "true")
+    from src.core.call_history import CallHistoryStore, CallRecord
+
+    store = CallHistoryStore(db_path=str(tmp_path / "transcript_sync.db"))
+    now = datetime.now(timezone.utc)
+    history = [{"role": "assistant", "content": "Чем могу помочь?"}]
+    assert await store.save(CallRecord(call_id="sync-1", start_time=now, end_time=now, conversation_history=history)) is True
+
+    grown = history + [{"role": "user", "content": "да, перезвоните завтра"}]
+    assert await store.update_conversation_history("sync-1", grown) is True
+    fetched = await store.get_by_call_id("sync-1")
+    assert [m["content"] for m in fetched.conversation_history] == ["Чем могу помочь?", "да, перезвоните завтра"]
+
+    assert await store.update_conversation_history("missing", grown) is False

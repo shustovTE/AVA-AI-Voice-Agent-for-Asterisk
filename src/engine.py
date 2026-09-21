@@ -886,6 +886,10 @@ class Engine:
         self._terminal_hangup_reasons: Dict[str, str] = {}
         self._terminal_fallback_reasons: Dict[str, str] = {}
         self._terminal_hangup_cancelled: Set[str] = set()
+        # Calls whose record is already in the call history: the transcript
+        # of such a record is synced again when the conversation grows later
+        # in the cleanup (the caller's last words after a hangup).
+        self._call_history_persisted: Set[str] = set()
         # A rejected VICIdial leg may survive a failed ARI DELETE after the
         # call session is cleaned up. Keep an independent owner retrying that
         # exact channel until Asterisk accepts the hangup or reports it gone.
@@ -8125,6 +8129,7 @@ class Engine:
             await self.session_store.upsert_call(session)
         except Exception:
             logger.debug("Failed to persist the caller's last words", call_id=session.call_id, exc_info=True)
+        await self._sync_call_history_transcript(session, reason="last-words")
         return True
 
     async def _record_turn_cut_by_hangup(self, session: CallSession, transcript_text: str) -> None:
@@ -8148,6 +8153,40 @@ class Engine:
             await self.session_store.upsert_call(session)
         except Exception:
             logger.debug("Failed to persist the reply cut by the hangup", call_id=session.call_id, exc_info=True)
+        await self._sync_call_history_transcript(session, reason="reply-cut-by-hangup")
+
+    async def _sync_call_history_transcript(self, session: CallSession, *, reason: str) -> bool:
+        """Write the session's conversation into an already persisted call record.
+
+        The record is saved once, before the post-call tools run; anything the
+        conversation gains after that (the caller's last words recorded after
+        a hangup, a turn the cleanup cancelled) would reach the webhooks but
+        not the call history the Admin UI shows. Best effort: no record, no
+        store, nothing to do.
+        """
+        call_id = session.call_id
+        persisted_calls = getattr(self, "_call_history_persisted", None) or set()
+        if call_id not in persisted_calls:
+            return False
+        try:
+            from src.core.call_history import get_call_history_store
+
+            store = get_call_history_store()
+            if not getattr(store, "_enabled", False):
+                return False
+            history = list(getattr(session, "conversation_history", None) or [])
+            updated = await store.update_conversation_history(call_id, history)
+            if updated:
+                logger.info(
+                    "Call history transcript synced after the record was written",
+                    call_id=call_id,
+                    reason=reason,
+                    entries=len(history),
+                )
+            return bool(updated)
+        except Exception:
+            logger.debug("Call history transcript sync failed", call_id=call_id, reason=reason, exc_info=True)
+            return False
 
     async def _settle_pipeline_on_hangup(self, session: CallSession) -> None:
         """Before the dialog worker is cancelled: what the caller heard, and what they last said.
@@ -10314,6 +10353,16 @@ class Engine:
             # Clean up call start time after post-call tools have used it
             _call_start_times.pop(call_id, None)
 
+            # The record was written before the post-call tools; whatever the
+            # conversation gained since (the caller's last words, a turn the
+            # cleanup cancelled) goes into it too, so the Admin UI shows the
+            # same transcript the webhooks were given.
+            try:
+                await self._sync_call_history_transcript(session, reason="cleanup-end")
+            except Exception:
+                logger.debug("Final call history transcript sync failed", call_id=call_id, exc_info=True)
+            getattr(self, "_call_history_persisted", set()).discard(call_id)
+
             # Finally remove the session.
             await self.session_store.remove_call(call_id)
 
@@ -10523,6 +10572,10 @@ class Engine:
             saved = await store.save(record)
             if saved:
                 logger.debug("Call history record saved", call_id=call_id, record_id=record.id)
+                persisted_calls = getattr(self, "_call_history_persisted", None)
+                if persisted_calls is None:
+                    persisted_calls = self._call_history_persisted = set()
+                persisted_calls.add(call_id)
 
                 # CallHistoryStore.save(...) is dedupe-by-call_id; when a record already exists,
                 # `record.id` is not the persisted row id. Resolve the persisted id so outbound

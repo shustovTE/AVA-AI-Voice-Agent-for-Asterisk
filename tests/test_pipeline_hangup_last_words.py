@@ -243,3 +243,74 @@ async def test_a_turn_cancelled_in_the_llm_keeps_the_callers_words(monkeypatch):
 
     assert _users(session) == [LAST_WORDS]
     assert not any(m.get("role") == "assistant" for m in session.conversation_history)
+
+
+# --- the call history record follows the conversation to the end of the cleanup ----
+#
+# The record is written once, before the post-call tools; the caller's last
+# words could land after that write and reach the webhooks but not the record
+# the Admin UI shows.
+
+
+class _FakeHistoryStore:
+    _enabled = True
+
+    def __init__(self):
+        self.saved = None
+        self.updates = []
+
+    async def save(self, record):
+        self.saved = list(record.conversation_history)
+        return True
+
+    async def get_by_call_id(self, call_id):
+        return None
+
+    async def update_conversation_history(self, call_id, history):
+        self.updates.append((call_id, list(history)))
+        return True
+
+
+def _fake_store(monkeypatch):
+    import src.core.call_history as call_history
+
+    store = _FakeHistoryStore()
+    monkeypatch.setattr(call_history, "get_call_history_store", lambda: store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_the_record_is_synced_at_the_end_of_the_cleanup_with_the_last_words(monkeypatch):
+    engine, session, stt, llm = await _start(monkeypatch)
+    store = _fake_store(monkeypatch)
+    engine._pipeline_stt_final_expected_at[session.call_id] = time.monotonic()
+
+    async def late_result():
+        await asyncio.sleep(0.2)
+        await stt.results.put(LAST_WORDS)
+
+    asyncio.create_task(late_result())
+    await engine._cleanup_call(session.call_id)
+
+    assert store.saved is not None
+    assert store.updates and store.updates[-1][0] == session.call_id
+    assert [m["content"] for m in store.updates[-1][1] if m["role"] == "user"] == [LAST_WORDS]
+    assert session.call_id not in engine._call_history_persisted
+
+
+@pytest.mark.asyncio
+async def test_words_recorded_after_the_write_update_the_record_at_once(monkeypatch):
+    engine, session, stt, llm = await _start(monkeypatch)
+    store = _fake_store(monkeypatch)
+    session.cleanup_in_progress = True
+    await engine._persist_call_history(session, session.call_id)
+    assert store.saved == [] and session.call_id in engine._call_history_persisted
+
+    assert await engine._record_caller_words_after_hangup(session, LAST_WORDS) is True
+
+    assert store.updates == [(session.call_id, session.conversation_history)]
+    assert [m["content"] for m in store.updates[0][1]] == [LAST_WORDS]
+    # Nothing to sync for a call whose record was never written.
+    engine._call_history_persisted.discard(session.call_id)
+    assert await engine._sync_call_history_transcript(session, reason="test") is False
+    await engine._cleanup_call(session.call_id)
