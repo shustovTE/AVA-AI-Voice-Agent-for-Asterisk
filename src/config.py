@@ -1126,6 +1126,15 @@ class StreamingConfig(BaseModel):
     # Overlap LLM token streaming with TTS synthesis in modular pipelines.
     # Streams tokens → splits into sentences → synthesizes each sentence concurrently.
     pipeline_streaming_overlap: bool = Field(default=True)
+    # Interrupted pipeline replies: keep in the conversation history only what the
+    # caller could hear, estimated from the audio that had reached the transport when
+    # the barge-in cut the stream (whole sentences plus a proportional prefix of the
+    # cut one, marked with an ellipsis). Off: the whole reply (serial mode) or the
+    # sentences queued so far (overlap mode) stay in the history, as before.
+    pipeline_heard_reply_on_interrupt: bool = Field(default=True)
+    # Audio already sent to the transport but not yet heard when the caller spoke
+    # (transport latency and the caller's reaction); subtracted from the played position.
+    pipeline_heard_reply_lead_ms: int = Field(default=200, ge=0, le=5000)
     # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
     # adapter immediately when a user turn is detected, before LLM inference starts.
     pipeline_filler_enabled: bool = Field(default=False)

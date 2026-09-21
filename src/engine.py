@@ -96,6 +96,7 @@ from .core.smart_turn import (
     ensure_model_file as ensure_smart_turn_model_file,
     load_model as load_smart_turn_model,
 )
+from .core.heard_reply import SpokenReply
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
@@ -808,6 +809,9 @@ class Engine:
         self._resample_state_pipeline16k: Dict[str, Optional[tuple]] = {}
         # Silence budget per call while gated, and how much of it is spent.
         self._pipeline_gated_silence_ms: Dict[str, float] = {}
+        # Per call: the pipeline reply currently on the playback stream and what the
+        # caller heard of it when a barge-in cut it (streaming.pipeline_heard_reply_on_interrupt).
+        self._spoken_replies: Dict[str, SpokenReply] = {}
         self._pipeline_gated_silence_used_ms: Dict[str, float] = {}
         # Asterisk talk-detect state per pipeline call, and the event that wakes
         # the dialog worker when it changes, so the end of a turn is decided by
@@ -7968,6 +7972,96 @@ class Engine:
                 # slow consumer keeps draining; a cancelled/replaced stream exits.
                 continue
 
+    # ── Interrupted pipeline replies: what the caller heard ──────────────────
+    def _heard_reply_enabled(self) -> bool:
+        cfg = getattr(self.config, "streaming", None)
+        return bool(getattr(cfg, "pipeline_heard_reply_on_interrupt", False)) if cfg else False
+
+    def _begin_spoken_reply(self, call_id: str, stream_id: Any, pipeline: Any) -> Optional[SpokenReply]:
+        """Start tracking the reply about to be synthesized onto ``stream_id``."""
+        if not self._heard_reply_enabled():
+            self._spoken_replies.pop(call_id, None)
+            return None
+        encoding, rate = self._pipeline_tts_source_format(pipeline)
+        narrow = str(encoding).lower() in {"mulaw", "ulaw", "g711_ulaw", "alaw", "g711_alaw"}
+        bytes_per_ms = max(1e-6, float(rate) * (1.0 if narrow else 2.0) / 1000.0)
+        cfg = getattr(self.config, "streaming", None)
+        try:
+            lead_ms = float(getattr(cfg, "pipeline_heard_reply_lead_ms", 200) or 0)
+        except (TypeError, ValueError):
+            lead_ms = 200.0
+        record = SpokenReply(
+            call_id=call_id,
+            stream_id=str(stream_id),
+            bytes_per_ms=bytes_per_ms,
+            lead_ms=lead_ms,
+        )
+        self._spoken_replies[call_id] = record
+        return record
+
+    async def _note_pipeline_reply_interrupted(
+        self, session: CallSession, played_ms: float
+    ) -> Optional[SpokenReply]:
+        """A barge-in cut the call's stream after ``played_ms`` of audio reached the transport.
+
+        Only the reply that owns the cut stream is affected; a filler phrase, a
+        greeting or a caller-inactivity announcement has no record and is left
+        alone. When the reply is already in the history it is rewritten to the
+        heard part right away; otherwise the pipeline runner reads the record
+        when it persists the turn.
+        """
+        call_id = session.call_id
+        record = self._spoken_replies.get(call_id)
+        if record is None or record.interrupted:
+            return record
+        manager = getattr(self, "streaming_playback_manager", None)
+        try:
+            owns_stream = bool(manager and manager.is_stream_active(call_id, record.stream_id))
+        except Exception:
+            owns_stream = False
+        if not owns_stream:
+            return None
+        heard = record.mark_interrupted(float(played_ms))
+        logger.info(
+            "Pipeline reply interrupted; keeping the heard part",
+            call_id=call_id,
+            stream_id=record.stream_id,
+            played_ms=int(played_ms),
+            heard_chars=len(heard),
+            generated_chars=len(record.full_text),
+            reply_complete=record.completed,
+        )
+        await self._patch_interrupted_reply_history(session, record)
+        return record
+
+    async def _patch_interrupted_reply_history(self, session: CallSession, record: SpokenReply) -> bool:
+        """Replace the persisted assistant text of an interrupted reply with the heard part."""
+        target = str(record.persisted_text or "").strip()
+        if not target:
+            return False
+        history = list(getattr(session, "conversation_history", None) or [])
+        for index in range(len(history) - 1, -1, -1):
+            entry = history[index]
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            if str(entry.get("content") or "").strip() != target:
+                continue
+            heard = str(record.heard_text or "").strip()
+            if heard == target:
+                return False
+            if heard:
+                patched = dict(entry)
+                patched["content"] = heard
+                patched["interrupted"] = True
+                history[index] = patched
+            else:
+                del history[index]
+            session.conversation_history = history
+            record.persisted_text = heard
+            await self._save_session(session)
+            return True
+        return False
+
     def _pipeline_tts_uses_streaming(self, pipeline: Any) -> bool:
         """Resolve the pipeline TTS delivery mode for every response path."""
         override = (
@@ -9865,6 +9959,7 @@ class Engine:
             self._resample_state_pipeline16k.pop(call_id, None)
             self._pipeline_gated_silence_ms.pop(call_id, None)
             self._pipeline_gated_silence_used_ms.pop(call_id, None)
+            self._spoken_replies.pop(call_id, None)
             self._pipeline_caller_talking.pop(call_id, None)
             self._pipeline_caller_talk_changed_at.pop(call_id, None)
             self._pipeline_turn_wakeup.pop(call_id, None)
@@ -12635,6 +12730,10 @@ class Engine:
                 playback_position_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
             except Exception:
                 pass
+            try:
+                await self._note_pipeline_reply_interrupted(session, playback_position_ms)
+            except Exception:
+                logger.debug("Heard-reply bookkeeping failed during barge-in", call_id=call_id, exc_info=True)
             try:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
             except Exception:
@@ -16554,6 +16653,7 @@ class Engine:
                         # Sentences fully handed to playback; on an interruption
                         # this is what the caller could have heard.
                         spoken_text = ""
+                        heard_rec: Optional[SpokenReply] = None
                         first_tts_ts: Optional[float] = None
 
                         stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -16585,6 +16685,7 @@ class Engine:
                             )
                             if not stream_id:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
+                            heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
 
                             async for token in pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
@@ -16599,10 +16700,14 @@ class Engine:
                                     sentence_buffer = sentence_buffer[split_pos:]
 
                                     if to_speak:
+                                        if heard_rec:
+                                            heard_rec.open_segment(to_speak)
                                         async for tts_chunk in pipeline.tts_adapter.synthesize(
                                             call_id, to_speak, pipeline.tts_options,
                                         ):
                                             if tts_chunk:
+                                                if heard_rec:
+                                                    heard_rec.add_audio_bytes(len(tts_chunk))
                                                 if first_tts_ts is None:
                                                     first_tts_ts = time.time()
                                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
@@ -16617,15 +16722,21 @@ class Engine:
                                                 await self._put_pipeline_stream_chunk(
                                                     call_id, stream_id, stream_q, tts_chunk
                                                 )
+                                        if heard_rec:
+                                            heard_rec.close_segment()
                                         spoken_text += to_speak + " "
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
                             if remainder:
+                                if heard_rec:
+                                    heard_rec.open_segment(remainder)
                                 async for tts_chunk in pipeline.tts_adapter.synthesize(
                                     call_id, remainder, pipeline.tts_options,
                                 ):
                                     if tts_chunk:
+                                        if heard_rec:
+                                            heard_rec.add_audio_bytes(len(tts_chunk))
                                         if first_tts_ts is None:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
@@ -16633,12 +16744,16 @@ class Engine:
                                         await self._put_pipeline_stream_chunk(
                                             call_id, stream_id, stream_q, tts_chunk
                                         )
+                                if heard_rec:
+                                    heard_rec.close_segment()
                                 spoken_text += remainder
 
                             # End-of-segment sentinel
                             await self._put_pipeline_stream_chunk(
                                 call_id, stream_id, stream_q, None
                             )
+                            if heard_rec:
+                                heard_rec.completed = True
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -16648,13 +16763,21 @@ class Engine:
                                 pass
 
                         except _PipelinePlaybackInterrupted:
-                            spoken = spoken_text.strip()
+                            # The barge-in handler measured what had played and left
+                            # the heard estimate on the record; without it (the
+                            # feature off, or a stream cut by something else) the
+                            # sentences fully handed to playback are kept, as before.
+                            heard_known = bool(
+                                heard_rec is not None and heard_rec.interrupted and heard_rec.heard_text is not None
+                            )
+                            spoken = (heard_rec.heard_text or "").strip() if heard_known else spoken_text.strip()
                             logger.info(
                                 "Pipeline streaming turn interrupted; discarding remaining TTS",
                                 call_id=call_id,
                                 stream_id=stream_id,
                                 spoken_chars=len(spoken),
                                 generated_chars=len(full_response_text),
+                                heard_estimate=heard_known,
                             )
                             try:
                                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
@@ -16666,7 +16789,11 @@ class Engine:
                             # are kept, so the history says what was actually heard.
                             conversation_history.append(_ts_msg("user", transcript_text))
                             if spoken:
-                                conversation_history.append(_ts_msg("assistant", spoken))
+                                conversation_history.append(
+                                    _ts_msg("assistant", spoken, interrupted=True) if heard_known else _ts_msg("assistant", spoken)
+                                )
+                            if heard_rec is not None:
+                                heard_rec.persisted_text = spoken
                             session.conversation_history = list(conversation_history)
                             try:
                                 await self.session_store.upsert_call(session)
@@ -16700,7 +16827,16 @@ class Engine:
                             response_text = full_response_text.strip()
                             _streaming_handled = True
                             conversation_history.append(_ts_msg("user", transcript_text))
-                            conversation_history.append(_ts_msg("assistant", response_text))
+                            if heard_rec is not None and heard_rec.interrupted:
+                                # The caller cut the reply after its last chunk was queued.
+                                heard = str(heard_rec.heard_text or "").strip()
+                                if heard:
+                                    conversation_history.append(_ts_msg("assistant", heard, interrupted=True))
+                                heard_rec.persisted_text = heard
+                            else:
+                                conversation_history.append(_ts_msg("assistant", response_text))
+                                if heard_rec is not None:
+                                    heard_rec.persisted_text = response_text
                             session.conversation_history = list(conversation_history)
                             await self.session_store.upsert_call(session)
 
@@ -16955,6 +17091,7 @@ class Engine:
                         if use_streaming_playback:
                             stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
                             stream_id: Optional[str] = None
+                            heard_rec: Optional[SpokenReply] = None
                             old_provider_name = getattr(session, "provider_name", None)
                             try:
                                 # Provide a stable provider label for adaptive streaming + metrics
@@ -16985,10 +17122,17 @@ class Engine:
                                     raise RuntimeError("start_streaming_playback returned no stream_id")
                                 playback_id = stream_id
                                 first_tts_ts: Optional[float] = None
+                                heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
+                                if heard_rec:
+                                    # The whole reply is already in the history (appended above).
+                                    heard_rec.open_segment(response_text)
+                                    heard_rec.persisted_text = response_text
 
                                 async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
                                     if not tts_chunk:
                                         continue
+                                    if heard_rec:
+                                        heard_rec.add_audio_bytes(len(tts_chunk))
                                     if first_tts_ts is None:
                                         first_tts_ts = time.time()
                                         turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
@@ -17006,6 +17150,9 @@ class Engine:
                                 await self._put_pipeline_stream_chunk(
                                     call_id, stream_id, stream_q, None
                                 )
+                                if heard_rec:
+                                    heard_rec.close_segment()
+                                    heard_rec.completed = True
                                 try:
                                     if playback_id and t_start is not None:
                                         _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
@@ -17021,6 +17168,11 @@ class Engine:
                                     await self.streaming_playback_manager.stop_streaming_playback(call_id)
                                 except Exception:
                                     pass
+                                if heard_rec is not None and heard_rec.interrupted:
+                                    try:
+                                        await self._patch_interrupted_reply_history(session, heard_rec)
+                                    except Exception:
+                                        logger.debug("Heard-reply history patch failed", call_id=call_id, exc_info=True)
                                 return
                             except Exception:
                                 logger.error("Pipeline streaming playback failed; falling back to file playback", call_id=call_id, exc_info=True)

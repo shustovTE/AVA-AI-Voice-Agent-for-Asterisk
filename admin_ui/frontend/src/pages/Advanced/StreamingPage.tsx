@@ -482,6 +482,27 @@ const StreamingPage = () => {
                 </ConfigCard>
             </ConfigSection>
 
+            <ConfigSection title="Interrupted Replies" description="What the conversation history keeps when the caller interrupts a pipeline reply.">
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <FormSwitch
+                            label="Keep only the heard part of an interrupted reply"
+                            description="Estimate what the caller heard from the audio that had reached the transport when the barge-in cut the stream: whole sentences plus a proportional prefix of the cut one, marked with an ellipsis. Off: the whole reply (or the sentences queued so far) stays in the history as if it had been spoken."
+                            checked={streamingConfig.pipeline_heard_reply_on_interrupt ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_heard_reply_on_interrupt', e.target.checked)}
+                            tooltip="Pipelines with streaming playback (Downstream Mode: stream). The LLM then sees only what was said; call summaries and post-call webhooks carry the same text."
+                        />
+                        <FormInput
+                            label="Heard-audio lead (ms)"
+                            type="number"
+                            value={streamingConfig.pipeline_heard_reply_lead_ms ?? 200}
+                            onChange={(e) => updateStreamingConfig('pipeline_heard_reply_lead_ms', parseInt(e.target.value))}
+                            tooltip="Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction). Subtracted from the played position; raise it if the history keeps words the caller did not hear."
+                        />
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
             <ConfigSection title="Diagnostics" description="Tools for debugging audio stream issues.">
                 <ConfigCard>
                     <div className="space-y-6">
