@@ -1141,6 +1141,11 @@ class StreamingConfig(BaseModel):
     # Audio already sent to the transport but not yet heard when the caller spoke
     # (transport latency and the caller's reaction); subtracted from the played position.
     pipeline_heard_reply_lead_ms: int = Field(default=200, ge=0, le=5000)
+    # After the caller hangs up, how long the call's cleanup waits for the words
+    # still in the recognizer (a VAD-gated model returns a phrase only after its
+    # closing silence, which the cleanup feeds it) before the call record is
+    # written; the result is the caller's last turn, with no LLM reply. 0 = off.
+    pipeline_hangup_final_wait_ms: int = Field(default=1500, ge=0, le=10000)
     # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
     # adapter immediately when a user turn is detected, before LLM inference starts.
     pipeline_filler_enabled: bool = Field(default=False)

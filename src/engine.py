@@ -8000,7 +8000,7 @@ class Engine:
         return record
 
     async def _note_pipeline_reply_interrupted(
-        self, session: CallSession, played_ms: float
+        self, session: CallSession, played_ms: float, *, require_active: bool = True
     ) -> Optional[SpokenReply]:
         """A barge-in cut the call's stream after ``played_ms`` of audio reached the transport.
 
@@ -8008,7 +8008,9 @@ class Engine:
         greeting or a caller-inactivity announcement has no record and is left
         alone. When the reply is already in the history it is rewritten to the
         heard part right away; otherwise the pipeline runner reads the record
-        when it persists the turn.
+        when it persists the turn. A hangup passes ``require_active=False``:
+        the pacer may already have died with the transport, but the call's
+        stream is still the reply's own.
         """
         call_id = session.call_id
         record = self._spoken_replies.get(call_id)
@@ -8017,6 +8019,9 @@ class Engine:
         manager = getattr(self, "streaming_playback_manager", None)
         try:
             owns_stream = bool(manager and manager.is_stream_active(call_id, record.stream_id))
+            if not owns_stream and not require_active and manager is not None:
+                info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+                owns_stream = str(info.get("stream_id") or "") == str(record.stream_id)
         except Exception:
             owns_stream = False
         if not owns_stream:
@@ -8035,11 +8040,16 @@ class Engine:
         return record
 
     async def _patch_interrupted_reply_history(self, session: CallSession, record: SpokenReply) -> bool:
-        """Replace the persisted assistant text of an interrupted reply with the heard part."""
+        """Replace the persisted assistant text of an interrupted reply with the heard part.
+
+        The session's list is patched in place, so every holder of it (the
+        dialog worker resyncs from it at each turn) sees the trimmed reply.
+        """
         target = str(record.persisted_text or "").strip()
         if not target:
             return False
-        history = list(getattr(session, "conversation_history", None) or [])
+        existing = getattr(session, "conversation_history", None)
+        history = existing if isinstance(existing, list) else list(existing or [])
         for index in range(len(history) - 1, -1, -1):
             entry = history[index]
             if not isinstance(entry, dict) or entry.get("role") != "assistant":
@@ -8056,11 +8066,152 @@ class Engine:
                 history[index] = patched
             else:
                 del history[index]
-            session.conversation_history = history
+            if history is not existing:
+                session.conversation_history = history
             record.persisted_text = heard
             await self._save_session(session)
             return True
         return False
+
+    # ── The caller hung up: what the record of the call still needs ─────────
+    @staticmethod
+    def _call_cleanup_started(session: Optional[CallSession]) -> bool:
+        if session is None:
+            return False
+        call_id = getattr(session, "call_id", None)
+        return call_id in _cleanup_in_progress or bool(getattr(session, "cleanup_in_progress", False))
+
+    async def _record_caller_words_after_hangup(self, session: CallSession, text: str) -> bool:
+        """Keep what the caller said when the call ended before the turn was answered.
+
+        The words become the caller's last turn in the conversation history,
+        with no LLM turn (nobody is left to answer), so the call record, the
+        post-call summary and the webhooks carry them. A turn the history
+        already holds is not repeated.
+        """
+        text = (text or "").strip()
+        if not text or not self._call_cleanup_started(session):
+            return False
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list):
+            history = list(history or [])
+            session.conversation_history = history
+        for entry in reversed(history):
+            if isinstance(entry, dict) and entry.get("role") == "user":
+                if str(entry.get("content") or "").strip() == text:
+                    return False
+                break
+        history.append(_ts_msg("user", text))
+        logger.info(
+            "Caller's last words recorded after hangup",
+            call_id=session.call_id,
+            chars=len(text),
+            preview=text[:80],
+        )
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the caller's last words", call_id=session.call_id, exc_info=True)
+        return True
+
+    async def _record_turn_cut_by_hangup(self, session: CallSession, transcript_text: str) -> None:
+        """A turn the call's cleanup cancelled: record the caller's words and the heard part of the reply."""
+        if not self._call_cleanup_started(session):
+            return
+        await self._record_caller_words_after_hangup(session, transcript_text)
+        record = self._spoken_replies.get(session.call_id)
+        if record is None or not record.interrupted or record.persisted_text is not None:
+            return
+        heard = str(record.heard_text or "").strip()
+        record.persisted_text = heard
+        if not heard:
+            return
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list):
+            history = list(history or [])
+            session.conversation_history = history
+        history.append(_ts_msg("assistant", heard, interrupted=True))
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the reply cut by the hangup", call_id=session.call_id, exc_info=True)
+
+    async def _settle_pipeline_on_hangup(self, session: CallSession) -> None:
+        """Before the dialog worker is cancelled: what the caller heard, and what they last said.
+
+        A reply the hangup cut is marked interrupted at the audio position the
+        transport had reached, like a barge-in. Then, when speech is
+        outstanding (the detector saw the caller talk after the recognizer's
+        last result, or a finalize is already pending), the recognizer is fed
+        its closing silence and the cleanup waits up to
+        ``streaming.pipeline_hangup_final_wait_ms`` for the result: a
+        VAD-gated model (GigaAM v3, Sherpa offline) returns a phrase only after
+        its silence gate, so a caller who speaks and hangs up at once leaves
+        the words in it. The dialog worker records the result as the caller's
+        last turn when it is cancelled.
+        """
+        call_id = session.call_id
+        if call_id not in self._pipeline_tasks:
+            return
+        try:
+            played_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
+        except Exception:
+            played_ms = 0
+        try:
+            await self._note_pipeline_reply_interrupted(session, played_ms, require_active=False)
+        except Exception:
+            logger.debug("Heard-reply bookkeeping failed during hangup", call_id=call_id, exc_info=True)
+
+        cfg = getattr(self.config, "streaming", None)
+        try:
+            wait_ms = int(getattr(cfg, "pipeline_hangup_final_wait_ms", 0) or 0)
+        except (TypeError, ValueError):
+            wait_ms = 0
+        if wait_ms <= 0:
+            return
+        now = time.monotonic()
+        last_final = self._pipeline_last_final_at.get(call_id)
+        expected_at = self._pipeline_stt_final_expected_at.get(call_id)
+        reason = "finalize pending" if expected_at is not None else ""
+        if not reason:
+            talking = bool(self._pipeline_caller_talking.get(call_id, False))
+            changed_at = self._pipeline_caller_talk_changed_at.get(call_id)
+            recent = changed_at is not None and (now - changed_at) <= 5.0
+            if recent and (talking or last_final is None or last_final < changed_at):
+                reason = "caller talked after the last result"
+        if not reason:
+            tracker = self._silero_trackers.get(call_id)
+            last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+            if (
+                last_speech is not None
+                and (now - last_speech) <= 5.0
+                and (last_final is None or last_final < last_speech)
+            ):
+                reason = "speech after the last result"
+        if not reason:
+            return
+        if expected_at is None:
+            burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
+            self._request_pipeline_stt_finalize(call_id, expect_result=True, burst_ms=burst_ms)
+        deadline = now + wait_ms / 1000.0
+        arrived = False
+        while time.monotonic() < deadline:
+            latest = self._pipeline_last_final_at.get(call_id)
+            if latest is not None and (last_final is None or latest > last_final):
+                arrived = True
+                break
+            await asyncio.sleep(0.02)
+        if arrived:
+            # Let the dialog worker take the result off its queue.
+            await asyncio.sleep(0)
+        logger.info(
+            "Waited for the caller's last words after hangup",
+            call_id=call_id,
+            reason=reason,
+            arrived=arrived,
+            waited_ms=int((time.monotonic() - now) * 1000),
+            limit_ms=wait_ms,
+        )
 
     def _pipeline_tts_uses_streaming(self, pipeline: Any) -> bool:
         """Resolve the pipeline TTS delivery mode for every response path."""
@@ -9727,6 +9878,14 @@ class Engine:
                         call_id=call_id,
                         exc_info=True,
                     )
+
+            # The caller may have hung up while the recognizer still held their
+            # last words, or while a reply was playing: settle both before the
+            # dialog worker is cancelled, so the record of the call is complete.
+            try:
+                await self._settle_pipeline_on_hangup(session)
+            except Exception:
+                logger.debug("Pipeline hangup settlement failed", call_id=call_id, exc_info=True)
 
             # Stop the dialog producer before tearing down playback or media.
             # An in-flight LLM request can otherwise finish after the first
@@ -12035,7 +12194,9 @@ class Engine:
             result_expected=expect_result,
         )
 
-    def _request_pipeline_stt_finalize(self, call_id: str, *, expect_result: bool) -> bool:
+    def _request_pipeline_stt_finalize(
+        self, call_id: str, *, expect_result: bool, burst_ms: Optional[int] = None
+    ) -> bool:
         """Feed the recognizer a burst of silence so it emits its result now.
 
         A streaming recognizer only closes a phrase after its own silence gate
@@ -12045,7 +12206,7 @@ class Engine:
         protocol change is needed; a recognizer that already emitted the phrase
         simply scores a little more silence.
         """
-        ms = int(self._silero_config()["stt_finalize_ms"])
+        ms = int(burst_ms) if burst_ms is not None else int(self._silero_config()["stt_finalize_ms"])
         queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
         if queue is None or ms <= 0:
             return False
@@ -16527,7 +16688,14 @@ class Engine:
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
                     ):
+                        # The call is ending; the caller's words still belong in its record.
+                        await self._record_caller_words_after_hangup(session, transcript_text)
                         return
+                    # The session is the record of the call: a barge-in trims the
+                    # reply it holds, an announcement or a tool appends to it. Every
+                    # turn starts from it, not from this worker's copy, or the next
+                    # persist would put the untrimmed reply back.
+                    conversation_history = list(session.conversation_history or [])
                     response_text = ""
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
@@ -17923,7 +18091,14 @@ class Engine:
                         # The ending is what end-of-turn tuning needs to see.
                         tail=aggregated[-40:] if len(aggregated) > 80 else None,
                     )
-                    await run_turn(aggregated)
+                    try:
+                        await run_turn(aggregated)
+                    except asyncio.CancelledError:
+                        # Cancelled by the call's cleanup with the turn unanswered:
+                        # the caller's words, and what they heard of a reply the
+                        # hangup cut, still go into the record.
+                        await self._record_turn_cut_by_hangup(session, aggregated)
+                        raise
 
                 def reevaluate() -> None:
                     """Recompute when the pending text may become a turn.
@@ -18028,10 +18203,28 @@ class Engine:
                     )
                     raise
                 finally:
-                    if get_task is not None and not get_task.done():
-                        get_task.cancel()
+                    leftovers: List[str] = []
+                    if get_task is not None:
+                        if not get_task.done():
+                            get_task.cancel()
+                        elif not get_task.cancelled() and get_task.exception() is None:
+                            leftovers.append(str(get_task.result() or ""))
                     if self._pipeline_turn_wakeup.get(call_id) is wakeup:
                         self._pipeline_turn_wakeup.pop(call_id, None)
+                    # Cancelled by the call's cleanup: the results the worker was
+                    # still holding for the end of the turn, and those it had not
+                    # taken off its queue yet, are the caller's last words.
+                    if self._call_cleanup_started(session):
+                        leftovers = list(pending_segments) + leftovers
+                        pending_segments.clear()
+                        while True:
+                            try:
+                                leftovers.append(str(transcript_queue.get_nowait() or ""))
+                            except asyncio.QueueEmpty:
+                                break
+                        text = " ".join(part.strip() for part in leftovers if part and part.strip()).strip()
+                        if text:
+                            await self._record_caller_words_after_hangup(session, text)
 
             async def dialog_supervisor() -> None:
                 restart_count = 0

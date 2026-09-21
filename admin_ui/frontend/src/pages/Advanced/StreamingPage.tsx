@@ -482,7 +482,7 @@ const StreamingPage = () => {
                 </ConfigCard>
             </ConfigSection>
 
-            <ConfigSection title="Interrupted Replies" description="What the conversation history keeps when the caller interrupts a pipeline reply.">
+            <ConfigSection title="Interrupted Replies" description="What the conversation history keeps when the caller interrupts a pipeline reply or hangs up.">
                 <ConfigCard>
                     <div className="space-y-6">
                         <FormSwitch
@@ -498,6 +498,13 @@ const StreamingPage = () => {
                             value={streamingConfig.pipeline_heard_reply_lead_ms ?? 200}
                             onChange={(e) => updateStreamingConfig('pipeline_heard_reply_lead_ms', parseInt(e.target.value))}
                             tooltip="Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction). Subtracted from the played position; raise it if the history keeps words the caller did not hear."
+                        />
+                        <FormInput
+                            label="Last words after hangup (ms)"
+                            type="number"
+                            value={streamingConfig.pipeline_hangup_final_wait_ms ?? 1500}
+                            onChange={(e) => updateStreamingConfig('pipeline_hangup_final_wait_ms', parseInt(e.target.value))}
+                            tooltip="When the caller hangs up right after speaking, the recognizer still holds their words (GigaAM v3 and Sherpa offline return a phrase only after 700 ms of silence). The call's cleanup feeds the recognizer its closing silence and waits up to this long for the result, which is recorded as the caller's last turn with no LLM reply; results the dialog was still holding for the end of the turn are recorded too. 0 turns the wait off."
                         />
                     </div>
                 </ConfigCard>

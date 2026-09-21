@@ -39,6 +39,21 @@ describe('StreamingPage interrupted replies', () => {
         expect(screen.getByLabelText('Heard-audio lead (ms)')).toHaveValue(200);
     });
 
+    it('shows the hangup wait with its default and saves it under streaming.pipeline_hangup_final_wait_ms', async () => {
+        render(<StreamingPage />);
+        const wait = await screen.findByLabelText('Last words after hangup (ms)');
+        expect(wait).toHaveValue(1500);
+        fireEvent.change(wait, { target: { value: '2500' } });
+        expect(wait).toHaveValue(2500);
+
+        fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+        await waitFor(() => expect(mocks.post).toHaveBeenCalled());
+        const call = mocks.post.mock.calls.find(([url]) => url === '/api/config/yaml') as [string, { content: string }];
+        const saved = yaml.load(call[1].content) as any;
+        expect(saved.streaming.pipeline_hangup_final_wait_ms).toBe(2500);
+    });
+
     it('saves the lead under streaming.pipeline_heard_reply_lead_ms', async () => {
         render(<StreamingPage />);
         const lead = await screen.findByLabelText('Heard-audio lead (ms)');
