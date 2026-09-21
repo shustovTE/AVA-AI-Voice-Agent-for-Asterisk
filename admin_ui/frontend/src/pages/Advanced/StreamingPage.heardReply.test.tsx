@@ -69,3 +69,26 @@ describe('StreamingPage interrupted replies', () => {
         expect(saved.streaming.pipeline_streaming_overlap).toBe(true);
     });
 });
+
+describe('StreamingPage discard of an unheard reply', () => {
+    beforeEach(() => {
+        mocks.post.mockReset();
+        mocks.post.mockResolvedValue({ data: { success: true, restart_required: true } });
+        mocks.config = { streaming: { pipeline_streaming_overlap: true } };
+    });
+
+    it('is on by default and saves under streaming.pipeline_discard_unheard_reply', async () => {
+        render(<StreamingPage />);
+        const discard = await screen.findByLabelText('Discard a reply the caller talks over before its first sound');
+        expect(discard).toBeChecked();
+        fireEvent.click(discard);
+        expect(discard).not.toBeChecked();
+
+        fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+        await waitFor(() => expect(mocks.post).toHaveBeenCalled());
+        const call = mocks.post.mock.calls.find(([url]) => url === '/api/config/yaml') as [string, { content: string }];
+        const saved = yaml.load(call[1].content) as any;
+        expect(saved.streaming.pipeline_discard_unheard_reply).toBe(false);
+    });
+});

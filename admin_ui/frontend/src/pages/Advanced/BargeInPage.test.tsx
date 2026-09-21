@@ -67,3 +67,49 @@ describe('BargeInPage talk-detect / Silero initial protection', () => {
         expect(saved.barge_in.initial_protection_ms).toBe(200);
     });
 });
+
+describe('BargeInPage shows only the fields of the detector that decides pipeline barge-in', () => {
+    beforeEach(() => {
+        mocks.post.mockReset();
+        mocks.post.mockResolvedValue({ data: { success: true, restart_required: true } });
+    });
+
+    it('with Silero VAD owning barge-in hides the energy detector and offers listening during playback', async () => {
+        mocks.config = {
+            barge_in: { enabled: true, pipeline_talk_detect_enabled: false },
+            vad: { silero_enabled: true, silero_barge_in: true },
+        };
+        render(<BargeInPage />);
+        expect(await screen.findByLabelText(FIELD)).toHaveValue(1500);
+        expect(screen.queryByLabelText('Initial Protection (ms)')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Pipeline Energy Threshold')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Pipeline Min Duration (ms)')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('TALK_DETECT Silence (ms)')).not.toBeInTheDocument();
+        expect(screen.getByLabelText('Greeting Protection Override (ms)')).toHaveValue(0);
+        // Full agents keep their own window, under their own heading.
+        expect(screen.getByLabelText('Provider Initial Protection (ms)')).toHaveValue(200);
+
+        const listen = screen.getByLabelText('Keep listening while the agent speaks');
+        expect(listen).not.toBeChecked();
+        fireEvent.click(listen);
+        fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+        await waitFor(() => expect(mocks.post).toHaveBeenCalled());
+        const [, body] = mocks.post.mock.calls.find(([u]) => u === '/api/config/yaml') as [string, { content: string }];
+        const saved = yaml.load(body.content) as any;
+        expect(saved.barge_in.pipeline_listen_during_playback).toBe(true);
+        expect(saved.barge_in.initial_protection_ms).toBeUndefined();
+    });
+
+    it('without Silero VAD and TALK_DETECT shows the energy detector fields instead', async () => {
+        mocks.config = {
+            barge_in: { enabled: true, pipeline_talk_detect_enabled: false, initial_protection_ms: 250 },
+            vad: { silero_enabled: false },
+        };
+        render(<BargeInPage />);
+        expect(await screen.findByLabelText('Initial Protection (ms)')).toHaveValue(250);
+        expect(screen.getByLabelText('Pipeline Energy Threshold')).toHaveValue(300);
+        expect(screen.queryByLabelText(FIELD)).not.toBeInTheDocument();
+        expect(screen.getByLabelText('Keep listening while the agent speaks')).toBeDisabled();
+    });
+});

@@ -137,6 +137,18 @@ const BargeInPage = () => {
     );
 
     const bargeInConfig = config.barge_in || {};
+    const vadConfig = config.vad || {};
+    // Which detector decides pipeline barge-in: Silero VAD (when it owns barge-in),
+    // else Asterisk TALK_DETECT, else the engine's own energy detector. The
+    // fields of the other detectors change nothing and stay hidden.
+    const sileroOwnsBargeIn = Boolean(vadConfig.silero_enabled) && (vadConfig.silero_barge_in ?? true);
+    const talkDetectEnabled = bargeInConfig.pipeline_talk_detect_enabled ?? true;
+    const energyDetectorActive = !sileroOwnsBargeIn && !talkDetectEnabled;
+    const pipelineDetectorLabel = sileroOwnsBargeIn
+        ? 'Silero VAD'
+        : talkDetectEnabled
+            ? 'Asterisk TALK_DETECT'
+            : 'the engine energy detector';
     const providerFallbackProviders = Array.isArray(bargeInConfig.provider_fallback_providers)
         ? (bargeInConfig.provider_fallback_providers as string[]).filter(Boolean)
         : [];
@@ -255,7 +267,7 @@ const BargeInPage = () => {
                                         <li><strong>Energy Threshold:</strong> Increase if barge-in is too sensitive (500-1200 typical)</li>
                                         <li><strong>Provider Output Suppress:</strong> Increase if provider resumes speaking pre-barge audio (800-1600ms typical)</li>
                                         <li><strong>Post-TTS Protection:</strong> Increase if you see immediate re-triggers after TTS ends (200-600ms typical)</li>
-                                        <li><strong>Talk-Detect / Silero Initial Protection:</strong> Lower (300-500ms) so callers can interrupt a reply sooner; raise it if the agent cuts itself off right after it starts speaking (echo on the line)</li>
+                                        <li><strong>Talk-Detect / Silero Initial Protection:</strong> Lower (300-800ms) so callers can interrupt a reply sooner; raise it if the agent cuts itself off right after it starts speaking (echo on the line). Speech before the reply's first sound never needs it: the reply is discarded instead.</li>
                                     </ul>
                                 </div>
                             </div>
@@ -273,35 +285,57 @@ const BargeInPage = () => {
                         <summary className="cursor-pointer text-sm font-medium">Show advanced settings</summary>
                         <div className="space-y-8 pt-4">
                             <div className="space-y-4">
-                                <div className="text-sm font-medium">Protection windows</div>
+                                <div className="text-sm font-medium">Pipeline protection windows</div>
+                                <p className="text-xs text-muted-foreground">
+                                    Pipeline barge-in is decided by {pipelineDetectorLabel}. One window applies at a time:
+                                    the detector&apos;s own, replaced by the greeting override while the greeting plays when that is longer.
+                                </p>
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    {energyDetectorActive ? (
+                                        <FormInput
+                                            label="Initial Protection (ms)"
+                                            type="number"
+                                            value={bargeInConfig.initial_protection_ms ?? 200}
+                                            onChange={(e) => updateBargeInConfig('initial_protection_ms', parseInt(e.target.value))}
+                                            tooltip="Engine energy detector (no Silero VAD, TALK_DETECT off): how long after agent output starts caller energy is ignored, against the initial burst and codec artifacts. Silero VAD and TALK_DETECT read the Talk-Detect / Silero window instead."
+                                        />
+                                    ) : (
+                                        <FormInput
+                                            label="Talk-Detect / Silero Initial Protection (ms)"
+                                            type="number"
+                                            value={bargeInConfig.talk_detect_initial_protection_ms ?? 1500}
+                                            onChange={(e) => updateBargeInConfig('talk_detect_initial_protection_ms', parseInt(e.target.value))}
+                                            tooltip="How long after agent audio starts the caller's speech is ignored by Asterisk TALK_DETECT and Silero VAD: the earliest a caller can interrupt a reply. It rejects phone echo of the agent's own voice; 0 lets the caller interrupt from the first millisecond (only with echo cancellation on the line). Counted from the stream start, about 200-300 ms before the first audible sound. Speech before the reply's first sound is never blocked by it: the reply is discarded instead (Streaming page → Interrupted Replies)."
+                                        />
+                                    )}
                                     <FormInput
-                                        label="Initial Protection (ms)"
-                                        type="number"
-                                        value={bargeInConfig.initial_protection_ms ?? 200}
-                                        onChange={(e) => updateBargeInConfig('initial_protection_ms', parseInt(e.target.value))}
-                                        tooltip="Short guard window at the start of agent output to avoid triggering on initial burst/codec artifacts."
-                                    />
-                                    <FormInput
-                                        label="Greeting Protection (ms)"
+                                        label="Greeting Protection Override (ms)"
                                         type="number"
                                         value={bargeInConfig.greeting_protection_ms ?? 0}
                                         onChange={(e) => updateBargeInConfig('greeting_protection_ms', parseInt(e.target.value))}
-                                        tooltip="Extra guard window during the initial greeting turn (useful if greetings are short and prone to false triggers). Replaces the talk-detect / Silero window below for the greeting when it is longer."
-                                    />
-                                    <FormInput
-                                        label="Talk-Detect / Silero Initial Protection (ms)"
-                                        type="number"
-                                        value={bargeInConfig.talk_detect_initial_protection_ms ?? 1500}
-                                        onChange={(e) => updateBargeInConfig('talk_detect_initial_protection_ms', parseInt(e.target.value))}
-                                        tooltip="Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk TALK_DETECT and Silero VAD. The caller's audio stays gated (silence reaches the recognizer) until a barge-in opens it, so this is the earliest a caller can interrupt a reply. It rejects phone echo of the agent's own voice; 0 lets the caller interrupt from the first millisecond. Lower it only on lines with working echo cancellation."
+                                        tooltip="Not a third window: while the greeting plays, the active window is replaced by this value when it is longer (it never shortens it). 0 leaves the greeting with the same window as every reply. Useful for short greetings that are cut by early echo."
                                     />
                                 </div>
+                                <FormSwitch
+                                    label="Keep listening while the agent speaks"
+                                    description="Pipelines with Silero VAD: the caller's audio keeps reaching the recognizer while the agent speaks, so what they say over a reply is transcribed whether or not it interrupts the reply. The protection window above still decides when speech may interrupt. Off: the recognizer gets silence while the agent is audible."
+                                    tooltip="Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent may transcribe itself. Words spoken into an audible reply are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard the reply."
+                                    checked={bargeInConfig.pipeline_listen_during_playback ?? false}
+                                    onChange={(e) => updateBargeInConfig('pipeline_listen_during_playback', e.target.checked)}
+                                    disabled={!sileroOwnsBargeIn}
+                                />
                             </div>
 
                             <div className="space-y-4">
                                 <div className="text-sm font-medium">Provider-owned mode</div>
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <FormInput
+                                        label="Provider Initial Protection (ms)"
+                                        type="number"
+                                        value={bargeInConfig.initial_protection_ms ?? 200}
+                                        onChange={(e) => updateBargeInConfig('initial_protection_ms', parseInt(e.target.value))}
+                                        tooltip="Full agents (OpenAI Realtime, Deepgram, Google Live, ...): inbound caller audio is dropped for this long after agent output starts, against self-echo (barge_in.initial_protection_ms). Pipelines with Silero VAD or TALK_DETECT do not read it; the engine energy detector does when both are off."
+                                    />
                                     <FormSwitch
                                         label="Provider Fallback Enabled"
                                         description="Use local VAD fallback only for providers that don’t emit explicit interruption events."
@@ -371,35 +405,49 @@ const BargeInPage = () => {
                                         checked={bargeInConfig.pipeline_talk_detect_enabled ?? true}
                                         onChange={(e) => updateBargeInConfig('pipeline_talk_detect_enabled', e.target.checked)}
                                     />
-                                    <FormInput
-                                        label="Pipeline Min Duration (ms)"
-                                        type="number"
-                                        value={bargeInConfig.pipeline_min_ms ?? 120}
-                                        onChange={(e) => updateBargeInConfig('pipeline_min_ms', parseInt(e.target.value))}
-                                        tooltip="Pipeline-specific minimum speech duration (more sensitive than provider-owned mode)."
-                                    />
-                                    <FormInput
-                                        label="Pipeline Energy Threshold"
-                                        type="number"
-                                        value={bargeInConfig.pipeline_energy_threshold ?? 300}
-                                        onChange={(e) => updateBargeInConfig('pipeline_energy_threshold', parseInt(e.target.value))}
-                                        tooltip="Pipeline-specific energy threshold (more sensitive than provider-owned mode)."
-                                    />
-                                    <FormInput
-                                        label="TALK_DETECT Silence (ms)"
-                                        type="number"
-                                        value={bargeInConfig.pipeline_talk_detect_silence_ms ?? 1200}
-                                        onChange={(e) => updateBargeInConfig('pipeline_talk_detect_silence_ms', parseInt(e.target.value))}
-                                        tooltip="Asterisk TALK_DETECT(set) silence threshold in ms. Higher treats more audio as ‘silence’."
-                                    />
-                                    <FormInput
-                                        label="TALK_DETECT Talking Threshold"
-                                        type="number"
-                                        value={bargeInConfig.pipeline_talk_detect_talking_threshold ?? 256}
-                                        onChange={(e) => updateBargeInConfig('pipeline_talk_detect_talking_threshold', parseInt(e.target.value))}
-                                        tooltip="Asterisk TALK_DETECT(set) talking threshold (DSP energy). Higher requires louder speech to trigger."
-                                    />
+                                    {energyDetectorActive && (
+                                        <FormInput
+                                            label="Pipeline Min Duration (ms)"
+                                            type="number"
+                                            value={bargeInConfig.pipeline_min_ms ?? 120}
+                                            onChange={(e) => updateBargeInConfig('pipeline_min_ms', parseInt(e.target.value))}
+                                            tooltip="Engine energy detector only: minimum sustained caller energy before a pipeline barge-in."
+                                        />
+                                    )}
+                                    {energyDetectorActive && (
+                                        <FormInput
+                                            label="Pipeline Energy Threshold"
+                                            type="number"
+                                            value={bargeInConfig.pipeline_energy_threshold ?? 300}
+                                            onChange={(e) => updateBargeInConfig('pipeline_energy_threshold', parseInt(e.target.value))}
+                                            tooltip="Engine energy detector only: RMS threshold over the caller's PCM16 frames."
+                                        />
+                                    )}
+                                    {talkDetectEnabled && (
+                                        <FormInput
+                                            label="TALK_DETECT Silence (ms)"
+                                            type="number"
+                                            value={bargeInConfig.pipeline_talk_detect_silence_ms ?? 1200}
+                                            onChange={(e) => updateBargeInConfig('pipeline_talk_detect_silence_ms', parseInt(e.target.value))}
+                                            tooltip="Asterisk TALK_DETECT(set) silence threshold in ms. Higher treats more audio as ‘silence’."
+                                        />
+                                    )}
+                                    {talkDetectEnabled && (
+                                        <FormInput
+                                            label="TALK_DETECT Talking Threshold"
+                                            type="number"
+                                            value={bargeInConfig.pipeline_talk_detect_talking_threshold ?? 256}
+                                            onChange={(e) => updateBargeInConfig('pipeline_talk_detect_talking_threshold', parseInt(e.target.value))}
+                                            tooltip="Asterisk TALK_DETECT(set) talking threshold (DSP energy). Higher requires louder speech to trigger."
+                                        />
+                                    )}
                                 </div>
+                                {!energyDetectorActive && (
+                                    <p className="text-xs text-muted-foreground">
+                                        The engine energy detector is not in use ({pipelineDetectorLabel} decides pipeline barge-in), so its
+                                        minimum duration, energy threshold and initial protection are not shown.
+                                    </p>
+                                )}
                             </div>
                         </div>
                     </details>

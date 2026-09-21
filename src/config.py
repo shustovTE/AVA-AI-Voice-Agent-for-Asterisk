@@ -925,6 +925,14 @@ class BargeInConfig(BaseModel):
     post_tts_end_protection_ms: int = Field(default=250)
     # Extra protection during the first greeting turn
     greeting_protection_ms: int = Field(default=0)
+    # Pipelines with Silero VAD: keep sending the caller's audio to the
+    # recognizer while the agent speaks instead of silence. The caller's words
+    # over a reply are then transcribed whether or not they interrupt it; the
+    # protection window above still decides when speech may interrupt. Off,
+    # the recognizer gets silence for the stretch in which the agent is
+    # audible, as before. Needs echo cancellation on the line or a caller
+    # whose phone does not return the agent's voice.
+    pipeline_listen_during_playback: bool = Field(default=False)
     # Provider-owned mode: local VAD fallback for providers whose server-side
     # interruption event may be disabled or unavailable for a given agent.
     provider_fallback_enabled: bool = Field(default=True)
@@ -1035,6 +1043,20 @@ class VADConfig(BaseModel):
     silero_stt_finalize_ms: int = Field(default=900, ge=0)
     # Let Silero speech during agent playback trigger barge-in.
     silero_barge_in: bool = Field(default=True)
+    # The recognizer gets whole utterances cut by Silero instead of a
+    # continuous stream: the engine keeps the caller's audio, and the moment
+    # Silero reports them quiet it sends everything since a little before the
+    # start of their speech as one utterance, which the recognizer decodes
+    # without a voice activity detector of its own (Local AI Server: GigaAM v3
+    # / NeMo through onnx-asr, Sherpa offline, the Whisper family). Nothing is
+    # streamed in between and no finalize burst is needed.
+    silero_stt_utterances: bool = Field(default=False)
+    # Audio taken before the frame Silero called the start of speech (its
+    # start_ms of confirmation and the onset consonant before it).
+    silero_utterance_preroll_ms: int = Field(default=300, ge=0, le=2000)
+    # A caller who never pauses is cut into pieces of at most this length,
+    # at the newest quiet chunk in the second half of the piece.
+    silero_utterance_max_ms: int = Field(default=20000, ge=2000, le=60000)
 
     # Smart Turn v3 (pipecat-ai/smart-turn): the semantic layer above Silero
     # VAD. When Silero reports the caller quiet, the model scores the caller's
@@ -1146,6 +1168,13 @@ class StreamingConfig(BaseModel):
     # closing silence, which the cleanup feeds it) before the call record is
     # written; the result is the caller's last turn, with no LLM reply. 0 = off.
     pipeline_hangup_final_wait_ms: int = Field(default=1500, ge=0, le=10000)
+    # Pipelines with Silero VAD: when the caller goes on talking after their
+    # turn was released and before the first sound of the reply has reached
+    # them, that reply is discarded (the LLM request is cancelled, no TTS is
+    # requested, an unplayed stream is dropped) and their words are kept to be
+    # answered together with what they say next, as one turn. Off: the reply
+    # plays and their next words are answered on their own.
+    pipeline_discard_unheard_reply: bool = Field(default=True)
     # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
     # adapter immediately when a user turn is detected, before LLM inference starts.
     pipeline_filler_enabled: bool = Field(default=False)

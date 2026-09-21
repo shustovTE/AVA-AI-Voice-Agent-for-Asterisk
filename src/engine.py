@@ -97,6 +97,7 @@ from .core.smart_turn import (
     load_model as load_smart_turn_model,
 )
 from .core.heard_reply import SpokenReply
+from .core.utterances import SttUtterance, UtteranceCutter
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
@@ -162,6 +163,10 @@ logger = get_logger(__name__)
 
 class _PipelinePlaybackInterrupted(RuntimeError):
     """The caller interrupted a pipeline stream while its producer was backpressured."""
+
+
+# The caller went on before the reply's first sound: the reply was discarded.
+_REPLY_SUPERSEDED = object()
 
 # Modular STT uses one canonical, headerless audio bus. Transport-specific
 # audio is converted to this format before it enters the pipeline queue.
@@ -841,6 +846,21 @@ class Engine:
         self._silero_trackers: Dict[str, SileroCallerTracker] = {}
         self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
         self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
+        # Silero cuts the caller's utterances for the recognizer
+        # (vad.silero_stt_utterances): one cutter per pipeline call, its
+        # resample state for wire rates other than the recognizer's, the start
+        # times of the utterances sent (FIFO, matched to the results that
+        # come back) and the calls warned that their recognizer takes only a
+        # stream.
+        self._utterance_cutters: Dict[str, UtteranceCutter] = {}
+        self._resample_state_utterance16k: Dict[str, Optional[tuple]] = {}
+        self._pipeline_utterance_starts: Dict[str, deque] = {}
+        self._pipeline_utterance_fallback_warned: Set[str] = set()
+        # The reply a pipeline turn is producing right now, so the caller
+        # going on before its first sound can discard it, and the event that
+        # tells the turn they went on (streaming.pipeline_discard_unheard_reply).
+        self._pipeline_reply_inflight: Dict[str, Dict[str, Any]] = {}
+        self._pipeline_caller_resumed: Dict[str, asyncio.Event] = {}
         # Smart Turn: the shared model (loaded in start()), the caller's
         # recent audio per pipeline call, and per call the verdict for the
         # current stop or the analysis still running for it.
@@ -8215,6 +8235,350 @@ class Engine:
         )
         return True
 
+    # ── Silero cuts the caller's utterances for the recognizer ───────────────
+    def _pipeline_utterance_mode(self, call_id: str) -> bool:
+        """Whether the engine, not the recognizer, cuts this call's utterances."""
+        return call_id in (getattr(self, "_utterance_cutters", None) or {})
+
+    def _pipeline_listens_during_playback(self) -> bool:
+        cfg = getattr(getattr(self, "config", None), "barge_in", None)
+        return bool(getattr(cfg, "pipeline_listen_during_playback", False)) if cfg else False
+
+    def _pipeline_forwards_gated_audio(self, call_id: str) -> bool:
+        """Gated caller frames still go to the recognizer: Silero owns barge-in and listening stays on."""
+        try:
+            return self._pipeline_listens_during_playback() and self._silero_owns_barge_in(call_id)
+        except Exception:
+            return False
+
+    def _pipeline_agent_audible(self, call_id: str) -> bool:
+        """Whether agent audio has actually reached the caller's line right now.
+
+        A streaming reply is audible once the pacer has sent its first bytes;
+        file playback and anything the engine cannot see are taken as audible
+        from the moment the gate closed.
+        """
+        manager = getattr(self, "streaming_playback_manager", None)
+        try:
+            if manager is not None and manager.is_stream_active(call_id):
+                return int(manager.get_playback_position_ms(call_id)) > 0
+        except Exception:
+            return True
+        return True
+
+    def _pipeline_caller_muted(self, session: CallSession) -> bool:
+        """Whether the caller's frames are withheld from the recognizer at this moment."""
+        if bool(getattr(session, "audio_capture_enabled", True)):
+            return False
+        if self._pipeline_listens_during_playback():
+            return False
+        return self._pipeline_agent_audible(session.call_id)
+
+    def _feed_utterance_cutter(
+        self, session: CallSession, cutter: UtteranceCutter, pcm16: bytes, rate: int
+    ) -> None:
+        """Append one caller frame to the cutter at the recognizer's rate."""
+        call_id = session.call_id
+        if rate != cutter.sample_rate:
+            try:
+                states = self._resample_state_utterance16k
+                pcm16, states[call_id] = resample_audio(
+                    pcm16, rate, cutter.sample_rate, state=states.get(call_id), mode="fir"
+                )
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                return
+        cutter.append(pcm16, muted=self._pipeline_caller_muted(session))
+
+    def _send_pipeline_utterance(
+        self, call_id: str, utterance: SttUtterance, *, expect_result: bool
+    ) -> bool:
+        """Queue one caller utterance for the recognizer; False when nothing was sent."""
+        queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
+        if queue is None:
+            return False
+        if utterance.signal_ms < 80.0:
+            logger.debug(
+                "Caller utterance without their audio dropped",
+                call_id=call_id,
+                duration_ms=int(utterance.duration_ms),
+                reason=utterance.reason,
+            )
+            return False
+        utterance.utterance_id = f"{call_id}:{utterance.utterance_id}"
+        try:
+            queue.put_nowait(utterance)
+        except asyncio.QueueFull:
+            logger.warning(
+                "Pipeline queue full; caller utterance dropped",
+                call_id=call_id,
+                duration_ms=int(utterance.duration_ms),
+            )
+            return False
+        starts = self._pipeline_utterance_starts.setdefault(call_id, deque(maxlen=16))
+        starts.append(float(utterance.started_at))
+        logger.info(
+            "Caller utterance sent to the recognizer",
+            call_id=call_id,
+            utterance_id=utterance.utterance_id,
+            duration_ms=int(utterance.duration_ms),
+            signal_ms=int(utterance.signal_ms),
+            reason=utterance.reason,
+        )
+        if expect_result:
+            expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+            if expected is None:
+                expected = self._pipeline_stt_final_expected_at = {}
+            expected[call_id] = time.monotonic()
+        return True
+
+    async def _send_stt_utterance(
+        self, pipeline: Any, call_id: str, utterance: SttUtterance, stream_format: str
+    ) -> None:
+        """Hand one utterance to the STT adapter, whole when it can take one.
+
+        An adapter (or a server behind it) that takes only a stream gets the
+        utterance as audio followed by the silence its own gate needs, so it
+        closes the phrase at once.
+        """
+        adapter = pipeline.stt_adapter
+        send = getattr(adapter, "send_utterance", None)
+        supported: Optional[bool] = None
+        probe = getattr(adapter, "utterances_supported", None)
+        if callable(probe):
+            try:
+                supported = probe(call_id)
+            except Exception:
+                supported = None
+        if callable(send) and supported is not False:
+            try:
+                await send(
+                    call_id,
+                    utterance.pcm16,
+                    sample_rate_hz=utterance.sample_rate,
+                    utterance_id=utterance.utterance_id,
+                    fmt=stream_format,
+                )
+            except Exception:
+                logger.debug("STT utterance send failed", call_id=call_id, exc_info=True)
+            return
+        warned = self._pipeline_utterance_fallback_warned
+        if call_id not in warned:
+            warned.add(call_id)
+            logger.warning(
+                "The recognizer takes no whole utterances; each one is streamed with a closing silence",
+                call_id=call_id,
+                component=getattr(adapter, "component_key", "unknown"),
+            )
+        try:
+            await adapter.send_audio(call_id, utterance.pcm16, fmt=stream_format)
+            burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
+            silence = b"\x00" * (
+                int(utterance.sample_rate) * PIPELINE_STT_BYTES_PER_SAMPLE * burst_ms // 1000
+            )
+            await adapter.send_audio(call_id, silence, fmt=stream_format)
+        except Exception:
+            logger.debug("STT utterance fallback send failed", call_id=call_id, exc_info=True)
+
+    # ── A reply the caller talks over before its first sound ─────────────────
+    def _discard_unheard_reply_enabled(self) -> bool:
+        cfg = getattr(getattr(self, "config", None), "streaming", None)
+        return bool(getattr(cfg, "pipeline_discard_unheard_reply", False)) if cfg else False
+
+    def _begin_pipeline_reply(self, call_id: str) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "released_at": time.monotonic(),
+            "superseded": False,
+            "stream_id": None,
+            "audible": False,
+        }
+        self._pipeline_reply_inflight[call_id] = record
+        return record
+
+    def _end_pipeline_reply(self, call_id: str) -> None:
+        self._pipeline_reply_inflight.pop(call_id, None)
+
+    def _pipeline_reply_superseded(self, call_id: str) -> bool:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        return bool(record and record.get("superseded"))
+
+    def _mark_pipeline_reply_stream(self, call_id: str, stream_id: Any) -> None:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            record["stream_id"] = str(stream_id) if stream_id else None
+
+    def _mark_pipeline_reply_audible(self, call_id: str) -> None:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            record["audible"] = True
+
+    def _pipeline_reply_audio_started(self, call_id: str) -> bool:
+        """Whether the reply in flight has put a first sound on the caller's line."""
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if not record:
+            return False
+        if record.get("audible"):
+            return True
+        stream_id = record.get("stream_id")
+        if not stream_id:
+            return False
+        manager = getattr(self, "streaming_playback_manager", None)
+        if manager is None:
+            return True
+        try:
+            if not manager.is_stream_active(call_id, stream_id):
+                # Played out already, or replaced: not this reply's first sound to discard.
+                return True
+            return int(manager.get_playback_position_ms(call_id)) > 0
+        except Exception:
+            return True
+
+    async def _discard_unheard_reply(self, session: CallSession) -> bool:
+        """The caller went on before the reply's first sound: drop the reply.
+
+        The model is still generating, or its text is being synthesized, or the
+        stream holds audio the pacer has not sent: none of it reached the
+        caller, so nothing is kept. The turn notices (its LLM request is
+        cancelled, no TTS is requested, a chunk put on the stopped stream
+        raises) and the dialog worker keeps the caller's words for their next
+        words. A reply that is already audible is left to barge-in.
+        """
+        call_id = session.call_id
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if not record or record.get("superseded") or not self._discard_unheard_reply_enabled():
+            return False
+        if self._pipeline_reply_audio_started(call_id):
+            return False
+        record["superseded"] = True
+        stream_id = record.get("stream_id")
+        manager = getattr(self, "streaming_playback_manager", None)
+        stopped = False
+        if stream_id and manager is not None:
+            try:
+                if manager.is_stream_active(call_id, stream_id):
+                    info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+                    try:
+                        info["end_reason"] = "superseded"
+                    except Exception:
+                        pass
+                    await manager.stop_streaming_playback(call_id)
+                    stopped = True
+            except Exception:
+                logger.debug("Unplayed reply stream stop failed", call_id=call_id, exc_info=True)
+        # Nothing of it was heard: no heard-part bookkeeping for this reply.
+        self._spoken_replies.pop(call_id, None)
+        if stopped:
+            for token in list(getattr(session, "tts_tokens", set()) or []):
+                try:
+                    if self.conversation_coordinator:
+                        await self.conversation_coordinator.on_tts_end(call_id, token, reason="superseded")
+                    else:
+                        await self.session_store.clear_gating_token(call_id, token)
+                except Exception:
+                    logger.debug("Failed to clear a gating token of a discarded reply", call_id=call_id, exc_info=True)
+        logger.info(
+            "Reply discarded before its first sound; the caller went on",
+            call_id=call_id,
+            stream_id=stream_id,
+            since_release_ms=int((time.monotonic() - float(record.get("released_at") or 0.0)) * 1000),
+        )
+        return True
+
+    async def _generate_unless_resumed(
+        self, pipeline: Any, call_id: str, factory: Callable[[], Any]
+    ) -> Any:
+        """Run one LLM request unless (or until) the caller goes on talking.
+
+        Returns the request's result, or :data:`_REPLY_SUPERSEDED` when the
+        caller resumed before the reply and the request was cancelled (and the
+        adapter told to stop generating, when it can).
+        """
+        event = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        if event is None or not self._discard_unheard_reply_enabled():
+            return await factory()
+        if self._pipeline_reply_superseded(call_id):
+            return _REPLY_SUPERSEDED
+        gen_task = asyncio.ensure_future(factory())
+        waiter = asyncio.ensure_future(event.wait())
+        try:
+            while True:
+                done, _ = await asyncio.wait({gen_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if gen_task in done:
+                    break
+                if self._pipeline_reply_superseded(call_id):
+                    gen_task.cancel()
+                    await asyncio.wait({gen_task})
+                    cancel = getattr(pipeline.llm_adapter, "cancel_generation", None)
+                    if callable(cancel):
+                        try:
+                            await cancel(call_id)
+                        except Exception:
+                            logger.debug("LLM cancel_generation failed", call_id=call_id, exc_info=True)
+                    logger.info("LLM request cancelled: the caller went on before the reply", call_id=call_id)
+                    return _REPLY_SUPERSEDED
+                # The caller spoke but the reply stands (already audible): keep waiting.
+                event.clear()
+                waiter = asyncio.ensure_future(event.wait())
+        except asyncio.CancelledError:
+            gen_task.cancel()
+            waiter.cancel()
+            raise
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        return gen_task.result()
+
+    async def _drop_unheard_reply_history(
+        self, session: CallSession, transcript_text: str, response_text: str
+    ) -> None:
+        """Take a discarded reply, and the caller turn it answered, back out of the history."""
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return
+        changed = False
+        for wanted_role, wanted in (("assistant", response_text), ("user", transcript_text)):
+            wanted = str(wanted or "").strip()
+            if not wanted or not history:
+                continue
+            entry = history[-1]
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == wanted_role
+                and str(entry.get("content") or "").strip() == wanted
+            ):
+                history.pop()
+                changed = True
+        if changed:
+            try:
+                await self.session_store.upsert_call(session)
+            except Exception:
+                logger.debug("Failed to persist the history without the discarded reply", call_id=session.call_id, exc_info=True)
+
+    def _pipeline_turn_waits_for_reply(
+        self, session: CallSession, speech_started_at: Optional[float]
+    ) -> bool:
+        """Words spoken into an audible reply wait for it to end (or for a barge-in).
+
+        Words spoken before the reply started make the reply stale: they are
+        released at once and cut it. Words spoken after it became audible,
+        inside the barge-in protection or too short to interrupt, are the
+        caller's answer to what they are hearing: the turn stays pending until
+        the reply ends or a barge-in cuts it.
+        """
+        if speech_started_at is None:
+            return False
+        if bool(getattr(session, "audio_capture_enabled", True)):
+            return False
+        if not self._pipeline_agent_audible(session.call_id):
+            return False
+        try:
+            tts_started = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tts_started = 0.0
+        if tts_started <= 0.0:
+            return False
+        reply_started_mono = time.monotonic() - max(0.0, time.time() - tts_started)
+        return float(speech_started_at) >= reply_started_mono
+
     def _silero_speech_holds_turn(self, call_id: str, hold_sec: float) -> bool:
         """Silero scored the caller's speech within the hold: the pending turn stays held.
 
@@ -8321,8 +8685,16 @@ class Engine:
         if not reason:
             return
         if expected_at is None:
-            burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
-            self._request_pipeline_stt_finalize(call_id, expect_result=True, burst_ms=burst_ms)
+            cutter = self._utterance_cutters.get(call_id)
+            if cutter is not None:
+                # Whatever the caller was saying when they hung up goes to the
+                # recognizer as it stands.
+                last = cutter.flush(reason="hangup")
+                if last is None or not self._send_pipeline_utterance(call_id, last, expect_result=True):
+                    return
+            else:
+                burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
+                self._request_pipeline_stt_finalize(call_id, expect_result=True, burst_ms=burst_ms)
         deadline = now + wait_ms / 1000.0
         arrived = False
         while time.monotonic() < deadline:
@@ -10261,6 +10633,12 @@ class Engine:
             self._silero_trackers.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
             self._turn_audio.pop(call_id, None)
+            self._utterance_cutters.pop(call_id, None)
+            self._resample_state_utterance16k.pop(call_id, None)
+            self._pipeline_utterance_starts.pop(call_id, None)
+            self._pipeline_utterance_fallback_warned.discard(call_id)
+            self._pipeline_reply_inflight.pop(call_id, None)
+            self._pipeline_caller_resumed.pop(call_id, None)
             self._pipeline_turn_verdict.pop(call_id, None)
             self._pipeline_turn_verdict_pending.pop(call_id, None)
             warm_up_task = self._pipeline_llm_warm_ups.pop(call_id, None)
@@ -11000,7 +11378,10 @@ class Engine:
             # CRITICAL FIX: Check for pipeline mode FIRST before routing to monolithic providers
             if self._pipeline_forced.get(caller_channel_id):
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
+                # (unless the deployment keeps listening while the agent speaks:
+                # then the frames go to the recognizer and Silero, which already
+                # scored them, still decides barge-in).
+                if not session.audio_capture_enabled and not self._pipeline_forwards_gated_audio(session.call_id):
                     # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
@@ -11112,6 +11493,9 @@ class Engine:
                     # the full silence budget.
                     self._pipeline_gated_silence_used_ms.pop(caller_channel_id, None)
                 
+                if self._pipeline_utterance_mode(caller_channel_id):
+                    # Silero cuts the caller's utterances for the recognizer; the raw stream is not sent.
+                    return
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
@@ -12128,6 +12512,9 @@ class Engine:
             "stop_ms": int(_get("silero_stop_ms", 300)),
             "stt_finalize_ms": int(_get("silero_stt_finalize_ms", 900)),
             "barge_in": bool(_get("silero_barge_in", True)),
+            "stt_utterances": bool(_get("silero_stt_utterances", False)),
+            "utterance_preroll_ms": int(_get("silero_utterance_preroll_ms", 300)),
+            "utterance_max_ms": int(_get("silero_utterance_max_ms", 20000)),
         }
 
     def _silero_config(self) -> Dict[str, Any]:
@@ -12230,16 +12617,34 @@ class Engine:
         buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
         if buffer is not None:
             buffer.append(pcm16, rate)
+        cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+        if cutter is not None:
+            self._feed_utterance_cutter(session, cutter, pcm16, rate)
         try:
             events = tracker.feed(pcm16, rate)
         except Exception:
             logger.debug("Silero VAD inference failed", call_id=call_id, source=source, exc_info=True)
             return
+        if cutter is not None and float(tracker.last_probability) < float(
+            getattr(tracker, "stop_threshold", 0.35)
+        ):
+            cutter.mark_quiet()
         for event in events:
             if event == "start":
+                if cutter is not None:
+                    cutter.speech_started()
                 await self._on_silero_speech_started(session, tracker, source=source)
             elif event == "stop":
-                await self._on_silero_speech_finished(session, tracker, source=source)
+                utterance = cutter.speech_stopped() if cutter is not None else None
+                await self._on_silero_speech_finished(
+                    session, tracker, source=source, utterance=utterance
+                )
+        if cutter is not None and tracker.talking:
+            # A caller who never pauses: the recognizer gets the utterance in
+            # pieces rather than a minute of speech at once.
+            piece = cutter.split_overflow()
+            if piece is not None:
+                self._send_pipeline_utterance(call_id, piece, expect_result=True)
 
     async def _on_silero_speech_started(
         self, session: CallSession, tracker: SileroCallerTracker, *, source: str
@@ -12250,6 +12655,18 @@ class Engine:
         # The caller went on: whatever Smart Turn said about the last stop no
         # longer applies, and the next stop is judged on the whole turn.
         self._discard_turn_verdict(call_id)
+        # A turn released a moment ago is being answered without these words:
+        # before the reply's first sound it is discarded and the words wait
+        # for what the caller says next.
+        resumed = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        if resumed is not None:
+            resumed.set()
+        try:
+            if await self._discard_unheard_reply(session):
+                await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
+                return
+        except Exception:
+            logger.debug("Unheard-reply discard failed", call_id=call_id, exc_info=True)
         listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
             getattr(session, "tts_playing", False)
         )
@@ -12311,17 +12728,28 @@ class Engine:
         )
 
     async def _on_silero_speech_finished(
-        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+        self,
+        session: CallSession,
+        tracker: SileroCallerTracker,
+        *,
+        source: str,
+        utterance: Optional[SttUtterance] = None,
     ) -> None:
         """The caller stopped: finalize the recognizer, then release the turn.
 
         The finalize request is recorded before the worker is woken so that
-        its recomputed deadline already waits for the result on its way.
+        its recomputed deadline already waits for the result on its way. With
+        Silero cutting the utterances, ``utterance`` is what the caller just
+        said and goes to the recognizer whole instead of a finalize burst.
         """
         call_id = session.call_id
         finalize_requested = False
         expect_result = False
-        if bool(getattr(session, "audio_capture_enabled", True)):
+        if self._pipeline_utterance_mode(call_id):
+            if utterance is not None:
+                expect_result = self._send_pipeline_utterance(call_id, utterance, expect_result=True)
+                finalize_requested = expect_result
+        elif bool(getattr(session, "audio_capture_enabled", True)):
             last_final = (getattr(self, "_pipeline_last_final_at", None) or {}).get(call_id)
             last_speech = tracker.last_speech_at
             # A result that arrived after the caller's last speech already
@@ -12355,7 +12783,7 @@ class Engine:
         """
         ms = int(burst_ms) if burst_ms is not None else int(self._silero_config()["stt_finalize_ms"])
         queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
-        if queue is None or ms <= 0:
+        if queue is None or ms <= 0 or self._pipeline_utterance_mode(call_id):
             return False
         silence = b"\x00" * (PIPELINE_STT_SAMPLE_RATE_HZ * PIPELINE_STT_BYTES_PER_SAMPLE * ms // 1000)
         try:
@@ -12595,6 +13023,9 @@ class Engine:
         Silence keeps the timeline continuous. It costs one more inference per
         frame, so ``gated_silence_ms`` bounds how long it is worth paying.
         """
+        if self._pipeline_utterance_mode(call_id):
+            # The cutter hands the recognizer whole utterances; nothing streams.
+            return None
         budget_ms = self._pipeline_gated_silence_ms.get(
             call_id, float(PIPELINE_GATED_SILENCE_MS_DEFAULT)
         )
@@ -13323,7 +13754,8 @@ class Engine:
             )
             if pipeline_forced:
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
+                # (unless the deployment keeps listening while the agent speaks).
+                if not session.audio_capture_enabled and not self._pipeline_forwards_gated_audio(session.call_id):
                     # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
@@ -13425,6 +13857,9 @@ class Engine:
                                 pass
                         return
                 
+                if self._pipeline_utterance_mode(caller_channel_id):
+                    # Silero cuts the caller's utterances for the recognizer; the raw stream is not sent.
+                    return
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
@@ -16105,6 +16540,19 @@ class Engine:
                     stop_ms=self._silero_config()["stop_ms"],
                     stt_finalize_ms=self._silero_config()["stt_finalize_ms"],
                 )
+                if self._silero_config()["stt_utterances"]:
+                    self._utterance_cutters[call_id] = UtteranceCutter(
+                        sample_rate=PIPELINE_STT_SAMPLE_RATE_HZ,
+                        preroll_ms=self._silero_config()["utterance_preroll_ms"],
+                        max_ms=self._silero_config()["utterance_max_ms"],
+                    )
+                    logger.info(
+                        "Silero cuts the caller's utterances for the recognizer",
+                        call_id=call_id,
+                        preroll_ms=self._silero_config()["utterance_preroll_ms"],
+                        max_ms=self._silero_config()["utterance_max_ms"],
+                        listen_during_playback=self._pipeline_listens_during_playback(),
+                    )
                 if self._smart_turn_model is not None:
                     self._turn_audio[call_id] = TurnAudioBuffer()
                     logger.info(
@@ -16389,6 +16837,10 @@ class Engine:
                             stt_options["chunk_ms"] = 160
                     except Exception:
                         stt_options["chunk_ms"] = 160
+
+            if self._pipeline_utterance_mode(call_id):
+                # The adapter tells the recognizer that the engine cuts the utterances.
+                stt_options["utterances"] = True
 
             if not bool(stt_options.get("streaming", True)) and streaming_supported:
                 # A recognizer that answers only when a phrase ends cannot serve the buffered
@@ -16712,6 +17164,9 @@ class Engine:
             # Reuse queue created by _ensure_pipeline_runner, or create if missing
             transcript_queue: asyncio.Queue[Optional[str]] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
             self._pipeline_transcript_queues[call_id] = transcript_queue
+            # Set by Silero's start while a turn is being answered, so the turn
+            # notices the caller going on before the reply's first sound.
+            self._pipeline_caller_resumed[call_id] = asyncio.Event()
 
             use_streaming = bool(stt_options.get("streaming", True))
             if use_streaming:
@@ -16809,6 +17264,12 @@ class Engine:
                                     await process_audio(bytes(local_buf))
                                 await transcript_queue.put(None)
                                 break
+                            if isinstance(frame, SttUtterance):
+                                if local_buf:
+                                    await process_audio(bytes(local_buf))
+                                    local_buf.clear()
+                                await process_audio(frame.pcm16)
+                                continue
                             local_buf.extend(frame)
                             if len(local_buf) < commit_bytes:
                                 continue
@@ -16840,6 +17301,19 @@ class Engine:
                                         )
                                     local_buf.clear()
                                 break
+                            if isinstance(frame, SttUtterance):
+                                # An utterance cut by Silero goes as one unit; raw frames
+                                # still ahead of it are flushed first.
+                                if local_buf:
+                                    try:
+                                        await pipeline.stt_adapter.send_audio(
+                                            call_id, bytes(local_buf), fmt=stream_format
+                                        )
+                                    except Exception:
+                                        logger.debug("Streaming STT send failed", call_id=call_id, exc_info=True)
+                                    local_buf.clear()
+                                await self._send_stt_utterance(pipeline, call_id, frame, stream_format)
+                                continue
                             local_buf.extend(frame)
                             if len(local_buf) < commit_bytes:
                                 continue
@@ -16901,6 +17375,9 @@ class Engine:
                 # call cleanup cancelling the worker also cancels an in-flight
                 # LLM request.
                 pending_started_at: Optional[float] = None
+                # When the caller's speech behind the first pending result began
+                # (monotonic), for the wait on a reply they are speaking into.
+                pending_speech_started_at: Optional[float] = None
                 pending_deadline: Optional[float] = None
                 end_of_turn = EndOfTurnPolicy(pipeline.llm_options)
                 wakeup = asyncio.Event()
@@ -16930,7 +17407,16 @@ class Engine:
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
 
-                async def run_turn(transcript_text: str) -> None:
+                async def run_turn(transcript_text: str) -> str:
+                    """Answer one caller turn; "superseded" when the caller went on before the reply."""
+                    self._begin_pipeline_reply(call_id)
+                    try:
+                        outcome = await run_turn_body(transcript_text)
+                    finally:
+                        self._end_pipeline_reply(call_id)
+                    return outcome or "answered"
+
+                async def run_turn_body(transcript_text: str) -> Optional[str]:
                     nonlocal conversation_history
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
@@ -17106,11 +17592,18 @@ class Engine:
                             )
                             if not stream_id:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
+                            self._mark_pipeline_reply_stream(call_id, stream_id)
+                            if self._pipeline_reply_superseded(call_id):
+                                # The caller went on while the stream was being set up.
+                                raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
                             heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
 
                             async for token in pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
                             ):
+                                if self._pipeline_reply_superseded(call_id):
+                                    # The caller went on before any of this was heard.
+                                    raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
                                 sentence_buffer += token
                                 full_response_text += token
 
@@ -17184,6 +17677,12 @@ class Engine:
                                 pass
 
                         except _PipelinePlaybackInterrupted:
+                            if self._pipeline_reply_superseded(call_id):
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                return "superseded"
                             # The barge-in handler measured what had played and left
                             # the heard estimate on the record; without it (the
                             # feature off, or a stream cut by something else) the
@@ -17319,15 +17818,21 @@ class Engine:
                     # Skip if streaming path already set tool_calls
                     if not tool_calls:
                         try:
-                            llm_result = await pipeline.llm_adapter.generate(
+                            llm_result = await self._generate_unless_resumed(
+                                pipeline,
                                 call_id,
-                                transcript_text,
-                                context_for_llm,  # Include conversation history
-                                llm_options,  # Use context-injected options (includes system_prompt)
+                                lambda: pipeline.llm_adapter.generate(
+                                    call_id,
+                                    transcript_text,
+                                    context_for_llm,  # Include conversation history
+                                    llm_options,  # Use context-injected options (includes system_prompt)
+                                ),
                             )
                         except Exception:
                             logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
                             return
+                        if llm_result is _REPLY_SUPERSEDED:
+                            return "superseded"
 
                         if not self._pipeline_output_allowed(
                             call_id, session, stage="post-llm"
@@ -17484,6 +17989,9 @@ class Engine:
                         call_id, session, stage="pre-output"
                     ):
                         return
+                    if self._pipeline_reply_superseded(call_id):
+                        # The caller went on while the model was answering.
+                        return "superseded"
 
                     # Update conversation history (skip if streaming path already did this)
                     if not _streaming_handled:
@@ -17543,6 +18051,10 @@ class Engine:
                                     raise RuntimeError("start_streaming_playback returned no stream_id")
                                 playback_id = stream_id
                                 first_tts_ts: Optional[float] = None
+                                self._mark_pipeline_reply_stream(call_id, stream_id)
+                                if self._pipeline_reply_superseded(call_id):
+                                    # The caller went on while the stream was being set up.
+                                    raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
                                 heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
                                 if heard_rec:
                                     # The whole reply is already in the history (appended above).
@@ -17580,6 +18092,13 @@ class Engine:
                                 except Exception:
                                     pass
                             except _PipelinePlaybackInterrupted:
+                                if self._pipeline_reply_superseded(call_id):
+                                    try:
+                                        await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                    except Exception:
+                                        pass
+                                    await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                    return "superseded"
                                 logger.info(
                                     "Pipeline streaming turn interrupted; discarding remaining TTS",
                                     call_id=call_id,
@@ -17618,6 +18137,10 @@ class Engine:
                                                     pass
                                             tts_bytes.extend(tts_chunk)
                                     if tts_bytes:
+                                        if self._pipeline_reply_superseded(call_id):
+                                            await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                            return "superseded"
+                                        self._mark_pipeline_reply_audible(call_id)
                                         playback_id = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
                                 except Exception:
                                     logger.debug("Pipeline file-playback fallback failed", call_id=call_id, exc_info=True)
@@ -17659,6 +18182,10 @@ class Engine:
                                     return
                             
                             if tts_bytes:
+                                if self._pipeline_reply_superseded(call_id):
+                                    await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                    return "superseded"
+                                self._mark_pipeline_reply_audible(call_id)
                                 try:
                                     playback_id = await self.playback_manager.play_audio(
                                         call_id,
@@ -18308,12 +18835,17 @@ class Engine:
                 async def flush_pending() -> None:
                     """Hand everything the caller has said so far to the LLM."""
                     nonlocal pending_segments, pending_started_at, pending_deadline, last_final_at
+                    nonlocal pending_speech_started_at
                     aggregated = " ".join(pending_segments).strip()
                     segments = len(pending_segments)
                     pending_segments.clear()
                     pending_deadline = None
                     last_final, last_final_at = last_final_at, None
                     started_at, pending_started_at = pending_started_at, None
+                    speech_started, pending_speech_started_at = pending_speech_started_at, None
+                    starts = self._pipeline_utterance_starts.get(call_id)
+                    if starts:
+                        starts.clear()
                     if not aggregated:
                         return
                     now = time.monotonic()
@@ -18344,14 +18876,31 @@ class Engine:
                         # The ending is what end-of-turn tuning needs to see.
                         tail=aggregated[-40:] if len(aggregated) > 80 else None,
                     )
+                    resumed = self._pipeline_caller_resumed.get(call_id)
+                    if resumed is not None:
+                        resumed.clear()
                     try:
-                        await run_turn(aggregated)
+                        outcome = await run_turn(aggregated)
                     except asyncio.CancelledError:
                         # Cancelled by the call's cleanup with the turn unanswered:
                         # the caller's words, and what they heard of a reply the
                         # hangup cut, still go into the record.
                         await self._record_turn_cut_by_hangup(session, aggregated)
                         raise
+                    if outcome == "superseded":
+                        # The caller went on before the reply's first sound: their
+                        # words are pending again and merge with what follows.
+                        pending_segments.append(aggregated)
+                        pending_started_at = started_at if started_at is not None else time.monotonic()
+                        pending_speech_started_at = speech_started
+                        last_final_at = last_final if last_final is not None else time.monotonic()
+                        logger.info(
+                            "Caller's words wait for their next words",
+                            call_id=call_id,
+                            chars=len(aggregated),
+                            preview=aggregated[:80],
+                        )
+                        reevaluate()
 
                 def reevaluate() -> None:
                     """Recompute when the pending text may become a turn.
@@ -18393,6 +18942,12 @@ class Engine:
                             deadline = self._apply_turn_verdict(call_id, changed_at, deadline)
                     else:
                         deadline = now + end_of_turn.silence_sec
+                    # Words spoken into a reply after it became audible (inside the
+                    # barge-in protection, or too short to interrupt) wait for the
+                    # reply to end or for a barge-in to cut it; words from before it
+                    # started make it stale and are released at once.
+                    if self._pipeline_turn_waits_for_reply(session, pending_speech_started_at):
+                        deadline = max(deadline, now + 0.1)
                     if end_of_turn.max_wait_ms > 0 and pending_started_at is not None:
                         deadline = min(deadline, pending_started_at + end_of_turn.max_wait_sec)
                     pending_deadline = deadline
@@ -18424,20 +18979,32 @@ class Engine:
                                 reevaluate()
                             continue
                         else:
-                            # Quiet for long enough: release the turn. With Silero
-                            # still scoring the caller's speech the hold is renewed
-                            # instead, as long as that gives a deadline ahead of now.
-                            if turn_source() == "vad" and self._silero_speech_holds_turn(
-                                call_id, end_of_turn.talk_detect_hold_sec
-                            ):
+                            # Quiet for long enough: release the turn, unless a
+                            # recomputation still holds it (Silero still scoring the
+                            # caller's speech, a reply they spoke into still audible),
+                            # as long as that gives a deadline ahead of now. The
+                            # result window (source "final") restarts from now, so it
+                            # is not recomputed here.
+                            if detector_driven():
                                 reevaluate()
-                                if pending_deadline is not None and pending_deadline > time.monotonic():
-                                    continue
+                            elif self._pipeline_turn_waits_for_reply(session, pending_speech_started_at):
+                                pending_deadline = time.monotonic() + 0.1
+                            if pending_deadline is not None and pending_deadline > time.monotonic():
+                                continue
                             await flush_pending()
                             continue
                         if transcript is None:
                             await flush_pending()
                             break
+                        # When this result's utterance started: the start the
+                        # cutter recorded when it sent it, else Silero's latest.
+                        starts = self._pipeline_utterance_starts.get(call_id)
+                        speech_started_for_result = starts.popleft() if starts else None
+                        if speech_started_for_result is None:
+                            tracker = self._silero_trackers.get(call_id)
+                            speech_started_for_result = (
+                                getattr(tracker, "segment_started_at", None) if tracker is not None else None
+                            )
                         normalized = (transcript or "").strip()
                         if not normalized:
                             # An empty result is not speech, so it must not
@@ -18445,6 +19012,8 @@ class Engine:
                             continue
                         await self._no_input_note_activity(call_id, "pipeline:transcript")
                         await self._no_input_note_processing(call_id, True)
+                        if not pending_segments:
+                            pending_speech_started_at = speech_started_for_result
                         pending_segments.append(normalized)
                         last_final_at = time.monotonic()
                         self._pipeline_stt_final_expected_at.pop(call_id, None)

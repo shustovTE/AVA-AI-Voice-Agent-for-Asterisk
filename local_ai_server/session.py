@@ -90,6 +90,11 @@ class SessionContext:
     # pipeline. None inherits the Local AI Server environment/default.
     stt_segment_energy_threshold: Optional[int] = None
     stt_segment_silence_ms: Optional[int] = None
+    # Who cuts the caller's utterances: "server" (the recognizer's own VAD on
+    # the audio stream) or "client" (the engine's VAD sends whole utterances
+    # as ``stt_utterance`` messages).
+    stt_segmenter: str = "server"
+    utterances_decoded: int = 0
     # Per-call TTS egress contract. Legacy clients omit these fields and retain
     # the historical μ-law/8 kHz behavior.
     tts_output_encoding: str = "mulaw"

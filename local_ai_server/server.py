@@ -3852,6 +3852,180 @@ class LocalAIServer:
             return True
         return self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
 
+    def _stt_supports_utterances(self) -> bool:
+        """Whether the active recognizer decodes a whole utterance the client's VAD cut (``stt_utterance``)."""
+        if self.mock_models:
+            return True
+        if self.stt_backend == "onnx_asr":
+            return getattr(self, "onnx_asr_backend", None) is not None
+        if self.stt_backend == "sherpa":
+            return (
+                getattr(self, "sherpa_model_type", "online") == "offline"
+                and getattr(self, "sherpa_backend", None) is not None
+            )
+        if self.stt_backend == "faster_whisper":
+            return getattr(self, "faster_whisper_backend", None) is not None
+        if self.stt_backend == "whisper_cpp":
+            return getattr(self, "whisper_cpp_backend", None) is not None
+        return False
+
+    async def _transcribe_utterance_pcm16(self, session: SessionContext, pcm16: bytes) -> Optional[str]:
+        """Decode one whole 16 kHz utterance with the active recognizer; None when it cannot."""
+        if self.mock_models:
+            return ""
+        backend_name = self.stt_backend
+        if backend_name == "onnx_asr":
+            backend = getattr(self, "onnx_asr_backend", None)
+            if backend is None:
+                return None
+            async with self._onnx_asr_session_lock(session):
+                result = await asyncio.to_thread(backend.transcribe_utterance, pcm16)
+            return None if result is None else str(result.get("text") or "")
+        if backend_name == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline":
+            backend = getattr(self, "sherpa_backend", None)
+            if backend is None or not hasattr(backend, "transcribe_utterance"):
+                return None
+            result = await asyncio.to_thread(backend.transcribe_utterance, pcm16)
+            return None if result is None else str(result.get("text") or "")
+        if backend_name in {"faster_whisper", "whisper_cpp"}:
+            backend = getattr(self, f"{backend_name}_backend", None)
+            if backend is None or not hasattr(backend, "transcribe_pcm16"):
+                return None
+            text = await asyncio.to_thread(backend.transcribe_pcm16, pcm16)
+            return str(text or "")
+        return None
+
+    async def _handle_stt_utterance(
+        self,
+        websocket,
+        session: SessionContext,
+        data: Dict[str, Any],
+    ) -> None:
+        """Decode one whole caller utterance the client's VAD cut and answer with one final.
+
+        The utterance arrives complete (pre-roll and closing silence
+        included), so no voice activity detection, no idle finalizer and no
+        echo guard apply: the client decided that this is speech to decode.
+        Exactly one ``stt_result`` answers each message, carrying the
+        ``utterance_id`` back, empty when nothing was recognized, with an
+        ``error`` when the active recognizer cannot decode utterances.
+        """
+        mode = self._normalize_mode(data.get("mode"), session)
+        request_id = data.get("request_id")
+        call_id = data.get("call_id")
+        utterance_id = data.get("utterance_id")
+        self._bind_session_call_id(session, call_id)
+        extra: Dict[str, Any] = {}
+        if utterance_id:
+            extra["utterance_id"] = str(utterance_id)
+
+        encoded_audio = data.get("data", "")
+        if not encoded_audio:
+            logging.warning("stt_utterance missing 'data' call_id=%s", session.call_id)
+            return
+        try:
+            audio_bytes = base64.b64decode(encoded_audio)
+        except Exception as exc:
+            logging.warning("Failed to decode base64 stt_utterance payload: %s", exc)
+            return
+        if not audio_bytes:
+            return
+
+        if not self._stt_supports_utterances():
+            logging.warning(
+                "🎙️ STT UTTERANCE - backend %s decodes no whole utterances call_id=%s",
+                self.stt_backend,
+                session.call_id,
+            )
+            await self._emit_stt_result(
+                websocket,
+                "",
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra={**extra, "error": "utterances_unsupported", "stt_utterances": False},
+            )
+            return
+
+        input_rate = int(data.get("rate", PCM16_TARGET_RATE))
+        if input_rate != PCM16_TARGET_RATE:
+            audio_bytes = await asyncio.to_thread(
+                self.audio_processor.resample_audio,
+                audio_bytes,
+                input_rate,
+                PCM16_TARGET_RATE,
+                "raw",
+                "raw",
+            )
+        session.stt_segmenter = "client"
+        session.last_request_meta = {"mode": mode, "request_id": request_id}
+        try:
+            session.last_audio_at = asyncio.get_running_loop().time()
+        except RuntimeError:
+            session.last_audio_at = 0.0
+        audio_ms = int(len(audio_bytes) / 2 * 1000 / PCM16_TARGET_RATE)
+
+        started = monotonic()
+        text = await self._transcribe_utterance_pcm16(session, audio_bytes)
+        if text is None:
+            logging.error(
+                "🎙️ STT UTTERANCE - decode failed call_id=%s utterance_id=%s",
+                session.call_id,
+                utterance_id,
+            )
+            await self._emit_stt_result(
+                websocket,
+                "",
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra={**extra, "error": "utterance_decode_failed"},
+            )
+            return
+        clean_text = (text or "").strip()
+        if clean_text and not any(ch.isalnum() for ch in clean_text):
+            # Punctuation alone is what a recognizer makes of noise.
+            clean_text = ""
+        session.utterances_decoded += 1
+        logging.info(
+            "📝 STT UTTERANCE - '%s' (audio=%dms took=%dms call_id=%s utterance_id=%s)",
+            clean_text,
+            audio_ms,
+            int((monotonic() - started) * 1000),
+            session.call_id,
+            utterance_id,
+        )
+        if mode == "stt":
+            sent = await self._emit_stt_result(
+                websocket,
+                clean_text,
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra=extra,
+            )
+            if sent:
+                self._reset_stt_session(session, clean_text)
+            return
+        await self._handle_final_transcript(
+            websocket,
+            session,
+            request_id,
+            mode=mode,
+            text=clean_text,
+            confidence=None,
+            idle_promoted=False,
+        )
+
     def _stt_is_available(self) -> bool:
         if self.mock_models:
             return True
@@ -4679,6 +4853,7 @@ class LocalAIServer:
         is_final: bool,
         is_partial: bool,
         confidence: Optional[float],
+        extra: Optional[Dict[str, Any]] = None,
     ) -> bool:
         payload = {
             "type": "stt_result",
@@ -4693,6 +4868,8 @@ class LocalAIServer:
             payload["confidence"] = confidence
         if request_id:
             payload["request_id"] = request_id
+        if extra:
+            payload.update(extra)
         return await self._send_json(websocket, payload)
 
     def _strip_tool_calls_for_tts(self, text: str) -> str:

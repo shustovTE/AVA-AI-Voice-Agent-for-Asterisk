@@ -386,17 +386,53 @@ const VADPage = () => {
                             />
                         </div>
 
+                        <FormSwitch
+                            label="Recognizer gets whole utterances cut by Silero"
+                            description="The engine keeps the caller's audio and, the moment Silero reports them quiet, sends everything from a little before their speech to its end as one utterance. The recognizer decodes it as it is, without a voice activity detector of its own; nothing streams in between and no finalize silence is needed."
+                            tooltip="Local AI Server backends that decode whole phrases: GigaAM v3 / NeMo through onnx-asr, Sherpa offline, faster-whisper, whisper.cpp (the server reports whether it can; an older server or a streaming backend gets each utterance followed by a closing silence instead). Pair it with 'Keep listening while the agent speaks' on the Barge-In page so words spoken over a reply are transcribed whole."
+                            checked={vadConfig.silero_stt_utterances ?? false}
+                            onChange={(e) => updateVADConfig('silero_stt_utterances', e.target.checked)}
+                            disabled={!vadConfig.silero_enabled}
+                        />
+
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <FormInput
-                                label="STT Finalize Silence (ms)"
-                                type="number"
-                                min="0"
-                                step="100"
-                                value={vadConfig.silero_stt_finalize_ms ?? 900}
-                                onChange={(e) => updateVADConfig('silero_stt_finalize_ms', parseInt(e.target.value))}
-                                tooltip="Silence fed to the recognizer the moment the caller is quiet, so a streaming recognizer closes the phrase at once instead of waiting out its own gate in real time (T-one holds 600 ms, at 300 ms chunk boundaries). 0 disables and the recognizer's own timing applies."
-                                disabled={!vadConfig.silero_enabled}
-                            />
+                            {vadConfig.silero_stt_utterances ? (
+                                <>
+                                    <FormInput
+                                        label="Utterance Pre-roll (ms)"
+                                        type="number"
+                                        min="0"
+                                        max="2000"
+                                        step="50"
+                                        value={vadConfig.silero_utterance_preroll_ms ?? 300}
+                                        onChange={(e) => updateVADConfig('silero_utterance_preroll_ms', parseInt(e.target.value))}
+                                        tooltip="Audio taken before the frame Silero called the start of speech: its Start (ms) of confirmation plus the onset consonant before it. 300 ms covers a 96 ms start comfortably."
+                                        disabled={!vadConfig.silero_enabled}
+                                    />
+                                    <FormInput
+                                        label="Max Utterance (ms)"
+                                        type="number"
+                                        min="2000"
+                                        max="60000"
+                                        step="1000"
+                                        value={vadConfig.silero_utterance_max_ms ?? 20000}
+                                        onChange={(e) => updateVADConfig('silero_utterance_max_ms', parseInt(e.target.value))}
+                                        tooltip="A caller who never pauses is sent in pieces of at most this length, cut at the newest quiet chunk in the second half of the piece. The turn stays open while Silero hears them, so the pieces still form one turn. Offline models are trained on short clips; 20 s is safe."
+                                        disabled={!vadConfig.silero_enabled}
+                                    />
+                                </>
+                            ) : (
+                                <FormInput
+                                    label="STT Finalize Silence (ms)"
+                                    type="number"
+                                    min="0"
+                                    step="100"
+                                    value={vadConfig.silero_stt_finalize_ms ?? 900}
+                                    onChange={(e) => updateVADConfig('silero_stt_finalize_ms', parseInt(e.target.value))}
+                                    tooltip="Silence fed to the recognizer the moment the caller is quiet, so a streaming recognizer closes the phrase at once instead of waiting out its own gate in real time (T-one holds 600 ms, at 300 ms chunk boundaries). 0 disables and the recognizer's own timing applies. Not used when the recognizer gets whole utterances."
+                                    disabled={!vadConfig.silero_enabled}
+                                />
+                            )}
                             <FormInput
                                 label="Stop Threshold (optional)"
                                 type="number"

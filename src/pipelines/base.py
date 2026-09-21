@@ -285,6 +285,12 @@ class STTComponent(Component):
     # from incidental method names because buffered-only adapters share this
     # base class.
     supports_streaming: bool = False
+    # Adapters that can take one whole caller utterance (cut by the engine's
+    # own VAD) through ``send_utterance(call_id, pcm16, *, sample_rate_hz,
+    # utterance_id, fmt)`` and report whether the far end decodes it through
+    # ``utterances_supported(call_id)`` (None until known). The engine streams
+    # each utterance with a closing silence to every other adapter.
+    supports_utterances: bool = False
 
     @abstractmethod
     async def transcribe(

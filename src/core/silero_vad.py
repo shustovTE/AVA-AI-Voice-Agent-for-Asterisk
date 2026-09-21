@@ -252,6 +252,11 @@ class SileroCallerTracker:
         return self._segmenter.segment_ms
 
     @property
+    def stop_threshold(self) -> float:
+        """Probability below which a chunk scores quiet (a candidate split point for a long utterance)."""
+        return self._segmenter.stop_threshold
+
+    @property
     def sample_rate(self) -> Optional[int]:
         return self._stream.sample_rate if self._stream is not None else None
 

@@ -49,6 +49,9 @@ class _FakeServer:
     def _rollback_interrupted_exchange(self, session):
         self.rollback_calls.append(session.call_id)
 
+    def _stt_supports_utterances(self):
+        return False
+
 
 @pytest.mark.asyncio
 async def test_set_mode_applies_scoped_whisper_segmenter_policy():
@@ -75,6 +78,7 @@ async def test_set_mode_applies_scoped_whisper_segmenter_policy():
         "segment_silence_ms": 1200,
         "output_encoding": "mulaw",
         "output_sample_rate_hz": 8000,
+        "stt_utterances": False,
     }
 
 
@@ -123,6 +127,7 @@ async def test_set_mode_omission_restores_server_segmenter_defaults():
         "segment_silence_ms": None,
         "output_encoding": "mulaw",
         "output_sample_rate_hz": 8000,
+        "stt_utterances": False,
     }
 
 
@@ -313,3 +318,50 @@ def test_protocol_version_is_single_source_of_truth():
     assert "protocol_version" in server_src
     assert server_src.count('"protocol_version": PROTOCOL_VERSION') >= 2
     assert isinstance(constants_mod.PROTOCOL_VERSION, int)
+
+
+@pytest.mark.asyncio
+async def test_set_mode_records_a_client_segmenter_and_reports_whether_utterances_decode():
+    ws_protocol_mod, session_mod, _constants_mod = _load_ws_protocol_modules()
+    server = _FakeServer()
+    server._stt_supports_utterances = lambda: True
+    protocol = ws_protocol_mod.WebSocketProtocol(server)
+    session = session_mod.SessionContext(call_id="seed")
+
+    await protocol.handle_json_message(
+        websocket=None,
+        session=session,
+        message='{"type":"set_mode","mode":"stt","call_id":"call-cut","stt_segmenter":"client"}',
+    )
+
+    assert session.stt_segmenter == "client"
+    assert server.sent_payloads[-1]["stt_utterances"] is True
+
+    await protocol.handle_json_message(
+        websocket=None,
+        session=session,
+        message='{"type":"set_mode","mode":"stt","call_id":"call-cut"}',
+    )
+    assert session.stt_segmenter == "server"
+
+
+@pytest.mark.asyncio
+async def test_a_whole_utterance_is_handed_to_the_server():
+    ws_protocol_mod, session_mod, _constants_mod = _load_ws_protocol_modules()
+    server = _FakeServer()
+    handled = []
+
+    async def _handle_stt_utterance(websocket, session, data):
+        handled.append((session.call_id, data))
+
+    server._handle_stt_utterance = _handle_stt_utterance
+    protocol = ws_protocol_mod.WebSocketProtocol(server)
+    session = session_mod.SessionContext(call_id="call-utt")
+
+    await protocol.handle_json_message(
+        websocket=None,
+        session=session,
+        message='{"type":"stt_utterance","mode":"stt","call_id":"call-utt","data":"AAA=","utterance_id":"u1"}',
+    )
+
+    assert handled == [("call-utt", {"type": "stt_utterance", "mode": "stt", "call_id": "call-utt", "data": "AAA=", "utterance_id": "u1"})]

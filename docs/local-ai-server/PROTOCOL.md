@@ -108,6 +108,7 @@ Notes:
 - `auth` → Authenticate session (if enabled); responds with `auth_response`.
 - `set_mode` → Changes session mode; responds with `mode_ready`.
 - `audio` → Base64 audio frames for STT/LLM/FULL flows (recommended: PCM16 mono @ 16 kHz).
+- `stt_utterance` → One whole caller utterance, cut by the client's own VAD, decoded as it is; answered with exactly one final `stt_result` that carries the `utterance_id` back. **(Added with `vad.silero_stt_utterances`.)**
 - `barge_in` → Clears Whisper-family STT suppression window; responds with `barge_in_ack`.
 - `llm_request` → Ask LLM with text; responds with `llm_response`.
 - `llm_tool_request` → Run tool-call parser/repair/structured gateway; responds with `llm_tool_response`.
@@ -214,6 +215,44 @@ Backward compatibility: if `utterance_id`, `chunk_index`, and `is_final` are abs
 { "type": "stt_result", "text": "...", "call_id": "abc", "mode": "stt", "is_final": false, "is_partial": true }
 { "type": "stt_result", "text": "...", "call_id": "abc", "mode": "stt", "is_final": true,  "is_partial": false }
 ```
+
+### Whole utterances (`stt_utterance`)
+
+When the client runs its own voice activity detector (the engine with Silero VAD and `vad.silero_stt_utterances`), it cuts the utterances itself and sends each one whole, from a little before the caller's speech to its end, the moment the caller stops. The server decodes it as it is: no VAD of its own, no idle finalizer, no echo guard, no pre-/post-roll (the utterance already carries them). Exactly one final `stt_result` answers each message.
+
+Announce it in `set_mode` (optional, informational) and read the server's capability from `mode_ready`:
+
+```json
+{ "type": "set_mode", "mode": "stt", "call_id": "abc", "stt_segmenter": "client" }
+{ "type": "mode_ready", "mode": "stt", "call_id": "abc", "stt_utterances": true, "...": "..." }
+```
+
+Request:
+
+```json
+{
+  "type": "stt_utterance",
+  "mode": "stt",
+  "call_id": "abc",
+  "rate": 16000,
+  "format": "pcm16le",
+  "utterance_id": "abc:utt-7",
+  "duration_ms": 1840,
+  "data": "<base64 pcm16 of the whole utterance>"
+}
+```
+
+Response (always one per request):
+
+```json
+{ "type": "stt_result", "text": "три комнаты", "call_id": "abc", "mode": "stt", "is_final": true, "is_partial": false, "utterance_id": "abc:utt-7" }
+```
+
+- `text` is empty when nothing was recognized (an utterance shorter than the decode floor, or noise), still with the `utterance_id`, so the client can match every utterance to a result.
+- A backend that takes only a stream (Vosk, Kroko, Sherpa online, T-one) answers `{"type": "stt_result", "text": "", "error": "utterances_unsupported", "stt_utterances": false, ...}`; the engine then streams each utterance as `audio` followed by a closing silence.
+- `error: "utterance_decode_failed"` reports a decode that raised.
+- Supported backends: `onnx_asr` (GigaAM v3, NeMo), `sherpa` offline, `faster_whisper`, `whisper_cpp`; the status response reports it as `capabilities.stt_utterances`.
+- In `llm` / `full` mode the decoded text goes through the same final-transcript path as a streamed final.
 
 Notes:
 
@@ -500,7 +539,7 @@ Response:
 {
   "type": "status_response",
   "status": "ok",
-  "capabilities": { "session_hangup_markers": true },
+  "capabilities": { "session_hangup_markers": true, "stt_utterances": true },
   "stt_backend": "vosk|kroko|sherpa|faster_whisper|whisper_cpp",
   "tts_backend": "piper|kokoro|melotts|silero",
   "models": {

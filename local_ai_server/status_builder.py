@@ -177,6 +177,8 @@ def build_status_response(server) -> Dict[str, Any]:
         "status": "ok",
         "capabilities": {
             "session_hangup_markers": True,
+            # Whole caller utterances cut by the client's VAD (``stt_utterance``).
+            "stt_utterances": bool(server._stt_supports_utterances()),
         },
         "stt_backend": server.stt_backend,
         "tts_backend": server.tts_backend,

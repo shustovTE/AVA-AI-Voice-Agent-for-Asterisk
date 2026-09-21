@@ -894,3 +894,41 @@ async def test_a_backend_that_fails_to_initialize_is_reported_not_fatal(monkeypa
 
     assert server.onnx_asr_backend is None
     assert "gigaam-v3-e2e-ctc" in server.startup_errors["stt"]
+
+
+# --- whole utterances cut by the client's VAD -----------------------------------------
+
+
+def test_a_whole_utterance_is_decoded_as_it_is_and_brought_to_the_loudness_target():
+    backend = _ready_backend("три комнаты", normalize_dbfs=-20.0, normalize_max_gain_db=24.0)
+    quiet = (0.01 * np.sqrt(2) * np.sin(2 * np.pi * 300 * np.arange(8000) / 16_000)).astype(np.float32)  # -40 dBFS, 500 ms
+    pcm16 = (quiet * 32767).astype(np.int16).tobytes()
+
+    result = backend.transcribe_utterance(pcm16)
+
+    assert result == {"type": "final", "text": "три комнаты"}
+    waveform, sample_rate = backend.recognizer.calls[0]
+    assert sample_rate == 16_000 and len(waveform) == 8000
+    assert 20 * np.log10(np.sqrt(np.mean(waveform.astype(np.float64) ** 2))) == pytest.approx(-20.0, abs=0.2)
+
+
+def test_an_utterance_shorter_than_the_decode_floor_is_reported_empty_not_guessed():
+    backend = _ready_backend("да", vad_min_speech_ms=200)
+    assert backend.transcribe_utterance(_pcm16(0.1, 16_000 * 100 // 1000)) == {"type": "final", "text": ""}
+    assert backend.recognizer.calls == []
+
+
+def test_a_very_long_utterance_is_decoded_in_pieces():
+    backend = _ready_backend("кусок")
+    seconds = 45
+    pcm16 = _pcm16(0.1, 16_000 * seconds)
+
+    result = backend.transcribe_utterance(pcm16)
+
+    assert result == {"type": "final", "text": "кусок кусок кусок"}  # 20 s + 20 s + 5 s
+    assert [len(w) for w, _ in backend.recognizer.calls] == [320_000, 320_000, 80_000]
+
+
+def test_an_uninitialized_backend_decodes_no_utterance():
+    backend = _backend()
+    assert backend.transcribe_utterance(_pcm16(0.1, 16_000)) is None

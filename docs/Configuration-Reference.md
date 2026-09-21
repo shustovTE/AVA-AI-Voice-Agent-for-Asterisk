@@ -129,6 +129,15 @@ Only the resolved detector drives the turn: with Silero in charge, Asterisk
 talk-detect events still serve barge-in and the inactivity watchdog but no
 longer touch the end of turn, so the two cannot disagree about it.
 
+Two things happen around a released turn with Silero in charge. When the
+caller goes on before the reply's first sound, the reply is discarded and the
+words wait for their next words (`streaming.pipeline_discard_unheard_reply`),
+so a pause the caller only took to breathe costs no reply to half a sentence.
+And words spoken into a reply that is already audible, inside the barge-in
+protection or too short to interrupt, are not released while the reply plays:
+the turn waits for the reply to end or for a barge-in to cut it (see the
+Streaming section). Words from before the reply started still cut it at once.
+
 Every `Caller turn ended on silence` line reports which `source` decided it
 (`vad`, `talk_detect` or `final`), and `Pipeline end-of-turn policy resolved`
 at call start reports whether Silero is tracking the call. The line's
@@ -183,6 +192,14 @@ timeline continuous.
   and a splice is harmless, so the budget caps what an agent turn costs. `0`
   restores the previous behaviour of dropping the frames. The budget is renewed
   as soon as real audio flows again.
+
+With `barge_in.pipeline_listen_during_playback` the frames are not withheld at
+all (Silero VAD, which owns barge-in, has already scored them), and with
+`vad.silero_stt_utterances` nothing streams to the recognizer in the first
+place: the engine keeps the caller's audio and sends whole utterances, in which
+the stretch where the agent was actually audible is zeros unless listening is
+on. The gate closes at the stream start, but echo needs sound, so the 200–300 ms
+before the first audible chunk are never muted.
 
 ### Golden Baselines
 See the validated configurations in `config/`:
@@ -552,15 +569,16 @@ contains configuration and verification evidence, but never the referenced API p
 Controls interruption of TTS playback when the caller speaks.
 
 - barge_in.enabled: true/false
-- barge_in.initial_protection_ms: 200–600 ms. Drop inbound immediately after TTS starts to avoid self‑echo.
+- barge_in.initial_protection_ms: 200–600 ms. Full agents (OpenAI Realtime, Deepgram, Google Live, ...) and the engine's own energy detector for pipelines: inbound caller audio is dropped for this long after agent output starts, against self-echo. Pipelines whose barge-in is decided by Silero VAD or Asterisk `TALK_DETECT` never read it (their window is `talk_detect_initial_protection_ms` below); the Barge-In page shows it under *Provider-owned mode*, and under the pipeline windows only while the energy detector is the one in charge.
 - barge_in.min_ms: 250–600 ms. Minimum sustained speech before a barge‑in is acknowledged (de‑bounce).
 - barge_in.energy_threshold: 1000–3000. RMS energy threshold; raise on noisy lines.
 - barge_in.cooldown_ms: 500–1500 ms. Ignore new barge‑ins after one triggers.
 - barge_in.post_tts_end_protection_ms: 250–500 ms. Short guard to avoid clipping the start of the next caller utterance.
-- barge_in.talk_detect_initial_protection_ms: default 1500. Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk `TALK_DETECT` and Silero VAD. The caller's frames stay gated until a barge-in opens them, so this is the earliest a caller can interrupt a reply; it rejects phone echo of the agent's own voice at the start of a reply. `0` lets the caller interrupt from the first millisecond (only sensible with echo cancellation on the line). The Barge-In page exposes it as *Talk-Detect / Silero Initial Protection*.
-- barge_in.greeting_protection_ms: default 0. Replaces the window above for the greeting turn when it is longer (it never shortens it).
-- barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only (local file playback) minimum talk duration before triggering barge-in.
-- barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold (more sensitive than full-agent mode).
+- barge_in.talk_detect_initial_protection_ms: default 1500. Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk `TALK_DETECT` and Silero VAD, the earliest a caller can interrupt a reply; it rejects phone echo of the agent's own voice at the start of a reply. Counted from the stream start (the gating token), which is 200–300 ms before the first audible sound with a streaming TTS. `0` lets the caller interrupt from the first millisecond (only sensible with echo cancellation on the line). Speech before the reply's first sound is never held by it: such a reply is discarded instead (`streaming.pipeline_discard_unheard_reply`). The Barge-In page exposes it as *Talk-Detect / Silero Initial Protection*.
+- barge_in.greeting_protection_ms: default 0. Not a third window: while the greeting plays (the call's `conversation_state` is `greeting` until the first playback ends), the window in force, whichever detector's, is replaced by this value when it is longer; it never shortens it. The Barge-In page shows it as *Greeting Protection Override*.
+- barge_in.pipeline_listen_during_playback: default `false`. Pipelines with Silero VAD owning barge-in: the caller's frames keep reaching the recognizer while the agent speaks instead of being replaced by silence (see [Pipeline Gated Audio](#pipeline-gated-audio)), so what they say over a reply is transcribed whether or not it interrupts the reply; the protection window above still decides when speech may interrupt. Words spoken into a reply that is already audible are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard it. Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent transcribes itself. Barge-In page: *Keep listening while the agent speaks*.
+- barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only minimum talk duration before the engine's energy detector triggers barge-in. Read only when neither Silero VAD nor `TALK_DETECT` decides pipeline barge-in; the Barge-In page hides it otherwise.
+- barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold of the same energy detector (more sensitive than full-agent mode); hidden with it.
 - barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.
 - barge_in.pipeline_talk_detect_silence_ms: 800–2000. Pipeline-only; `TALK_DETECT(set)` silence window.
 - barge_in.pipeline_talk_detect_talking_threshold: 1–32768 (default 256). Pipeline-only; global Asterisk `TALK_DETECT(set)` DSP magnitude threshold. Audio profiles can override it with `profiles.<name>.talk_detect_talking_threshold`; `wideband_pcm_16k` uses the live-validated value 1000 to reject wideband playback echo while retaining caller barge-in.
@@ -599,7 +617,8 @@ Controls the pacing and robustness of streamed agent audio.
 - streaming.pipeline_streaming_overlap: default `true`. Pipelines: stream LLM tokens and synthesize sentence by sentence instead of waiting for the whole reply; needs an LLM adapter with token streaming and `downstream_mode: stream`. A pipeline overrides it with `options.tts.streaming_overlap` (*TTS Playback Policy → Streaming Overlap* in the pipeline editor); the log line `Pipeline streaming overlap policy resolved` shows the outcome.
 - streaming.pipeline_heard_reply_on_interrupt: default `true`. When the caller interrupts a pipeline reply, the conversation history keeps only what the caller could hear: the sentences that played in full plus a proportional prefix of the cut one (to a word boundary), marked with an ellipsis, and the entry carries `interrupted: true`. The estimate comes from the audio that had reached the transport when the barge-in cut the stream, so it applies to streaming playback. Off: the whole reply (serial mode) or the sentences queued so far (overlap mode) stay in the history as if they had been spoken. Log line: `Pipeline reply interrupted; keeping the heard part` (`played_ms`, `heard_chars`, `generated_chars`).
 - streaming.pipeline_heard_reply_lead_ms: default `200` (0–5000). Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction); subtracted from the played position. Raise it if the history keeps words the caller did not hear.
-- A reply still playing when the caller's next turn is released (their speech ran into it inside the barge-in protection window, or the recognizer returned it late) is cut the same way before the next reply starts, since it was produced without the caller's latest words; log line `Pipeline playback cut by the caller's next turn`. A second reply is never attached to a live stream.
+- A reply still playing when the caller's next turn is released is cut the same way before the next reply starts when it is stale, that is when the caller's words were spoken before the reply started (the recognizer returned them late): it was produced without them; log line `Pipeline playback cut by the caller's next turn`. Words spoken into a reply after it became audible (inside the barge-in protection window, or too short to trigger a barge-in) are the caller's answer to what they are hearing: the turn stays pending until the reply ends or a barge-in cuts it, and is answered then, without cutting the reply. A second reply is never attached to a live stream.
+- streaming.pipeline_discard_unheard_reply: default `true`. Pipelines with Silero VAD: the end of a turn is a guess on a pause, and when the caller goes on talking after the turn was released but before the first sound of the reply has reached them, nothing of that reply is worth keeping. Silero's start then cancels the LLM request in flight (an OpenAI-compatible request is aborted; the local AI server is told to stop and its late answer is skipped), requests no TTS, stops a stream whose audio has not been sent, keeps the history clean of the reply and its caller turn, and the dialog worker holds the caller's words to answer them together with what they say next, as one turn (`Caller's words wait for their next words`). Log lines: `Reply discarded before its first sound; the caller went on` (`since_release_ms`), `LLM request cancelled: the caller went on before the reply`. Once the first bytes have reached the transport the reply is the caller's to interrupt (barge-in). Off: the reply plays and the caller's next words are answered on their own. Streaming page → *Interrupted Replies*.
 - streaming.pipeline_hangup_final_wait_ms: default `1500` (0–10000). When the caller hangs up, the call's cleanup first treats a reply still playing as interrupted at the position the transport had reached (the history keeps the heard part, as for a barge-in). Then, when the caller's speech is outstanding (the speech detector saw them talk after the recognizer's last result, or a finalize was already pending), the recognizer is fed its closing silence and the cleanup waits up to this long for the result, which is recorded as the caller's last turn with no LLM reply, so the call record, the post-call summary and the webhooks carry it. Results the dialog was still holding for the end of the turn, and a turn whose LLM request the hangup cancelled, are recorded the same way. Needed for the VAD-gated offline recognizers (GigaAM v3, Sherpa offline), which return a phrase only after their silence gate. `0` turns the wait off. Log lines: `Waited for the caller's last words after hangup` (`reason`, `arrived`, `waited_ms`) and `Caller's last words recorded after hangup`.
 - streaming.greeting_rtp_wait_ms: ExternalMedia-only. How long to wait (ms) for the remote RTP endpoint to be discovered during the initial greeting before falling back to file playback (prevents “dead air until caller speaks” in some Asterisk setups).
 
@@ -679,6 +698,30 @@ providers are not affected.
 - `vad.silero_barge_in`: let Silero speech during agent playback trigger
   barge-in (default `true`). Turn off to leave barge-in to `TALK_DETECT` while
   Silero still decides the end of turn.
+- `vad.silero_stt_utterances`: the recognizer gets whole utterances cut by
+  Silero instead of a continuous stream (default `false`). The engine keeps
+  the caller's audio at the recognizer's 16 kHz and, the moment Silero
+  reports them quiet, sends everything from `vad.silero_utterance_preroll_ms`
+  (default `300`, the start Silero needed plus the onset before it) before
+  the frame that opened the speech to the frame that closed it (Silero's
+  stop silence included) as one utterance. The recognizer decodes it as it
+  is, with no voice activity detector, idle finalizer or echo guard of its
+  own; nothing streams in between and `silero_stt_finalize_ms` is not used.
+  A caller who never pauses is sent in pieces of at most
+  `vad.silero_utterance_max_ms` (default `20000`), cut at the newest quiet
+  chunk in the second half of the piece; the turn stays held while Silero
+  hears them, so the pieces still make one turn. A hangup flushes what they
+  were saying (`streaming.pipeline_hangup_final_wait_ms` waits for it). Local
+  AI Server backends that decode whole phrases take the utterance as
+  `stt_utterance` (GigaAM v3 / NeMo through onnx-asr, Sherpa offline,
+  faster-whisper, whisper.cpp; the server says so in `mode_ready` and in its
+  status `capabilities.stt_utterances`); an older server or a streaming
+  backend gets each utterance as audio followed by a closing silence instead,
+  with one warning per call. Log lines: `Silero cuts the caller's utterances
+  for the recognizer` at call start, `Caller utterance sent to the recognizer`
+  per utterance (`duration_ms`, `signal_ms`, `reason`). Pair it with
+  `barge_in.pipeline_listen_during_playback` so words spoken over a reply are
+  transcribed whole. VAD page → *Silero VAD*.
 
 Every call logs `Silero VAD tracking caller speech` at start; each end of
 speech logs `Silero VAD: caller quiet` at debug level with whether a finalize

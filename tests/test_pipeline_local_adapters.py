@@ -420,3 +420,104 @@ async def test_pipeline_orchestrator_resolves_local_adapters():
     assert resolution.pipeline_name == "local_only"
 
     await orchestrator.stop()
+
+
+# --- whole utterances cut by the engine's VAD (``stt_utterance``) ------------------
+
+
+@pytest.mark.asyncio
+async def test_local_stt_adapter_sends_a_whole_utterance_and_learns_the_servers_capability(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalSTTAdapter("local_stt", app_config, provider_config, {"mode": "stt"})
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*_args, **_kwargs):
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
+    mock_ws.push(json.dumps({"type": "mode_ready", "mode": "stt", "call_id": "call-utt", "stt_utterances": True}))
+
+    await adapter.start_stream("call-utt", {"mode": "stt", "utterances": True}, sample_rate_hz=16000, fmt="pcm16_16k")
+    try:
+        assert json.loads(mock_ws.sent[0])["stt_segmenter"] == "client"
+        assert adapter.supports_utterances is True
+        assert adapter.utterances_supported("call-utt") is True
+
+        audio = b"\x01\x02" * 1600  # 100 ms
+        await adapter.send_utterance("call-utt", audio, sample_rate_hz=16000, utterance_id="call-utt:utt-1", fmt="pcm16_16k")
+
+        message = json.loads(mock_ws.sent[-1])
+        assert message["type"] == "stt_utterance"
+        assert message["mode"] == "stt" and message["call_id"] == "call-utt"
+        assert message["rate"] == 16000 and message["format"] == "pcm16le"
+        assert message["utterance_id"] == "call-utt:utt-1"
+        assert message["duration_ms"] == 100
+        assert base64.b64decode(message["data"]) == audio
+    finally:
+        await adapter.close_call("call-utt")
+
+
+@pytest.mark.asyncio
+async def test_local_stt_adapter_takes_an_unsupported_answer_as_the_fallback_signal(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalSTTAdapter("local_stt", app_config, provider_config, {"mode": "stt"})
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*_args, **_kwargs):
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
+
+    await adapter.start_stream("call-old", {"mode": "stt"}, sample_rate_hz=16000, fmt="pcm16_16k")
+    try:
+        assert adapter.utterances_supported("call-old") is None  # an old server never says
+        mock_ws.push(json.dumps({
+            "type": "stt_result", "text": "", "call_id": "call-old", "mode": "stt",
+            "is_final": True, "is_partial": False, "error": "utterances_unsupported", "stt_utterances": False,
+        }))
+        mock_ws.push(json.dumps({
+            "type": "stt_result", "text": "алло", "call_id": "call-old", "mode": "stt",
+            "is_final": True, "is_partial": False, "utterance_id": "x",
+        }))
+        results = adapter.iter_results("call-old")
+        assert await asyncio.wait_for(results.__anext__(), timeout=2) == "алло"  # the error result is not a transcript
+        assert adapter.utterances_supported("call-old") is False
+    finally:
+        await adapter.close_call("call-old")
+
+
+@pytest.mark.asyncio
+async def test_local_llm_adapter_skips_the_answer_to_a_cancelled_request(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = LocalProviderConfig(**app_config.providers["local"])
+    adapter = LocalLLMAdapter("local_llm", app_config, provider_config, {"mode": "llm"})
+    mock_ws = _MockWebSocket()
+
+    async def fake_connect(*_args, **_kwargs):
+        return mock_ws
+
+    monkeypatch.setattr("src.pipelines.local.websockets.connect", fake_connect)
+    await adapter.start()
+    await adapter.open_call("call-cancel", {"mode": "llm"})
+
+    first = asyncio.create_task(adapter.generate("call-cancel", "у меня три", {"messages": []}, {}))
+    await asyncio.sleep(0)
+    first_request = json.loads(mock_ws.sent[-1])
+    assert first_request["type"] == "llm_request" and first_request["request_id"].startswith("llm-")
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await adapter.cancel_generation("call-cancel")
+    cancel = json.loads(mock_ws.sent[-1])
+    assert cancel["type"] == "barge_in" and cancel["reason"] == "superseded" and cancel["rollback_assistant"] is False
+
+    second = asyncio.create_task(adapter.generate("call-cancel", "у меня три комнаты", {"messages": []}, {}))
+    await asyncio.sleep(0)
+    second_request = json.loads(mock_ws.sent[-1])
+    # The late answer to the cancelled request, then the acknowledgement, then ours.
+    mock_ws.push(json.dumps({"type": "llm_response", "text": "stale", "request_id": first_request["request_id"]}))
+    mock_ws.push(json.dumps({"type": "barge_in_ack", "status": "ok", "call_id": "call-cancel"}))
+    mock_ws.push(json.dumps({"type": "llm_response", "text": "fresh", "request_id": second_request["request_id"]}))
+    assert (await second).text == "fresh"

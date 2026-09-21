@@ -943,6 +943,70 @@ class SherpaOfflineSTTBackend:
             logging.error(f"❌ {self.LOG_TAG} - Finalize error: %s", exc)
             return None
 
+    # A whole utterance longer than this is decoded in pieces of at most
+    # UTTERANCE_PIECE_S: the models are trained on short clips and the client
+    # normally cuts at 20 s anyway.
+    UTTERANCE_SPLIT_S = 25.0
+    UTTERANCE_PIECE_S = 20.0
+
+    def transcribe_utterance(self, pcm16_audio: bytes) -> Optional[Dict[str, Any]]:
+        """Decode one whole utterance the client's VAD cut, with no VAD of our own.
+
+        The utterance already carries its pre-roll and its closing silence, so
+        it is only validated, brought to the loudness target (its whole length
+        counts as speech) and decoded; one shorter than the decode floor is
+        reported as empty rather than guessed. A very long one is decoded in
+        pieces so the model is never handed more than it was trained on.
+        """
+        if not self._initialized or self.recognizer is None:
+            return None
+        try:
+            samples = self._pcm16_to_float32(pcm16_audio)
+            total = len(samples)
+            if total < self._min_audio_length:
+                logging.info(
+                    f"🔍 {self.LOG_TAG} utterance skipped (too short): %d < %d samples",
+                    total,
+                    self._min_audio_length,
+                )
+                return {"type": "final", "text": ""}
+            piece_len = int(self.UTTERANCE_PIECE_S * self.sample_rate)
+            if total > int(self.UTTERANCE_SPLIT_S * self.sample_rate):
+                pieces = [samples[i : i + piece_len] for i in range(0, total, piece_len)]
+            else:
+                pieces = [samples]
+            texts: List[str] = []
+            for index, piece in enumerate(pieces):
+                validation_error = self._validate_segment_samples(piece)
+                gain_db = 0.0
+                if not validation_error:
+                    piece, gain_db = self._normalize_segment(piece, slice(0, len(piece)))
+                stats = self._segment_stats(piece)
+                extra = " utterance=%d/%d gain_db=%+.1f" % (index + 1, len(pieces), gain_db)
+                self._log_segment(index, stats, validation_error, extra)
+                if validation_error:
+                    logging.warning(
+                        f"⚠️ {self.LOG_TAG} - utterance piece %d rejected before decode: %s",
+                        index,
+                        validation_error,
+                    )
+                    continue
+                if len(piece) < self._min_audio_length:
+                    continue
+                text = self._transcribe_segment(piece)
+                logging.info(
+                    f"🔍 {self.LOG_TAG} transcribe utterance[%d] result: '%s' (empty=%s)",
+                    index,
+                    text or "",
+                    not text,
+                )
+                if text:
+                    texts.append(text)
+            return {"type": "final", "text": " ".join(texts)}
+        except Exception as exc:
+            logging.error(f"❌ {self.LOG_TAG} - Utterance error: %s", exc)
+            return None
+
     def transcribe_pcm16(self, pcm16_audio: bytes) -> Optional[Dict[str, Any]]:
         """Direct transcription without VAD (for pre-segmented audio)."""
         if not self._initialized or self.recognizer is None:

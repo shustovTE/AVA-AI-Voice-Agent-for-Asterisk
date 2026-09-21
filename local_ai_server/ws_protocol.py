@@ -133,6 +133,20 @@ class WebSocketProtocol:
                     setattr(session, f"stt_{key}", None)
                     continue
                 setattr(session, f"stt_{key}", raw_value)
+            # Who cuts the caller's utterances: the client's VAD sends them
+            # whole as ``stt_utterance`` messages, or the server's VAD cuts
+            # the audio stream (the default).
+            segmenter = str(data.get("stt_segmenter") or "").strip().lower()
+            session.stt_segmenter = "client" if segmenter == "client" else "server"
+            supports_utterances = bool(
+                getattr(self._server, "_stt_supports_utterances", lambda: False)()
+            )
+            if session.stt_segmenter == "client":
+                logging.info(
+                    "🎙️ STT SEGMENTER - client cuts the utterances call_id=%s decodable=%s",
+                    session.call_id,
+                    supports_utterances,
+                )
             await self._server._send_json(
                 websocket,
                 {
@@ -143,6 +157,7 @@ class WebSocketProtocol:
                     "segment_silence_ms": session.stt_segment_silence_ms,
                     "output_encoding": session.tts_output_encoding,
                     "output_sample_rate_hz": session.tts_output_sample_rate_hz,
+                    "stt_utterances": supports_utterances,
                 },
             )
             return
@@ -150,6 +165,12 @@ class WebSocketProtocol:
         if msg_type == "audio":
             self._server._apply_tts_output_preferences(session, data)
             await self._server._handle_audio_payload(websocket, session, data)
+            return
+
+        if msg_type == "stt_utterance":
+            # One whole caller utterance cut by the client's VAD: decoded as
+            # it is, one final ``stt_result`` per message.
+            await self._server._handle_stt_utterance(websocket, session, data)
             return
 
         if msg_type == "barge_in":

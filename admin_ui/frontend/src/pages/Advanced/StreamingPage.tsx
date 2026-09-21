@@ -499,6 +499,13 @@ const StreamingPage = () => {
                             onChange={(e) => updateStreamingConfig('pipeline_heard_reply_lead_ms', parseInt(e.target.value))}
                             tooltip="Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction). Subtracted from the played position; raise it if the history keeps words the caller did not hear."
                         />
+                        <FormSwitch
+                            label="Discard a reply the caller talks over before its first sound"
+                            description="Pipelines with Silero VAD: when the caller goes on talking after their turn was released and before the reply's first sound has reached them, the reply is dropped (the LLM request is cancelled, no TTS is requested, an unplayed stream is stopped) and their words are answered together with what they say next, as one turn. Off: the reply plays and their next words are answered on their own."
+                            checked={streamingConfig.pipeline_discard_unheard_reply ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_discard_unheard_reply', e.target.checked)}
+                            tooltip="A turn released on a pause the caller only took to breathe no longer costs a reply to half a sentence. Counted until the first bytes of the reply reach the transport; after that the reply is the caller's to interrupt (Barge-In page)."
+                        />
                         <FormInput
                             label="Last words after hangup (ms)"
                             type="number"

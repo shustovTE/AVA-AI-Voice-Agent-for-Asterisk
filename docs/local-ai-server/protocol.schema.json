@@ -91,6 +91,12 @@
             8000,
             16000
           ]
+        },
+        "stt_segmenter": {
+          "enum": [
+            "server",
+            "client"
+          ]
         }
       },
       "additionalProperties": true
@@ -144,6 +150,9 @@
             8000,
             16000
           ]
+        },
+        "stt_utterances": {
+          "type": "boolean"
         }
       },
       "additionalProperties": true
@@ -1166,6 +1175,43 @@
       },
       "additionalProperties": true
     },
+    "STTUtteranceRequest": {
+      "type": "object",
+      "required": [
+        "type",
+        "data"
+      ],
+      "properties": {
+        "type": {
+          "const": "stt_utterance"
+        },
+        "data": {
+          "type": "string"
+        },
+        "rate": {
+          "type": "integer"
+        },
+        "format": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "utterance_id": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
     "STTResult": {
       "type": "object",
       "required": [
@@ -1203,6 +1249,15 @@
         },
         "request_id": {
           "type": "string"
+        },
+        "utterance_id": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "stt_utterances": {
+          "type": "boolean"
         }
       },
       "additionalProperties": true
@@ -1309,6 +1364,9 @@
     },
     {
       "$ref": "#/$defs/AudioFrameRequest"
+    },
+    {
+      "$ref": "#/$defs/STTUtteranceRequest"
     },
     {
       "$ref": "#/$defs/STTResult"
