@@ -34,6 +34,13 @@ def _parse_int(raw: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _parse_choice(raw: Optional[str], choices: tuple, default: str, *, upper: bool = False) -> str:
+    """One of ``choices`` (case-insensitive), else ``default``."""
+    value = (raw or "").strip()
+    value = value.upper() if upper else value.lower()
+    return value if value in choices else default
+
+
 def _parse_stt_resampler(raw: Optional[str]) -> str:
     """``LOCAL_STT_RESAMPLER``: ``fir`` (polyphase windowed-sinc) unless ``ratecv`` is asked for."""
     value = (raw or "").strip().lower()
@@ -130,6 +137,20 @@ class LocalAIConfig:
     onnx_asr_cache_dir: str = "/app/models/stt/onnx-asr"
     onnx_asr_quantization: str = ""
     onnx_asr_device: str = "auto"
+    # Runtime placement of the pieces around the encoder. A transducer (RNNT)
+    # runs its decoder and joiner once per encoder frame on tiny tensors: on
+    # the CPU that is a fraction of a millisecond per step, on CUDA a launch
+    # plus two copies. The mel spectrogram is the same story. "cpu" keeps them
+    # on the CPU whatever the model's device; "model" follows the model.
+    onnx_asr_decoder_device: str = "cpu"
+    onnx_asr_preprocessor: str = "cpu"
+    # onnxruntime's cuDNN convolution algorithm search for the CUDA provider:
+    # EXHAUSTIVE (its default) benchmarks every algorithm again for every new
+    # input length, HEURISTIC picks one at once, DEFAULT is cuDNN's own choice.
+    onnx_asr_cudnn_algo_search: str = "HEURISTIC"
+    # Decode a few silent utterances at start so the first real one does not
+    # pay for lazy initialization and the arena growth.
+    onnx_asr_warmup: bool = True
     faster_whisper_model: str = "base"
     faster_whisper_device: str = "cpu"
     faster_whisper_compute: str = "int8"
@@ -336,6 +357,12 @@ class LocalAIConfig:
             ).strip(),
             onnx_asr_quantization=(os.getenv("ONNX_ASR_QUANTIZATION", "") or "").strip().lower(),
             onnx_asr_device=(os.getenv("ONNX_ASR_DEVICE", "auto") or "auto").strip().lower(),
+            onnx_asr_decoder_device=_parse_choice(os.getenv("ONNX_ASR_DECODER_DEVICE"), ("cpu", "model"), "cpu"),
+            onnx_asr_preprocessor=_parse_choice(os.getenv("ONNX_ASR_PREPROCESSOR"), ("cpu", "model"), "cpu"),
+            onnx_asr_cudnn_algo_search=_parse_choice(
+                os.getenv("ONNX_ASR_CUDNN_ALGO_SEARCH"), ("HEURISTIC", "DEFAULT", "EXHAUSTIVE"), "HEURISTIC", upper=True
+            ),
+            onnx_asr_warmup=_parse_bool(os.getenv("ONNX_ASR_WARMUP", "1")),
             faster_whisper_model=os.getenv("FASTER_WHISPER_MODEL", "base"),
             faster_whisper_device=os.getenv("FASTER_WHISPER_DEVICE", "cpu"),
             faster_whisper_compute=os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8"),

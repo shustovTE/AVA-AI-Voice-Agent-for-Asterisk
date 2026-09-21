@@ -56,6 +56,8 @@ class _FakeManager:
 
     def __init__(self, providers=None, **kwargs):
         self.providers = providers
+        self.provider_options = kwargs.get("provider_options")
+        self.preprocessor_config = kwargs.get("preprocessor_config")
         self.create_calls = []
         _FakeManager.instances.append(self)
 
@@ -212,7 +214,11 @@ def test_the_backend_is_the_offline_vad_gate_with_an_onnx_asr_model():
     assert backend._min_audio_length == 3200
     assert backend.tuning_summary() == (
         "(preroll_ms=350 postroll_ms=300 threshold=0.35 min_silence_ms=700 min_speech_ms=200 "
-        "normalize_dbfs=-20.0 max_gain_db=18)"
+        "normalize_dbfs=-20.0 max_gain_db=18 decoder=none preprocessor=cpu "
+        "cudnn_algo_search=HEURISTIC warmup=on)"
+    )
+    assert (backend.decoder_device, backend.preprocessor, backend.cudnn_algo_search, backend.warmup) == (
+        "cpu", "cpu", "HEURISTIC", True
     )
     # The Sherpa offline backend keeps its own tag.
     assert sb.SherpaOfflineSTTBackend.LOG_TAG == "SHERPA-OFFLINE"
@@ -848,6 +854,10 @@ async def test_loading_creates_the_backend_from_the_config_and_releases_it_on_sw
         "cache_dir": "/app/models/stt/onnx-asr",
         "quantization": "int8",
         "device": "auto",
+        "decoder_device": "cpu",
+        "preprocessor": "cpu",
+        "cudnn_algo_search": "HEURISTIC",
+        "warmup": True,
         "sample_rate": 16_000,
         "preroll_ms": 350,
         "vad_threshold": 0.35,
@@ -932,3 +942,125 @@ def test_a_very_long_utterance_is_decoded_in_pieces():
 def test_an_uninitialized_backend_decodes_no_utterance():
     backend = _backend()
     assert backend.transcribe_utterance(_pcm16(0.1, 16_000)) is None
+
+
+# --- runtime placement: decoder on the CPU, NumPy mel, cuDNN search, warm-up --------------
+
+
+class _FakeSession:
+    def __init__(self, path, sess_options=None, providers=None, **kwargs):
+        self._model_path = path
+        self.sess_options = sess_options
+        self.providers = list(providers or [])
+
+
+class _FakeSessionOptions:
+    def __init__(self):
+        self.intra_op_num_threads = 0
+        self.inter_op_num_threads = 0
+
+
+def _fake_onnxruntime_with_sessions(providers):
+    module = _fake_onnxruntime(providers)
+    module.InferenceSession = _FakeSession
+    module.SessionOptions = _FakeSessionOptions
+    return module
+
+
+class _TransducerManager(_FakeManager):
+    """create_asr returns the adapter onnx-asr returns: ``.asr`` holds the three sessions."""
+
+    def create_asr(self, model, local_dir, *, quantization=None, offline=None, config=None):
+        super().create_asr(model, local_dir, quantization=quantization, offline=offline, config=config)
+        recognizer = _FakeRecognizer("да")
+        recognizer.asr = SimpleNamespace(
+            _encoder=_FakeSession("/m/encoder.onnx", providers=["CUDAExecutionProvider"]),
+            _decoder=_FakeSession("/m/decoder.onnx", providers=["CUDAExecutionProvider"]),
+            _joiner=_FakeSession("/m/joint.onnx", providers=["CUDAExecutionProvider"]),
+        )
+        return recognizer
+
+
+def _fake_onnx_asr_with(manager_cls):
+    module = _fake_onnx_asr()
+    module.loader.Manager = manager_cls
+    return module
+
+
+def _initialized(tmp_path, *, manager_cls=_FakeManager, providers=("CUDAExecutionProvider", "CPUExecutionProvider"), **overrides):
+    vad = tmp_path / "silero_vad.onnx"
+    vad.write_bytes(b"vad")
+    backend = _backend(vad_model_path=str(vad), model_path="/data/gigaam", device="cuda", **overrides)
+    _FakeManager.instances.clear()
+    with patch.dict(
+        sys.modules,
+        {
+            "onnx_asr": _fake_onnx_asr_with(manager_cls),
+            "sherpa_onnx": _fake_sherpa(),
+            "onnxruntime": _fake_onnxruntime_with_sessions(list(providers)),
+        },
+    ):
+        assert backend.initialize() is True
+    return backend, _FakeManager.instances[-1]
+
+
+def test_config_reads_the_runtime_placement_knobs(monkeypatch):
+    cfg = _config(monkeypatch)
+    assert (cfg.onnx_asr_decoder_device, cfg.onnx_asr_preprocessor, cfg.onnx_asr_cudnn_algo_search, cfg.onnx_asr_warmup) == (
+        "cpu", "cpu", "HEURISTIC", True
+    )
+    cfg = _config(
+        monkeypatch,
+        ONNX_ASR_DECODER_DEVICE="model",
+        ONNX_ASR_PREPROCESSOR="Model",
+        ONNX_ASR_CUDNN_ALGO_SEARCH="exhaustive",
+        ONNX_ASR_WARMUP="false",
+    )
+    assert (cfg.onnx_asr_decoder_device, cfg.onnx_asr_preprocessor, cfg.onnx_asr_cudnn_algo_search, cfg.onnx_asr_warmup) == (
+        "model", "model", "EXHAUSTIVE", False
+    )
+    cfg = _config(monkeypatch, ONNX_ASR_DECODER_DEVICE="gpu", ONNX_ASR_CUDNN_ALGO_SEARCH="fast")
+    assert (cfg.onnx_asr_decoder_device, cfg.onnx_asr_cudnn_algo_search) == ("cpu", "HEURISTIC")
+
+
+def test_the_cuda_provider_gets_the_cudnn_search_and_the_mel_runs_in_numpy(tmp_path):
+    backend, manager = _initialized(tmp_path, warmup=False)
+    assert manager.providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert manager.provider_options == [{"cudnn_conv_algo_search": "HEURISTIC"}, {}]
+    assert manager.preprocessor_config == {"use_numpy_preprocessors": True}
+
+    backend, manager = _initialized(tmp_path, warmup=False, preprocessor="model", cudnn_algo_search="exhaustive")
+    assert manager.provider_options == [{"cudnn_conv_algo_search": "EXHAUSTIVE"}, {}]
+    assert manager.preprocessor_config == {"use_numpy_preprocessors": False}
+    assert "preprocessor=model cudnn_algo_search=EXHAUSTIVE warmup=off" in backend.tuning_summary()
+
+
+def test_a_transducers_decoder_and_joiner_are_rebuilt_on_the_cpu(tmp_path):
+    backend, _ = _initialized(tmp_path, manager_cls=_TransducerManager, warmup=False)
+    asr = backend.recognizer.asr
+    assert asr._encoder.providers == ["CUDAExecutionProvider"]  # untouched
+    assert asr._decoder.providers == ["CPUExecutionProvider"] and asr._decoder._model_path == "/m/decoder.onnx"
+    assert asr._joiner.providers == ["CPUExecutionProvider"] and asr._joiner._model_path == "/m/joint.onnx"
+    assert asr._joiner.sess_options.intra_op_num_threads == 1
+    assert backend.decoder_placement == "cpu"
+    assert "decoder=cpu" in backend.tuning_summary()
+
+
+def test_the_decoder_can_follow_the_model_and_a_ctc_model_has_none(tmp_path):
+    backend, _ = _initialized(tmp_path, manager_cls=_TransducerManager, warmup=False, decoder_device="model")
+    assert backend.recognizer.asr._decoder.providers == ["CUDAExecutionProvider"]
+    assert backend.decoder_placement == "CUDAExecutionProvider"
+    assert "decoder=cuda" in backend.tuning_summary()
+
+    backend, _ = _initialized(tmp_path, warmup=False)  # the plain fake recognizer: no decoder sessions
+    assert backend.decoder_placement == ""
+    assert "decoder=none" in backend.tuning_summary()
+
+
+def test_the_warm_up_decodes_silence_of_every_length_the_client_may_send(tmp_path):
+    backend, _ = _initialized(tmp_path, manager_cls=_TransducerManager)
+    assert [len(w) for w, _ in backend.recognizer.calls] == [16_000, 48_000, 128_000, 320_000]
+    assert "warmup=on" in backend.tuning_summary()
+
+    backend, _ = _initialized(tmp_path, manager_cls=_TransducerManager, warmup=False)
+    assert backend.recognizer.calls == []

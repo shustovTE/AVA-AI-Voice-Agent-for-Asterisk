@@ -56,6 +56,10 @@ describe('EnvPage offline phrase segmenter settings', () => {
         );
 
         expect(await screen.findByLabelText('onnx-asr Model')).toHaveValue('gigaam-v3-e2e-ctc');
+        expect(screen.getByLabelText('onnx-asr Transducer Decoder')).toHaveValue('cpu');
+        expect(screen.getByLabelText('onnx-asr Mel Preprocessor')).toHaveValue('cpu');
+        expect(screen.getByLabelText('onnx-asr cuDNN Algorithm Search')).toHaveValue('HEURISTIC');
+        expect(screen.getByLabelText('onnx-asr Warm-up')).toHaveValue('true');
         for (const label of SEGMENTER_LABELS('onnx-asr')) {
             expect(screen.getByLabelText(label)).toBeInTheDocument();
         }

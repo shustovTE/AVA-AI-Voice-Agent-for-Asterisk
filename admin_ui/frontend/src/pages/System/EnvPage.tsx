@@ -629,6 +629,7 @@ const EnvPage = () => {
         // Local AI Server - Tone STT
         'TONE_MODEL_PATH', 'TONE_DECODER_TYPE', 'TONE_KENLM_PATH', 'INCLUDE_TONE',
         'ONNX_ASR_MODEL', 'ONNX_ASR_MODEL_PATH', 'ONNX_ASR_CACHE_DIR', 'ONNX_ASR_QUANTIZATION', 'ONNX_ASR_DEVICE', 'INCLUDE_ONNX_ASR',
+        'ONNX_ASR_DECODER_DEVICE', 'ONNX_ASR_PREPROCESSOR', 'ONNX_ASR_CUDNN_ALGO_SEARCH', 'ONNX_ASR_WARMUP',
         // Local AI Server - Silero TTS
         'INCLUDE_SILERO', 'SILERO_SPEAKER', 'SILERO_LANGUAGE', 'SILERO_MODEL_ID',
         'SILERO_SAMPLE_RATE', 'SILERO_MODEL_PATH'
@@ -1683,6 +1684,47 @@ const EnvPage = () => {
                                     value={env['ONNX_ASR_MODEL_PATH'] || ''}
                                     onChange={(e) => updateEnv('ONNX_ASR_MODEL_PATH', e.target.value)}
                                     tooltip="Directory that already holds the model files (config.json, the .onnx and the vocabulary). Leave empty to download into ONNX_ASR_CACHE_DIR (/app/models/stt/onnx-asr) on first start."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Transducer Decoder"
+                                    value={env['ONNX_ASR_DECODER_DEVICE'] || 'cpu'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_DECODER_DEVICE', e.target.value)}
+                                    options={[
+                                        { value: 'cpu', label: 'CPU (default)' },
+                                        { value: 'model', label: 'Same device as the model' },
+                                    ]}
+                                    tooltip="RNNT models only. The decoder and joiner run once per 40 ms of audio on tiny tensors: a fraction of a millisecond per step on the CPU, a kernel launch plus two copies on CUDA, so on a GPU the CPU is faster. The encoder stays on the model's device. CTC models have no such loop."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Mel Preprocessor"
+                                    value={env['ONNX_ASR_PREPROCESSOR'] || 'cpu'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_PREPROCESSOR', e.target.value)}
+                                    options={[
+                                        { value: 'cpu', label: 'NumPy on the CPU (default)' },
+                                        { value: 'model', label: 'ONNX session on the model device' },
+                                    ]}
+                                    tooltip="The log-mel spectrogram of a few seconds of audio costs a few milliseconds in NumPy; as a CUDA session it is a new input shape for every utterance length plus copies to and from the card."
+                                />
+                                <FormSelect
+                                    label="onnx-asr cuDNN Algorithm Search"
+                                    value={env['ONNX_ASR_CUDNN_ALGO_SEARCH'] || 'HEURISTIC'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_CUDNN_ALGO_SEARCH', e.target.value)}
+                                    options={[
+                                        { value: 'HEURISTIC', label: 'HEURISTIC (default)' },
+                                        { value: 'DEFAULT', label: "DEFAULT (cuDNN's own choice)" },
+                                        { value: 'EXHAUSTIVE', label: 'EXHAUSTIVE (benchmark per new length)' },
+                                    ]}
+                                    tooltip="CUDA only. onnxruntime's own default, EXHAUSTIVE, benchmarks every convolution algorithm again for every new input length, and utterance lengths are all different: that is the slow first utterance and the spikes on new lengths."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Warm-up"
+                                    value={env['ONNX_ASR_WARMUP'] || 'true'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_WARMUP', e.target.value)}
+                                    options={[
+                                        { value: 'true', label: 'On (default)' },
+                                        { value: 'false', label: 'Off' },
+                                    ]}
+                                    tooltip="Decode 1, 3, 8 and 20 s of silence right after the model loads, so the first real utterance pays nothing for lazy initialization and the memory arena is already grown to the longest utterance."
                                 />
                                 {renderOfflineSegmenterFields('onnx-asr')}
                             </>

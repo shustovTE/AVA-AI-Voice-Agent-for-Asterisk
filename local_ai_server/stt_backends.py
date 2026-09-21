@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -1055,6 +1056,10 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
     DEFAULT_MODEL = "gigaam-v3-e2e-ctc"
     DEFAULT_CACHE_DIR = "/app/models/stt/onnx-asr"
     DEVICES = ("auto", "cpu", "cuda")
+    PLACEMENTS = ("cpu", "model")
+    CUDNN_ALGO_SEARCHES = ("HEURISTIC", "DEFAULT", "EXHAUSTIVE")
+    # Silent utterances decoded at start: the longest is the client's cap.
+    WARMUP_SECONDS = (1, 3, 8, 20)
 
     def __init__(
         self,
@@ -1065,6 +1070,10 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
         cache_dir: str = DEFAULT_CACHE_DIR,
         quantization: str = "",
         device: str = "auto",
+        decoder_device: str = "cpu",
+        preprocessor: str = "cpu",
+        cudnn_algo_search: str = "HEURISTIC",
+        warmup: bool = True,
         sample_rate: int = PCM16_TARGET_RATE,
         preroll_ms: int = 0,
         vad_threshold: float = 0.5,
@@ -1094,7 +1103,20 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
             self.quantization = None
         device = (device or "auto").strip().lower()
         self.device = device if device in self.DEVICES else "auto"
+        decoder_device = (decoder_device or "cpu").strip().lower()
+        self.decoder_device = decoder_device if decoder_device in self.PLACEMENTS else "cpu"
+        preprocessor = (preprocessor or "cpu").strip().lower()
+        self.preprocessor = preprocessor if preprocessor in self.PLACEMENTS else "cpu"
+        cudnn_algo_search = (cudnn_algo_search or "HEURISTIC").strip().upper()
+        self.cudnn_algo_search = (
+            cudnn_algo_search if cudnn_algo_search in self.CUDNN_ALGO_SEARCHES else "HEURISTIC"
+        )
+        self.warmup = bool(warmup)
         self.providers: List[str] = []
+        self.provider_options: List[Dict[str, Any]] = []
+        # Where the transducer decoder and joiner ended up: "cpu", the model's
+        # provider, or "" for a CTC model that has none.
+        self.decoder_placement = ""
         self._decode_lock = threading.Lock()
         super().__init__(
             model_path=self.explicit_model_path or self.model_dir,
@@ -1192,17 +1214,26 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
                 self.providers,
                 "" if offline else "; downloaded from Hugging Face when missing",
             )
-            manager = onnx_asr.loader.Manager(providers=self.providers)
+            self.provider_options = [self._provider_options_for(provider) for provider in self.providers]
+            manager = onnx_asr.loader.Manager(
+                providers=self.providers,
+                provider_options=self.provider_options,
+                # The mel spectrogram: NumPy on the CPU, or an ONNX session on the model's device.
+                preprocessor_config={"use_numpy_preprocessors": self.preprocessor == "cpu"},
+            )
             self.recognizer = manager.create_asr(
                 self.model,
                 local_dir,
                 quantization=self.quantization,
                 offline=offline,
             )
+            self._place_transducer_decoder()
 
             self._configure_vad(sherpa_onnx)
 
             self._initialized = True
+            if self.warmup:
+                self._warm_up()
             logging.info(
                 f"✅ {self.LOG_TAG} - Model %s + Silero VAD initialized on %s %s",
                 self.model,
@@ -1213,6 +1244,90 @@ class OnnxAsrSTTBackend(SherpaOfflineSTTBackend):
         except Exception as exc:
             logging.error(f"❌ {self.LOG_TAG} - Failed to initialize model %s: %s", self.model, exc)
             return False
+
+    def _provider_options_for(self, provider: str) -> Dict[str, Any]:
+        """onnxruntime provider options: the cuDNN algorithm search for CUDA, nothing for the rest."""
+        if provider == "CUDAExecutionProvider":
+            return {"cudnn_conv_algo_search": self.cudnn_algo_search}
+        return {}
+
+    def _place_transducer_decoder(self) -> None:
+        """Run a transducer's decoder and joiner on the CPU while the encoder stays on the model's device.
+
+        onnx-asr builds the three sessions with one set of options, and the
+        two small graphs are run once per encoder frame on tiny tensors: on
+        CUDA every step is a kernel launch plus two copies, on the CPU a
+        fraction of a millisecond. The sessions are rebuilt from the same
+        files (onnx-asr 0.12: ``asr._decoder`` / ``asr._joiner``); a package
+        that no longer exposes them leaves the decoder where the model is.
+        """
+        self.decoder_placement = ""
+        asr = getattr(self.recognizer, "asr", None)
+        decoder = getattr(asr, "_decoder", None)
+        joiner = getattr(asr, "_joiner", None)
+        if decoder is None or joiner is None:
+            return  # a CTC model decodes in one pass; nothing to place
+        model_device = self.providers[0] if self.providers else "CPUExecutionProvider"
+        self.decoder_placement = model_device
+        if self.decoder_device != "cpu" or model_device == "CPUExecutionProvider":
+            return
+        try:
+            import onnxruntime as rt
+
+            options = rt.SessionOptions()
+            # Tiny graphs: a thread pool would only add hand-over latency.
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            rebuilt = {}
+            for name, session in (("_decoder", decoder), ("_joiner", joiner)):
+                path = getattr(session, "_model_path", None)
+                if not path:
+                    raise RuntimeError(f"{name} session carries no model path")
+                rebuilt[name] = rt.InferenceSession(path, sess_options=options, providers=["CPUExecutionProvider"])
+            for name, session in rebuilt.items():
+                setattr(asr, name, session)
+            self.decoder_placement = "cpu"
+            logging.info(
+                f"🧩 {self.LOG_TAG} - Transducer decoder and joiner run on the CPU; the encoder stays on %s",
+                model_device,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"⚠️ {self.LOG_TAG} - Could not move the transducer decoder to the CPU (%s); it stays on %s",
+                exc,
+                model_device,
+            )
+
+    def _warm_up(self) -> None:
+        """Decode a few silent utterances so the first real one pays nothing for lazy initialization."""
+        started = time.monotonic()
+        done = 0
+        for seconds in self.WARMUP_SECONDS:
+            try:
+                self._transcribe_segment(np.zeros(int(self.sample_rate * seconds), dtype=np.float32))
+                done += 1
+            except Exception as exc:
+                logging.warning(f"⚠️ {self.LOG_TAG} - Warm-up decode of %ds failed: %s", seconds, exc)
+                break
+        logging.info(
+            f"🔥 {self.LOG_TAG} - Warm-up: %d utterances (%s s) in %d ms",
+            done,
+            "/".join(str(s) for s in self.WARMUP_SECONDS[:done]),
+            int((time.monotonic() - started) * 1000),
+        )
+
+    def tuning_summary(self) -> str:
+        """The segmenting knobs plus where the runtime pieces run, for the start-up log line."""
+        base = super().tuning_summary().rstrip(")")
+        decoder = self.decoder_placement or "none"
+        if decoder == "CUDAExecutionProvider":
+            decoder = "cuda"
+        elif decoder == "CPUExecutionProvider":
+            decoder = "cpu"
+        return (
+            f"{base} decoder={decoder} preprocessor={self.preprocessor} "
+            f"cudnn_algo_search={self.cudnn_algo_search} warmup={'on' if self.warmup else 'off'})"
+        )
 
     def _transcribe_segment(self, speech_samples: np.ndarray) -> str:
         """Decode one VAD segment with the onnx-asr model (serialized: one decode at a time)."""

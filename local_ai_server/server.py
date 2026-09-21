@@ -1477,6 +1477,10 @@ class LocalAIServer:
                 cache_dir=self.onnx_asr_cache_dir,
                 quantization=self.onnx_asr_quantization,
                 device=self.onnx_asr_device,
+                decoder_device=getattr(self.config, "onnx_asr_decoder_device", "cpu"),
+                preprocessor=getattr(self.config, "onnx_asr_preprocessor", "cpu"),
+                cudnn_algo_search=getattr(self.config, "onnx_asr_cudnn_algo_search", "HEURISTIC"),
+                warmup=bool(getattr(self.config, "onnx_asr_warmup", True)),
                 sample_rate=PCM16_TARGET_RATE,
                 # The VAD gate is the one the Sherpa offline backend uses, with its tuning.
                 preroll_ms=getattr(self.config, "sherpa_offline_preroll_ms", 0),
