@@ -130,7 +130,10 @@ AAVA ends the call after the **Agent itself** speaks an *Assistant Farewell
 Marker* («до свидания», «всего доброго», goodbye…) at the end of an utterance.
 The farewell audio finishes playing before the hangup (the standard
 `cleanup_after_tts` drain, with the bounded terminal fallback), and a marker
-mentioned mid-sentence does not trigger. With strategy *extend*/*replace* the
+mentioned mid-sentence does not trigger. A caller who interrupts the farewell
+(barge-in) cancels this hangup: it is a guess about the conversation, the
+caller's words go to the model as an ordinary turn and the model may say
+goodbye again; an explicit `hangup_call` is not cancelled. With strategy *extend*/*replace* the
 Agent can add or replace the farewell marker list; empty keeps the global
 list. This is a deterministic safety net for providers whose platform-side
 agent does not reliably end the call itself (e.g. ElevenLabs); it also lets

@@ -984,7 +984,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                                     <label htmlFor="agent-hangup-on-farewell" className="text-sm font-medium">
                                         Hang up on assistant farewell
                                     </label>
-                                    <HelpTooltip content="Ends the call after the AGENT itself speaks one of the Assistant Farewell Markers at the end of an utterance (e.g. «До свидания»). The farewell audio finishes playing first. A safety net for providers whose platform-side agent does not reliably end the call itself." />
+                                    <HelpTooltip content="Ends the call after the AGENT itself speaks one of the Assistant Farewell Markers at the end of an utterance (e.g. «До свидания»). The farewell audio finishes playing first. A caller who interrupts the farewell (barge-in) cancels the hangup and the conversation goes on. A safety net for providers whose platform-side agent does not reliably end the call itself." />
                                 </div>
                                 <p className="text-xs text-muted-foreground mt-1">
                                     Off by default; matching only at the end of the agent's utterance.

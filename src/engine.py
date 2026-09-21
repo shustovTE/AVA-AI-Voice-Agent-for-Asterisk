@@ -534,6 +534,13 @@ _call_start_times = {}  # call_id -> timestamp
 # In-memory set to prevent duplicate cleanup (race condition guard)
 _cleanup_in_progress: set = set()  # call_ids currently being cleaned up
 _cleanup_completed_at: dict = {}  # call_id -> epoch seconds (best-effort dedupe for repeated StasisEnd/Destroyed)
+# Terminal hangups that are a guess about the conversation rather than an explicit
+# decision: the pipeline's farewell-without-tool fallback and the assistant-farewell
+# marker. A caller who interrupts the farewell shows the guess was wrong, so a
+# barge-in cancels them; the hangup_call tool's own hangup is left alone.
+_BARGE_IN_CANCELLABLE_TERMINAL_REASONS = frozenset(
+    {"pipeline_farewell_without_tool", "assistant_farewell_marker"}
+)
 _cleanup_lock = asyncio.Lock()  # Lock to make cleanup guard atomic (AAVA-148)
 
 
@@ -873,6 +880,12 @@ class Engine:
         self._terminal_hangup_locks: Dict[str, asyncio.Lock] = {}
         self._terminal_hangup_started: Set[str] = set()
         self._terminal_fallback_tasks: Dict[str, asyncio.Task] = {}
+        # Why each pending terminal hangup (and fallback timer) was started, and
+        # the calls whose pending hangup a barge-in cancelled: a heuristic
+        # farewell hangup yields to a caller who interrupts the farewell.
+        self._terminal_hangup_reasons: Dict[str, str] = {}
+        self._terminal_fallback_reasons: Dict[str, str] = {}
+        self._terminal_hangup_cancelled: Set[str] = set()
         # A rejected VICIdial leg may survive a failed ARI DELETE after the
         # call session is cleaned up. Keep an independent owner retrying that
         # exact channel until Asterisk accepts the hangup or reports it gone.
@@ -9959,6 +9972,9 @@ class Engine:
                     fallback.cancel()
                 self._terminal_hangup_locks.pop(call_id, None)
                 self._terminal_hangup_started.discard(call_id)
+                self._terminal_hangup_reasons.pop(call_id, None)
+                self._terminal_fallback_reasons.pop(call_id, None)
+                self._terminal_hangup_cancelled.discard(call_id)
                 self._local_tts_farewell_pending.discard(call_id)
             except Exception:
                 logger.debug("Terminal lifecycle cleanup failed", call_id=call_id, exc_info=True)
@@ -12855,6 +12871,13 @@ class Engine:
                 )
                 return
 
+            # A farewell the caller talks over was not the end of the call: drop
+            # the hangup it armed before anything else drains and executes it.
+            try:
+                await self._cancel_terminal_hangup_for_barge_in(call_id, session)
+            except Exception:
+                logger.debug("Farewell hangup cancellation failed during barge-in", call_id=call_id, exc_info=True)
+
             provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
             local_provider_notified = False
             local_turn_interrupted = bool(
@@ -15376,6 +15399,7 @@ class Engine:
         timeout_sec: float,
         quiet_sec: float,
         reason: str,
+        abort: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """Wait until generated audio is paced onto the call transport.
 
@@ -15395,6 +15419,8 @@ class Engine:
         logged_wait = False
 
         while (time.monotonic() - started_at) < timeout_sec:
+            if abort is not None and abort():
+                return False
             session = await self.session_store.get_by_call_id(call_id)
             if session and bool(getattr(session, "cleanup_in_progress", False)):
                 return False
@@ -15482,6 +15508,14 @@ class Engine:
                 return False
 
             started.add(call_id)
+            reasons = getattr(self, "_terminal_hangup_reasons", None)
+            if reasons is None:
+                reasons = self._terminal_hangup_reasons = {}
+            reasons[call_id] = reason
+            cancelled = getattr(self, "_terminal_hangup_cancelled", None)
+            if cancelled is None:
+                cancelled = self._terminal_hangup_cancelled = set()
+            cancelled.discard(call_id)
             fallback_tasks = getattr(self, "_terminal_fallback_tasks", {})
             fallback = fallback_tasks.pop(call_id, None)
             current_task = asyncio.current_task()
@@ -15495,7 +15529,21 @@ class Engine:
                     timeout_sec=drain_timeout_sec,
                     quiet_sec=self._terminal_transport_quiet_sec(),
                     reason=reason,
+                    abort=lambda: call_id in cancelled,
                 )
+
+            if call_id in cancelled:
+                # A barge-in during the farewell: the caller is not done, so the
+                # guessed hangup is dropped and the dialog goes on.
+                cancelled.discard(call_id)
+                started.discard(call_id)
+                reasons.pop(call_id, None)
+                logger.info(
+                    "Terminal hangup cancelled: the caller interrupted the farewell",
+                    call_id=call_id,
+                    reason=reason,
+                )
+                return False
 
             session = await self.session_store.get_by_call_id(call_id)
             if not session or self._session_was_transferred(session):
@@ -15572,6 +15620,10 @@ class Engine:
         previous = tasks.pop(call_id, None)
         if previous and not previous.done():
             previous.cancel()
+        fallback_reasons = getattr(self, "_terminal_fallback_reasons", None)
+        if fallback_reasons is None:
+            fallback_reasons = self._terminal_fallback_reasons = {}
+        fallback_reasons[call_id] = reason
 
         async def _fallback() -> None:
             try:
@@ -15596,9 +15648,73 @@ class Engine:
             finally:
                 if tasks.get(call_id) is asyncio.current_task():
                     tasks.pop(call_id, None)
+                    fallback_reasons.pop(call_id, None)
 
         task = asyncio.create_task(_fallback(), name=f"terminal-fallback-{call_id}")
         tasks[call_id] = task
+
+    def _terminal_hangup_is_heuristic(self, call_id: str, reason: Optional[str]) -> bool:
+        """Whether a pending terminal hangup is a guess a barge-in may cancel.
+
+        ``cleanup_after_tts`` is the generic audio-done hangup; it counts as a
+        guess only when the assistant-farewell marker armed it.
+        """
+        base = str(reason or "").split(":", 1)[0]
+        if base in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS:
+            return True
+        if base == "cleanup_after_tts":
+            origin = str((getattr(self, "_terminal_fallback_reasons", None) or {}).get(call_id) or "")
+            return origin.split(":", 1)[0] in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS
+        return False
+
+    async def _cancel_terminal_hangup_for_barge_in(
+        self, call_id: str, session: Optional[CallSession]
+    ) -> bool:
+        """The caller interrupted a farewell: drop the hangup that farewell had armed.
+
+        Only the heuristic hangups are dropped (the pipeline's
+        farewell-without-tool fallback and the assistant-farewell marker); an
+        explicit ``hangup_call`` keeps ending the call. A hangup already
+        waiting for the audio to drain is told to stop, its fallback timer is
+        cancelled and ``cleanup_after_tts`` is cleared, so the caller's words
+        reach the model as an ordinary turn and the model may say goodbye again.
+        """
+        cancelled_any = False
+        started = getattr(self, "_terminal_hangup_started", None) or set()
+        reasons = getattr(self, "_terminal_hangup_reasons", None) or {}
+        pending_reason = reasons.get(call_id)
+        if call_id in started and self._terminal_hangup_is_heuristic(call_id, pending_reason):
+            cancelled = getattr(self, "_terminal_hangup_cancelled", None)
+            if cancelled is None:
+                cancelled = self._terminal_hangup_cancelled = set()
+            cancelled.add(call_id)
+            cancelled_any = True
+            logger.info(
+                "Pending farewell hangup cancelled by barge-in",
+                call_id=call_id,
+                reason=pending_reason,
+            )
+        fallback_reasons = getattr(self, "_terminal_fallback_reasons", None) or {}
+        origin = fallback_reasons.get(call_id)
+        if origin is not None and str(origin).split(":", 1)[0] in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS:
+            tasks = getattr(self, "_terminal_fallback_tasks", None) or {}
+            task = tasks.pop(call_id, None)
+            fallback_reasons.pop(call_id, None)
+            if task and not task.done():
+                task.cancel()
+            if session is not None and bool(getattr(session, "cleanup_after_tts", False)):
+                session.cleanup_after_tts = False
+                try:
+                    await self._save_session(session)
+                except Exception:
+                    logger.debug("Failed to clear cleanup_after_tts after barge-in", call_id=call_id, exc_info=True)
+            cancelled_any = True
+            logger.info(
+                "Pending farewell fallback cancelled by barge-in",
+                call_id=call_id,
+                reason=origin,
+            )
+        return cancelled_any
 
     async def _speak_no_input_announcement(self, call_id: str, text: str, kind: str) -> bool:
         """Speak a watchdog message in the call's configured provider/pipeline voice."""
