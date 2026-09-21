@@ -477,6 +477,24 @@ class StreamingPlaybackManager:
                     and call_id not in self._cleanup_in_progress
                     and self.is_stream_active(call_id, existing)
                 ):
+                    existing_type = str(existing_info.get('playback_type') or '')
+                    if (
+                        str(playback_type or '').startswith('pipeline-tts')
+                        and existing_type.startswith('pipeline-tts')
+                    ):
+                        # A pipeline reply is one stream per turn. Handing a second
+                        # producer the live stream's id would leave its queue unread
+                        # and its audio lost when the first reply ends: replace it.
+                        logger.warning(
+                            "Pipeline TTS stream requested while one is playing; replacing it",
+                            call_id=call_id,
+                            stream_id=existing,
+                            playback_type=playback_type,
+                            existing_type=existing_type,
+                        )
+                        existing_info['end_reason'] = 'replaced'
+                        await self.stop_streaming_playback(call_id)
+                        continue
                     logger.debug(
                         "Streaming already active for call",
                         call_id=call_id,

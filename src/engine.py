@@ -8155,6 +8155,84 @@ class Engine:
             logger.debug("Failed to persist the reply cut by the hangup", call_id=session.call_id, exc_info=True)
         await self._sync_call_history_transcript(session, reason="reply-cut-by-hangup")
 
+    async def _cut_pipeline_playback_for_turn(self, session: CallSession) -> bool:
+        """Stop the call's streaming playback because the caller's next turn is starting.
+
+        The reply on the stream was generated before the caller's latest words
+        (they spoke over it inside the barge-in protection window, or the
+        recognizer returned them late), so it is treated as interrupted at the
+        position the transport had reached: the history keeps the heard part,
+        the stream and its gating are released, and the next reply gets a
+        stream of its own. Nothing playing means nothing to do.
+        """
+        call_id = session.call_id
+        manager = getattr(self, "streaming_playback_manager", None)
+        if manager is None:
+            return False
+        try:
+            if not manager.is_stream_active(call_id):
+                return False
+        except Exception:
+            return False
+        info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+        stream_id = str(info.get("stream_id") or "")
+        playback_type = str(info.get("playback_type") or "")
+        try:
+            played_ms = int(manager.get_playback_position_ms(call_id))
+        except Exception:
+            played_ms = 0
+        try:
+            info["end_reason"] = "next-turn"
+        except Exception:
+            pass
+        try:
+            await self._note_pipeline_reply_interrupted(session, played_ms)
+        except Exception:
+            logger.debug("Heard-reply bookkeeping failed before the next turn", call_id=call_id, exc_info=True)
+        try:
+            await manager.stop_streaming_playback(call_id)
+        except Exception:
+            logger.debug("Streaming playback stop failed before the next turn", call_id=call_id, exc_info=True)
+        # Release the gating the cut stream held, as the barge-in handler does,
+        # so the caller's audio reaches the recognizer again at once.
+        try:
+            for token in list(getattr(session, "tts_tokens", set()) or []):
+                try:
+                    if self.conversation_coordinator:
+                        await self.conversation_coordinator.on_tts_end(call_id, token, reason="next-turn")
+                    else:
+                        await self.session_store.clear_gating_token(call_id, token)
+                except Exception:
+                    logger.debug("Failed to clear a gating token before the next turn", call_id=call_id, exc_info=True)
+        except Exception:
+            pass
+        logger.info(
+            "Pipeline playback cut by the caller's next turn",
+            call_id=call_id,
+            stream_id=stream_id,
+            playback_type=playback_type,
+            played_ms=played_ms,
+        )
+        return True
+
+    def _silero_speech_holds_turn(self, call_id: str, hold_sec: float) -> bool:
+        """Silero scored the caller's speech within the hold: the pending turn stays held.
+
+        Silero is the engine's own detector, so its stop cannot be lost the way
+        an Asterisk talk-detect end event can, and a caller in one long sentence
+        gives a VAD-gated recognizer no result for as long as the sentence
+        lasts. The hold therefore runs from the last frame scored as speech,
+        and only a detector left "talking" without speech frames (audio no
+        longer flowing) lets the hold expire.
+        """
+        if not (getattr(self, "_pipeline_caller_talking", None) or {}).get(call_id, False):
+            return False
+        tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+        last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+        if last_speech is None:
+            return False
+        return (time.monotonic() - float(last_speech)) < float(hold_sec)
+
     async def _sync_call_history_transcript(self, session: CallSession, *, reason: str) -> bool:
         """Write the session's conversation into an already persisted call record.
 
@@ -16860,6 +16938,12 @@ class Engine:
                         # The call is ending; the caller's words still belong in its record.
                         await self._record_caller_words_after_hangup(session, transcript_text)
                         return
+                    # A reply still playing now was produced without the caller's
+                    # latest words (their speech ran into it, or the recognizer
+                    # returned them late): cut it like a barge-in, keeping only the
+                    # heard part, before answering. A second reply started on top
+                    # of it would attach to the live stream and never be played.
+                    await self._cut_pipeline_playback_for_turn(session)
                     # The session is the record of the call: a barge-in trims the
                     # reply it holds, an announcement or a tool appends to it. Every
                     # turn starts from it, not from this worker's copy, or the next
@@ -18287,7 +18371,15 @@ class Engine:
                         changed_at = self._pipeline_caller_talk_changed_at.get(call_id, 0.0)
                         anchor = last_final_at if last_final_at is not None else now
                         if talking:
-                            deadline = anchor + end_of_turn.talk_detect_hold_sec
+                            hold_anchor = anchor
+                            if turn_source() == "vad":
+                                # Silero's stop cannot be lost, and a long sentence
+                                # gives no result while it lasts: hold from the last
+                                # frame it scored as speech, not from the last result.
+                                tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+                                last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+                                hold_anchor = max(anchor, changed_at, float(last_speech or 0.0))
+                            deadline = hold_anchor + end_of_turn.talk_detect_hold_sec
                         else:
                             deadline = max(anchor, changed_at) + end_of_turn.talk_detect_grace_sec
                         # The recognizer was told to finalize when the caller
@@ -18332,7 +18424,15 @@ class Engine:
                                 reevaluate()
                             continue
                         else:
-                            # Quiet for long enough: release the turn.
+                            # Quiet for long enough: release the turn. With Silero
+                            # still scoring the caller's speech the hold is renewed
+                            # instead, as long as that gives a deadline ahead of now.
+                            if turn_source() == "vad" and self._silero_speech_holds_turn(
+                                call_id, end_of_turn.talk_detect_hold_sec
+                            ):
+                                reevaluate()
+                                if pending_deadline is not None and pending_deadline > time.monotonic():
+                                    continue
                             await flush_pending()
                             continue
                         if transcript is None:

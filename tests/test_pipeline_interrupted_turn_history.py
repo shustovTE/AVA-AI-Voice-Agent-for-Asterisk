@@ -65,12 +65,14 @@ class _PlaybackStub:
     """Owns the stream; flipping ``active`` is what a barge-in does."""
 
     def __init__(self):
-        self.active = True
+        # No stream until one is started, as with the real manager.
+        self.active = False
         self.stopped = asyncio.Event()
         self.position_ms = 0  # what the hangup path reads as the played position
 
     async def start_streaming_playback(self, call_id, queue, **kwargs):
         self.queue = queue
+        self.active = True
         return "stream-1"
 
     def is_stream_active(self, call_id, stream_id=None):

@@ -101,7 +101,12 @@ thinks aloud; every value is also the latency before an answer).
   pending result is held while Asterisk keeps reporting speech without any
   newer result. Defaults to `8000`. A `ChannelTalkingFinished` is not
   guaranteed to arrive, and a caller still talking produces a result every
-  phrase, so a long quiet hold means the end event was lost.
+  phrase, so a long quiet hold means the end event was lost. With Silero VAD
+  as the turn source the hold runs from the last frame Silero scored as
+  speech instead: its stop cannot be lost, and a VAD-gated recognizer gives
+  no result for as long as a sentence lasts, so the turn stays held while
+  Silero hears the caller and only a detector left "talking" without speech
+  frames (audio no longer flowing) lets the hold expire.
 
 With Silero VAD enabled (see [Silero VAD](#silero-vad-pipelines) below) the
 engine's own neural detector takes that role, and with
@@ -594,6 +599,7 @@ Controls the pacing and robustness of streamed agent audio.
 - streaming.pipeline_streaming_overlap: default `true`. Pipelines: stream LLM tokens and synthesize sentence by sentence instead of waiting for the whole reply; needs an LLM adapter with token streaming and `downstream_mode: stream`. A pipeline overrides it with `options.tts.streaming_overlap` (*TTS Playback Policy → Streaming Overlap* in the pipeline editor); the log line `Pipeline streaming overlap policy resolved` shows the outcome.
 - streaming.pipeline_heard_reply_on_interrupt: default `true`. When the caller interrupts a pipeline reply, the conversation history keeps only what the caller could hear: the sentences that played in full plus a proportional prefix of the cut one (to a word boundary), marked with an ellipsis, and the entry carries `interrupted: true`. The estimate comes from the audio that had reached the transport when the barge-in cut the stream, so it applies to streaming playback. Off: the whole reply (serial mode) or the sentences queued so far (overlap mode) stay in the history as if they had been spoken. Log line: `Pipeline reply interrupted; keeping the heard part` (`played_ms`, `heard_chars`, `generated_chars`).
 - streaming.pipeline_heard_reply_lead_ms: default `200` (0–5000). Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction); subtracted from the played position. Raise it if the history keeps words the caller did not hear.
+- A reply still playing when the caller's next turn is released (their speech ran into it inside the barge-in protection window, or the recognizer returned it late) is cut the same way before the next reply starts, since it was produced without the caller's latest words; log line `Pipeline playback cut by the caller's next turn`. A second reply is never attached to a live stream.
 - streaming.pipeline_hangup_final_wait_ms: default `1500` (0–10000). When the caller hangs up, the call's cleanup first treats a reply still playing as interrupted at the position the transport had reached (the history keeps the heard part, as for a barge-in). Then, when the caller's speech is outstanding (the speech detector saw them talk after the recognizer's last result, or a finalize was already pending), the recognizer is fed its closing silence and the cleanup waits up to this long for the result, which is recorded as the caller's last turn with no LLM reply, so the call record, the post-call summary and the webhooks carry it. Results the dialog was still holding for the end of the turn, and a turn whose LLM request the hangup cancelled, are recorded the same way. Needed for the VAD-gated offline recognizers (GigaAM v3, Sherpa offline), which return a phrase only after their silence gate. `0` turns the wait off. Log lines: `Waited for the caller's last words after hangup` (`reason`, `arrived`, `waited_ms`) and `Caller's last words recorded after hangup`.
 - streaming.greeting_rtp_wait_ms: ExternalMedia-only. How long to wait (ms) for the remote RTP endpoint to be discovered during the initial greeting before falling back to file playback (prevents “dead air until caller speaks” in some Asterisk setups).
 

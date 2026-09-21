@@ -76,9 +76,10 @@ class _SilentTTS(TTSComponent):
 
 class _PlaybackStub:
     def __init__(self):
-        self.active = True
+        self.active = False  # no stream until one is started
 
     async def start_streaming_playback(self, call_id, queue, **kwargs):
+        self.active = True
         return "stream-1"
 
     def is_stream_active(self, call_id, stream_id=None):
