@@ -1120,6 +1120,15 @@ class NoInputConfig(BaseModel):
         return normalized
 
 
+# Asked of the model, in place of a caller turn, when the speech that cut a
+# pipeline reply off came to nothing (streaming.pipeline_continue_reply_prompt).
+DEFAULT_CONTINUE_REPLY_PROMPT = (
+    "(The caller interrupted you, but nothing intelligible was said. Continue your "
+    "previous reply from where it was cut off, without repeating what you already "
+    "said. If none of it was heard, say it again.)"
+)
+
+
 class StreamingConfig(BaseModel):
     sample_rate: int = Field(default=8000)
     jitter_buffer_ms: int = Field(default=50)
@@ -1175,6 +1184,17 @@ class StreamingConfig(BaseModel):
     # answered together with what they say next, as one turn. Off: the reply
     # plays and their next words are answered on their own.
     pipeline_discard_unheard_reply: bool = Field(default=True)
+    # Pipelines: when the speech that cut a reply off (barge-in) comes back from
+    # the recognizer empty (a cough, noise, nothing intelligible), the reply is
+    # continued from where it stopped: the model is asked, with the heard part
+    # in front of it, to go on, and the continuation joins the heard part in the
+    # history. The request is not a caller turn and leaves no trace. Off: the
+    # reply stays cut off until the caller says something the recognizer
+    # understands.
+    pipeline_continue_reply_after_empty_interrupt: bool = Field(default=True)
+    # The request sent to the model in place of a caller turn; never stored.
+    # Blank falls back to DEFAULT_CONTINUE_REPLY_PROMPT.
+    pipeline_continue_reply_prompt: str = Field(default="")
     # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
     # adapter immediately when a user turn is detected, before LLM inference starts.
     pipeline_filler_enabled: bool = Field(default=False)

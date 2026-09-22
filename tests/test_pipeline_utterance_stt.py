@@ -19,6 +19,7 @@ from src.config import AppConfig
 from src.core.models import CallSession
 from src.core.utterances import SttUtterance
 from src.engine import Engine
+from src.pipelines.base import LLMComponent, TTSComponent
 from tests.test_pipeline_runner_lifecycle import _RecordingLLM, _ResultStreamingStubSTT, _StubResolution
 
 CHUNK = b"\x11\x22" * 512  # one 32 ms Silero chunk at 16 kHz
@@ -54,11 +55,14 @@ class _PlaybackStub:
         self.active = False
         self.position_ms = 0
         self.active_streams = {}
+        self.starts = 0
 
     async def start_streaming_playback(self, call_id, queue, **kwargs):
         self.active = True
-        self.active_streams[call_id] = {"stream_id": "stream-1", "playback_type": kwargs.get("playback_type")}
-        return "stream-1"
+        self.starts += 1
+        stream_id = f"stream-{self.starts}"
+        self.active_streams[call_id] = {"stream_id": stream_id, "playback_type": kwargs.get("playback_type")}
+        return stream_id
 
     def is_stream_active(self, call_id, stream_id=None):
         return self.active
@@ -97,14 +101,16 @@ def _config(vad=None, barge_in=None, streaming=None) -> AppConfig:
     )
 
 
-async def _start_call(monkeypatch, *, stt, vad=None, barge_in=None, streaming=None):
+async def _start_call(monkeypatch, *, stt, vad=None, barge_in=None, streaming=None, llm=None, tts=None):
     engine = Engine(_config(vad, barge_in, streaming))
     engine.pipeline_orchestrator._started = True
     model = _ScriptedModel()
     engine._silero_model = model
     monkeypatch.setattr(engine, "streaming_playback_manager", _PlaybackStub())
-    llm = _RecordingLLM()
-    resolution = _StubResolution(stt_adapter=stt, stt_options={"streaming": True, "chunk_ms": 80}, llm_adapter=llm)
+    llm = llm or _RecordingLLM()
+    resolution = _StubResolution(
+        stt_adapter=stt, stt_options={"streaming": True, "chunk_ms": 80}, llm_adapter=llm, tts_adapter=tts
+    )
     resolution.llm_options = dict(GRACE)
     monkeypatch.setattr(engine.pipeline_orchestrator, "get_pipeline", lambda *a, **k: resolution)
     engine.ari_client.set_channel_var = AsyncMock(return_value=True)
@@ -308,3 +314,150 @@ async def test_the_utterance_that_cuts_the_agent_off_reaches_the_recognizer_whol
         assert 0 not in sent["audio"]
     finally:
         await engine._cleanup_call(session.call_id)
+
+
+class _ScriptedLLM(LLMComponent):
+    """Answers with the next scripted reply; records what it was asked."""
+
+    supports_streaming = False
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.transcripts = []
+
+    async def generate(self, call_id, transcript, context, options):
+        self.transcripts.append(transcript)
+        return self.replies.pop(0) if self.replies else ""
+
+
+class _LongTTS(TTSComponent):
+    """Seconds of audio per reply, so a barge-in lands well inside it."""
+
+    downstream_mode_override = "stream"
+
+    async def synthesize(self, call_id, text, options):
+        yield b"\x01\x00" * 16000
+
+
+REPLY = "Смотрите, если стены сейчас в бетоне, то это всё равно полноценный капитальный ремонт под ключ."
+CONTINUATION = "Так вот, это полный цикл работ: электрика, сантехника, стяжка и отделка."
+
+
+async def _reply_cut_off_by_a_cough(monkeypatch, *, streaming=None):
+    """A reply plays, speech that comes to nothing cuts it, and the recognizer says so."""
+    stt = _UtteranceStubSTT()
+    llm = _ScriptedLLM([REPLY, CONTINUATION])
+    engine, session, model, _ = await _start_call(
+        monkeypatch,
+        stt=stt,
+        llm=llm,
+        tts=_LongTTS(),
+        barge_in={"talk_detect_initial_protection_ms": 0},
+        streaming=streaming,
+    )
+    playback = engine.streaming_playback_manager
+    await stt.results.put("Хочу ремонт под ключ.")
+    assert await _wait_for(lambda: playback.starts == 1 and session.call_id in engine._spoken_replies)
+    # The reply is audible; the caller's frames are gated.
+    playback.position_ms = 900
+    session.audio_capture_enabled = False
+    session.tts_playing = True
+    session.tts_started_ts = time.time() - 2.0
+    await _hear(engine, session, model, [0.9, 0.9, 0.9])  # a cough: Silero start, barge-in
+    record = engine._spoken_replies[session.call_id]
+    assert record.interrupted and record.heard_text
+    assert session.conversation_history[-1]["content"] == record.heard_text  # trimmed to the heard part
+    await _hear(engine, session, model, [0.1, 0.1, 0.1])
+    assert await _wait_for(lambda: len(stt.utterances) == 1)
+    await stt.results.put("")  # nothing intelligible
+    return engine, session, stt, llm, playback, record.heard_text
+
+
+@pytest.mark.asyncio
+async def test_a_reply_cut_off_by_speech_that_came_to_nothing_is_continued(monkeypatch):
+    from src.config import DEFAULT_CONTINUE_REPLY_PROMPT
+
+    engine, session, stt, llm, playback, heard = await _reply_cut_off_by_a_cough(monkeypatch)
+    try:
+        assert await _wait_for(lambda: len(llm.transcripts) == 2)
+        assert llm.transcripts == ["Хочу ремонт под ключ.", DEFAULT_CONTINUE_REPLY_PROMPT]
+        assert await _wait_for(lambda: playback.starts == 2)
+        assert await _wait_for(
+            lambda: [m["role"] for m in session.conversation_history] == ["user", "assistant"]
+            and session.conversation_history[-1]["content"] == f"{heard} {CONTINUATION}"
+        )
+        assert "interrupted" not in session.conversation_history[-1]
+        assert engine._spoken_replies[session.call_id].persisted_text == f"{heard} {CONTINUATION}"
+        assert engine._spoken_replies[session.call_id].prefix_text == f"{heard} "
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_the_continuation_can_be_switched_off(monkeypatch):
+    engine, session, stt, llm, playback, heard = await _reply_cut_off_by_a_cough(
+        monkeypatch, streaming={"pipeline_continue_reply_after_empty_interrupt": False}
+    )
+    try:
+        await asyncio.sleep(0.5)
+        assert llm.transcripts == ["Хочу ремонт под ключ."]
+        assert playback.starts == 1
+        assert session.conversation_history[-1] == {
+            **session.conversation_history[-1],
+            "content": heard,
+            "interrupted": True,
+        }
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_the_continuation_joins_the_heard_part_and_the_request_leaves_no_trace():
+    from src.core.heard_reply import SpokenReply
+
+    engine = Engine(_config())
+    session = CallSession(call_id="call-join", caller_channel_id="call-join")
+    session.conversation_history = [
+        {"role": "user", "content": "Хочу ремонт под ключ."},
+        {"role": "assistant", "content": "Смотрите, если…", "interrupted": True},
+        {"role": "user", "content": "(continue)"},
+        {"role": "assistant", "content": "стены в бетоне, это капитальный ремонт."},
+    ]
+    record = SpokenReply(call_id="call-join", stream_id="stream-2", persisted_text="стены в бетоне, это капитальный ремонт.")
+    engine._spoken_replies["call-join"] = record
+    await engine.session_store.upsert_call(session)
+
+    assert await engine._join_continued_reply_history(session, "(continue)", "Смотрите, если…")
+
+    assert session.conversation_history == [
+        {"role": "user", "content": "Хочу ремонт под ключ."},
+        {"role": "assistant", "content": "Смотрите, если… стены в бетоне, это капитальный ремонт."},
+    ]
+    assert record.persisted_text == "Смотрите, если… стены в бетоне, это капитальный ремонт."
+    assert record.prefix_text == "Смотрите, если… "
+
+
+@pytest.mark.asyncio
+async def test_a_continuation_cut_off_in_turn_keeps_what_was_heard_before_it():
+    from src.core.heard_reply import SpokenReply
+
+    engine = Engine(_config())
+    session = CallSession(call_id="call-prefix", caller_channel_id="call-prefix")
+    session.conversation_history = [
+        {"role": "user", "content": "Хочу ремонт под ключ."},
+        {"role": "assistant", "content": "Смотрите, если… стены в бетоне, это капитальный ремонт."},
+    ]
+    record = SpokenReply(
+        call_id="call-prefix",
+        stream_id="stream-2",
+        persisted_text="Смотрите, если… стены в бетоне, это капитальный ремонт.",
+        prefix_text="Смотрите, если… ",
+    )
+    record.interrupted = True
+    record.heard_text = "стены в бетоне…"
+    await engine.session_store.upsert_call(session)
+
+    assert await engine._patch_interrupted_reply_history(session, record)
+
+    assert session.conversation_history[-1]["content"] == "Смотрите, если… стены в бетоне…"
+    assert session.conversation_history[-1]["interrupted"] is True

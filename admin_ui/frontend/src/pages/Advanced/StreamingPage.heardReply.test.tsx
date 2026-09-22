@@ -92,3 +92,30 @@ describe('StreamingPage discard of an unheard reply', () => {
         expect(saved.streaming.pipeline_discard_unheard_reply).toBe(false);
     });
 });
+
+describe('StreamingPage continuation of a reply cut off by nothing', () => {
+    beforeEach(() => {
+        mocks.post.mockReset();
+        mocks.post.mockResolvedValue({ data: { success: true, restart_required: true } });
+        mocks.config = { streaming: { pipeline_streaming_overlap: true } };
+    });
+
+    it('is on by default and saves the switch and the request text under streaming', async () => {
+        render(<StreamingPage />);
+        const cont = await screen.findByLabelText('Continue a reply cut off by an unintelligible interruption');
+        expect(cont).toBeChecked();
+        fireEvent.click(cont);
+        expect(cont).not.toBeChecked();
+        fireEvent.change(screen.getByLabelText('Continuation request'), {
+            target: { value: 'Продолжай с места обрыва.' },
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+        await waitFor(() => expect(mocks.post).toHaveBeenCalled());
+        const call = mocks.post.mock.calls.find(([url]) => url === '/api/config/yaml') as [string, { content: string }];
+        const saved = yaml.load(call[1].content) as any;
+        expect(saved.streaming.pipeline_continue_reply_after_empty_interrupt).toBe(false);
+        expect(saved.streaming.pipeline_continue_reply_prompt).toBe('Продолжай с места обрыва.');
+    });
+});

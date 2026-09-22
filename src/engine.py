@@ -861,6 +861,9 @@ class Engine:
         # tells the turn they went on (streaming.pipeline_discard_unheard_reply).
         self._pipeline_reply_inflight: Dict[str, Dict[str, Any]] = {}
         self._pipeline_caller_resumed: Dict[str, asyncio.Event] = {}
+        # How many continuations of a cut-off reply in a row came to nothing
+        # themselves (streaming.pipeline_continue_reply_after_empty_interrupt).
+        self._pipeline_continue_streak: Dict[str, int] = {}
         # Smart Turn: the shared model (loaded in start()), the caller's
         # recent audio per pipeline call, and per call the verdict for the
         # current stop or the analysis still running for it.
@@ -8094,11 +8097,12 @@ class Engine:
             if str(entry.get("content") or "").strip() != target:
                 continue
             heard = str(record.heard_text or "").strip()
-            if heard == target:
+            prefix = str(record.prefix_text or "") if heard else ""
+            if prefix + heard == target:
                 return False
             if heard:
                 patched = dict(entry)
-                patched["content"] = heard
+                patched["content"] = prefix + heard
                 patched["interrupted"] = True
                 history[index] = patched
             else:
@@ -8128,6 +8132,8 @@ class Engine:
         """
         text = (text or "").strip()
         if not text or not self._call_cleanup_started(session):
+            return False
+        if text == self._continue_reply_prompt():
             return False
         history = getattr(session, "conversation_history", None)
         if not isinstance(history, list):
@@ -8315,7 +8321,7 @@ class Engine:
             )
             return False
         starts = self._pipeline_utterance_starts.setdefault(call_id, deque(maxlen=16))
-        starts.append(float(utterance.started_at))
+        starts.append((float(utterance.started_at), bool(utterance.interrupted_agent)))
         logger.info(
             "Caller utterance sent to the recognizer",
             call_id=call_id,
@@ -8553,6 +8559,85 @@ class Engine:
                 await self.session_store.upsert_call(session)
             except Exception:
                 logger.debug("Failed to persist the history without the discarded reply", call_id=session.call_id, exc_info=True)
+
+    # ── A reply cut off by speech that came to nothing is continued ──────────
+    def _continue_reply_after_empty_interrupt(self, call_id: str) -> bool:
+        """Whether the reply a barge-in just cut off is to be picked up where it stopped."""
+        cfg = getattr(self.config, "streaming", None)
+        if not bool(getattr(cfg, "pipeline_continue_reply_after_empty_interrupt", True)):
+            return False
+        record = self._spoken_replies.get(call_id)
+        if record is None or not record.interrupted or record.continued:
+            return False
+        if self._pipeline_continue_streak.get(call_id, 0) >= 2:
+            logger.info(
+                "Interrupted reply left as it is: two continuations in a row were cut off by nothing",
+                call_id=call_id,
+            )
+            return False
+        return True
+
+    def _continue_reply_prompt(self) -> str:
+        """What the model is asked, in place of a caller turn, to go on with a cut-off reply."""
+        from .config import DEFAULT_CONTINUE_REPLY_PROMPT
+
+        cfg = getattr(self.config, "streaming", None)
+        text = str(getattr(cfg, "pipeline_continue_reply_prompt", "") or "").strip()
+        return text or DEFAULT_CONTINUE_REPLY_PROMPT
+
+    async def _join_continued_reply_history(self, session: CallSession, prompt: str, heard: str) -> bool:
+        """Fold the continuation of a cut-off reply into the history.
+
+        The request that asked for it is not a caller turn, so its entry goes;
+        the continuation is appended to the heard part's entry, which keeps one
+        assistant turn (a chat template that insists on alternating roles never
+        sees two assistant messages in a row) and reads as what was said.
+        """
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return False
+        prompt = str(prompt or "").strip()
+        heard = str(heard or "").strip()
+        index = None
+        for candidate in range(len(history) - 1, -1, -1):
+            entry = history[candidate]
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == "user"
+                and str(entry.get("content") or "").strip() == prompt
+            ):
+                index = candidate
+                break
+        if index is None:
+            return False
+        del history[index]
+        continuation = history[index] if index < len(history) else None
+        previous = history[index - 1] if index > 0 else None
+        if (
+            isinstance(continuation, dict)
+            and continuation.get("role") == "assistant"
+            and index == len(history) - 1
+            and isinstance(previous, dict)
+            and previous.get("role") == "assistant"
+            and heard
+            and str(previous.get("content") or "").strip() == heard
+        ):
+            text = str(continuation.get("content") or "").strip()
+            merged = f"{heard} {text}".strip() if text else heard
+            patched = {key: value for key, value in previous.items() if key != "interrupted"}
+            patched["content"] = merged
+            history[index - 1] = patched
+            del history[index]
+            record = self._spoken_replies.get(session.call_id)
+            if record is not None and str(record.persisted_text or "").strip() == text:
+                record.persisted_text = merged
+                record.prefix_text = f"{heard} "
+        session.conversation_history = history
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the continued reply", call_id=session.call_id, exc_info=True)
+        return True
 
     def _pipeline_turn_waits_for_reply(
         self, session: CallSession, speech_started_at: Optional[float]
@@ -10640,6 +10725,7 @@ class Engine:
             self._pipeline_utterance_fallback_warned.discard(call_id)
             self._pipeline_reply_inflight.pop(call_id, None)
             self._pipeline_caller_resumed.pop(call_id, None)
+            self._pipeline_continue_streak.pop(call_id, None)
             self._pipeline_turn_verdict.pop(call_id, None)
             self._pipeline_turn_verdict_pending.pop(call_id, None)
             warm_up_task = self._pipeline_llm_warm_ups.pop(call_id, None)
@@ -17394,6 +17480,8 @@ class Engine:
                 wakeup = asyncio.Event()
                 self._pipeline_turn_wakeup[call_id] = wakeup
                 last_final_at: Optional[float] = None
+                # The pending text is the request to continue a cut-off reply, not the caller's words.
+                pending_resume: bool = False
                 logger.info(
                     "Pipeline end-of-turn policy resolved",
                     call_id=call_id,
@@ -18846,9 +18934,10 @@ class Engine:
                 async def flush_pending() -> None:
                     """Hand everything the caller has said so far to the LLM."""
                     nonlocal pending_segments, pending_started_at, pending_deadline, last_final_at
-                    nonlocal pending_speech_started_at
+                    nonlocal pending_speech_started_at, pending_resume
                     aggregated = " ".join(pending_segments).strip()
                     segments = len(pending_segments)
+                    resume, pending_resume = pending_resume, False
                     pending_segments.clear()
                     pending_deadline = None
                     last_final, last_final_at = last_final_at, None
@@ -18858,6 +18947,9 @@ class Engine:
                     if starts:
                         starts.clear()
                     if not aggregated:
+                        return
+                    if resume:
+                        await continue_interrupted_reply(aggregated)
                         return
                     now = time.monotonic()
                     source = turn_source()
@@ -18912,6 +19004,44 @@ class Engine:
                             preview=aggregated[:80],
                         )
                         reevaluate()
+
+                async def continue_interrupted_reply(prompt: str) -> None:
+                    """The speech that cut the reply off came to nothing: pick the reply up where it stopped.
+
+                    The model is asked, with the heard part of the reply in
+                    front of it, to go on from there. The request is not a
+                    caller turn: it leaves no trace in the history, and the
+                    continuation joins the heard part as one assistant entry.
+                    The caller speaking before the continuation's first sound
+                    discards it like any reply, and their words are the next
+                    turn on their own.
+                    """
+                    if self._call_cleanup_started(session):
+                        return
+                    record = self._spoken_replies.get(call_id)
+                    heard = str(getattr(record, "persisted_text", "") or "").strip() if record is not None else ""
+                    if record is not None:
+                        record.continued = True
+                    attempt = self._pipeline_continue_streak.get(call_id, 0) + 1
+                    self._pipeline_continue_streak[call_id] = attempt
+                    logger.info(
+                        "Interrupted reply continued: the speech that cut it off came to nothing",
+                        call_id=call_id,
+                        heard_chars=len(heard),
+                        heard_tail=heard[-40:] if heard else None,
+                        attempt=attempt,
+                    )
+                    resumed = self._pipeline_caller_resumed.get(call_id)
+                    if resumed is not None:
+                        resumed.clear()
+                    outcome = await run_turn(prompt)
+                    if outcome == "superseded":
+                        logger.info(
+                            "Continuation discarded before its first sound; the caller went on",
+                            call_id=call_id,
+                        )
+                        return
+                    await self._join_continued_reply_history(session, prompt, heard)
 
                 def reevaluate() -> None:
                     """Recompute when the pending text may become a turn.
@@ -19010,7 +19140,9 @@ class Engine:
                         # When this result's utterance started: the start the
                         # cutter recorded when it sent it, else Silero's latest.
                         starts = self._pipeline_utterance_starts.get(call_id)
-                        speech_started_for_result = starts.popleft() if starts else None
+                        speech_started_for_result, result_interrupted_agent = (
+                            starts.popleft() if starts else (None, False)
+                        )
                         if speech_started_for_result is None:
                             tracker = self._silero_trackers.get(call_id)
                             speech_started_for_result = (
@@ -19019,10 +19151,29 @@ class Engine:
                         normalized = (transcript or "").strip()
                         if not normalized:
                             # An empty result is not speech, so it must not
-                            # push the deadline out.
+                            # push the deadline out. When it is all that the
+                            # speech which cut the agent off came to, the reply
+                            # it cut is continued instead of left hanging.
+                            if (
+                                result_interrupted_agent
+                                and not pending_segments
+                                and self._continue_reply_after_empty_interrupt(call_id)
+                            ):
+                                pending_segments.append(self._continue_reply_prompt())
+                                pending_resume = True
+                                pending_speech_started_at = None
+                                pending_started_at = last_final_at = time.monotonic()
+                                reevaluate()
                             continue
                         await self._no_input_note_activity(call_id, "pipeline:transcript")
                         await self._no_input_note_processing(call_id, True)
+                        self._pipeline_continue_streak.pop(call_id, None)
+                        if pending_resume:
+                            # The caller did say something after all: their words,
+                            # not the continuation, are the next turn.
+                            pending_segments.clear()
+                            pending_resume = False
+                            pending_started_at = None
                         if not pending_segments:
                             pending_speech_started_at = speech_started_for_result
                         pending_segments.append(normalized)

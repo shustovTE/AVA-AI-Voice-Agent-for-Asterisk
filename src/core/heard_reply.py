@@ -68,6 +68,11 @@ class SpokenReply:
     heard_text: Optional[str] = None
     # The assistant text currently in the conversation history for this reply, if any.
     persisted_text: Optional[str] = None
+    # What sits in front of this reply in its history entry: the heard part of
+    # the reply it continues (see Engine._join_continued_reply_history).
+    prefix_text: str = ""
+    # The speech that cut it off came to nothing and a continuation was asked for.
+    continued: bool = False
 
     @property
     def full_text(self) -> str:

@@ -506,6 +506,20 @@ const StreamingPage = () => {
                             onChange={(e) => updateStreamingConfig('pipeline_discard_unheard_reply', e.target.checked)}
                             tooltip="A turn released on a pause the caller only took to breathe no longer costs a reply to half a sentence. Counted until the first bytes of the reply reach the transport; after that the reply is the caller's to interrupt (Barge-In page)."
                         />
+                        <FormSwitch
+                            label="Continue a reply cut off by an unintelligible interruption"
+                            description="Pipelines with Silero VAD cutting the caller's utterances: when the speech that interrupted a reply comes back from the recognizer empty (a cough, noise), the model is asked, with the heard part in front of it, to go on from where it stopped. The continuation joins the heard part in the history; the request leaves no trace. Off: the reply stays cut off until the caller says something the recognizer understands."
+                            checked={streamingConfig.pipeline_continue_reply_after_empty_interrupt ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_continue_reply_after_empty_interrupt', e.target.checked)}
+                            tooltip="At most two continuations in a row; a third interruption that comes to nothing leaves the reply cut off. The caller speaking before the continuation's first sound discards it, as with any reply, and their words are answered on their own."
+                        />
+                        <FormInput
+                            label="Continuation request"
+                            value={streamingConfig.pipeline_continue_reply_prompt ?? ''}
+                            onChange={(e) => updateStreamingConfig('pipeline_continue_reply_prompt', e.target.value)}
+                            placeholder="(The caller interrupted you, but nothing intelligible was said. Continue your previous reply from where it was cut off, without repeating what you already said. If none of it was heard, say it again.)"
+                            tooltip="Sent to the model in place of a caller turn when a reply is continued; never stored in the history. Blank uses the built-in text shown as the placeholder."
+                        />
                         <FormInput
                             label="Last words after hangup (ms)"
                             type="number"

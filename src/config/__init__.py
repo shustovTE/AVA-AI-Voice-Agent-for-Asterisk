@@ -56,6 +56,7 @@ LLMConfig = _parent_config.LLMConfig
 VADConfig = _parent_config.VADConfig
 NoInputConfig = _parent_config.NoInputConfig
 StreamingConfig = _parent_config.StreamingConfig
+DEFAULT_CONTINUE_REPLY_PROMPT = _parent_config.DEFAULT_CONTINUE_REPLY_PROMPT
 LoggingConfig = _parent_config.LoggingConfig
 PipelineEntry = _parent_config.PipelineEntry
 AppConfig = _parent_config.AppConfig
@@ -92,6 +93,7 @@ __all__ = [
     'VADConfig',
     'NoInputConfig',
     'StreamingConfig',
+    'DEFAULT_CONTINUE_REPLY_PROMPT',
     'LoggingConfig',
     'PipelineEntry',
     'AppConfig',
