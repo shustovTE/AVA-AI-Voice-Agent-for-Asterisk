@@ -844,6 +844,9 @@ class Engine:
         # pipeline call, plus resample state for wire rates it does not take.
         self._silero_model: Optional[SileroVadModel] = None
         self._silero_trackers: Dict[str, SileroCallerTracker] = {}
+        # Calls whose caller started talking inside the barge-in protection
+        # window: when it ends and they are still talking, they interrupt.
+        self._silero_deferred_barge_in: Dict[str, float] = {}
         self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
         self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
         # Silero cuts the caller's utterances for the recognizer
@@ -10717,6 +10720,7 @@ class Engine:
             self._pipeline_stt_final_expected_at.pop(call_id, None)
             self._pipeline_last_final_at.pop(call_id, None)
             self._silero_trackers.pop(call_id, None)
+            self._silero_deferred_barge_in.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
             self._turn_audio.pop(call_id, None)
             self._utterance_cutters.pop(call_id, None)
@@ -12726,6 +12730,12 @@ class Engine:
                 await self._on_silero_speech_finished(
                     session, tracker, source=source, utterance=utterance
                 )
+        deferred_since = (getattr(self, "_silero_deferred_barge_in", None) or {}).get(call_id)
+        if deferred_since is not None:
+            if tracker.talking:
+                await self._retry_deferred_silero_barge_in(session, tracker, source=source, since=deferred_since)
+            else:
+                self._silero_deferred_barge_in.pop(call_id, None)
         if cutter is not None and tracker.talking:
             # A caller who never pauses: the recognizer gets the utterance in
             # pieces rather than a minute of speech at once.
@@ -12760,11 +12770,33 @@ class Engine:
         if listening:
             await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
             return
+        outcome = await self._silero_barge_in(session, tracker, source=source)
+        if outcome == "protected":
+            # The window only says when speech may interrupt: a caller still
+            # talking when it ends interrupts then (retried frame by frame).
+            self._silero_deferred_barge_in[call_id] = time.monotonic()
+
+    async def _silero_barge_in(
+        self,
+        session: CallSession,
+        tracker: SileroCallerTracker,
+        *,
+        source: str,
+        deferred_since: Optional[float] = None,
+    ) -> str:
+        """Interrupt the agent for the caller's speech unless something says not to.
+
+        Returns ``"fired"``, ``"protected"`` (inside the echo-protection
+        window, where the start of a reply may still be the agent's own voice
+        coming back; the caller may outlast the window, so the decision is
+        retried while they talk) or ``"skipped"`` (barge-in off, cooldown).
+        """
+        call_id = session.call_id
         if not self._silero_config()["barge_in"]:
-            return
+            return "skipped"
         cfg = getattr(self.config, "barge_in", None)
         if not cfg or not getattr(cfg, "enabled", True):
-            return
+            return "skipped"
         now = time.time()
         tts_elapsed_ms = 0
         try:
@@ -12783,17 +12815,18 @@ class Engine:
         except Exception:
             pass
         if tts_elapsed_ms < initial_protect:
-            logger.debug(
-                "Silero VAD speech suppressed (echo protection)",
-                call_id=call_id,
-                tts_elapsed_ms=tts_elapsed_ms,
-                protection_ms=initial_protect,
-            )
-            return
+            if deferred_since is None:
+                logger.debug(
+                    "Silero VAD speech inside the protection window; barge-in deferred to its end",
+                    call_id=call_id,
+                    tts_elapsed_ms=tts_elapsed_ms,
+                    protection_ms=initial_protect,
+                )
+            return "protected"
         cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
         last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
         if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
-            return
+            return "skipped"
         await self._no_input_note_activity(call_id, "engine:silero_vad_barge_in")
         try:
             if not bool(getattr(session, "media_rx_confirmed", False)):
@@ -12812,7 +12845,25 @@ class Engine:
             source=source,
             tts_elapsed_ms=tts_elapsed_ms,
             probability=round(tracker.last_probability, 3),
+            deferred_ms=int((time.monotonic() - deferred_since) * 1000) if deferred_since is not None else None,
         )
+        return "fired"
+
+    async def _retry_deferred_silero_barge_in(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str, since: float
+    ) -> None:
+        """The caller started inside the protection window and is still talking: interrupt once it has passed."""
+        call_id = session.call_id
+        listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
+            getattr(session, "tts_playing", False)
+        )
+        if listening:
+            # The reply ended, or something else cut it: nothing left to interrupt.
+            self._silero_deferred_barge_in.pop(call_id, None)
+            return
+        outcome = await self._silero_barge_in(session, tracker, source=source, deferred_since=since)
+        if outcome != "protected":
+            self._silero_deferred_barge_in.pop(call_id, None)
 
     async def _on_silero_speech_finished(
         self,
@@ -12830,6 +12881,7 @@ class Engine:
         said and goes to the recognizer whole instead of a finalize burst.
         """
         call_id = session.call_id
+        self._silero_deferred_barge_in.pop(call_id, None)
         finalize_requested = False
         expect_result = False
         if self._pipeline_utterance_mode(call_id):

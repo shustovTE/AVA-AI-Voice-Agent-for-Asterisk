@@ -461,3 +461,31 @@ async def test_a_continuation_cut_off_in_turn_keeps_what_was_heard_before_it():
 
     assert session.conversation_history[-1]["content"] == "Смотрите, если… стены в бетоне…"
     assert session.conversation_history[-1]["interrupted"] is True
+
+
+@pytest.mark.asyncio
+async def test_speech_that_outlasts_the_protection_window_reaches_the_recognizer_whole(monkeypatch):
+    """It started while the window still held: when the window ends it interrupts, and none of it is lost."""
+    stt = _UtteranceStubSTT()
+    engine, session, model, llm = await _start_call(monkeypatch, stt=stt)  # the default 1500 ms window
+    try:
+        playback = engine.streaming_playback_manager
+        playback.active = True
+        playback.position_ms = 400  # the reply is audible: the caller's frames are muted
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 0.7  # inside the window
+        await _hear(engine, session, model, [0.9, 0.9, 0.9, 0.9])  # Silero start: no barge-in yet
+        assert session.audio_capture_enabled is False
+        session.tts_started_ts = time.time() - 1.6  # the window has passed; still talking
+        await _hear(engine, session, model, [0.9])
+        assert session.audio_capture_enabled is True  # the deferred barge-in fired
+        await _hear(engine, session, model, [0.1, 0.1, 0.1])
+        assert await _wait_for(lambda: len(stt.utterances) == 1)
+
+        sent = stt.utterances[0]
+        # From the 64 ms pre-roll before the chunk that confirmed speech to the chunk that closed it.
+        assert len(sent["audio"]) == (8 * 512 - 512) * 2
+        assert sent["audio"][:2] == b"\x11\x22" and 0 not in sent["audio"]
+    finally:
+        await engine._cleanup_call(session.call_id)

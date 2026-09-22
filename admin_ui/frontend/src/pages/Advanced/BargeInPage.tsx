@@ -267,7 +267,7 @@ const BargeInPage = () => {
                                         <li><strong>Energy Threshold:</strong> Increase if barge-in is too sensitive (500-1200 typical)</li>
                                         <li><strong>Provider Output Suppress:</strong> Increase if provider resumes speaking pre-barge audio (800-1600ms typical)</li>
                                         <li><strong>Post-TTS Protection:</strong> Increase if you see immediate re-triggers after TTS ends (200-600ms typical)</li>
-                                        <li><strong>Talk-Detect / Silero Initial Protection:</strong> Lower (300-800ms) so callers can interrupt a reply sooner; raise it if the agent cuts itself off right after it starts speaking (echo on the line). Speech before the reply's first sound never needs it: the reply is discarded instead.</li>
+                                        <li><strong>Talk-Detect / Silero Initial Protection:</strong> Lower (300-800ms) so callers can interrupt a reply sooner; raise it if the agent cuts itself off right after it starts speaking (echo on the line). With Silero VAD, speech that outlasts the window interrupts when it ends, so a long window costs delay, not words. Speech before the reply's first sound never needs it: the reply is discarded instead.</li>
                                     </ul>
                                 </div>
                             </div>
@@ -305,7 +305,7 @@ const BargeInPage = () => {
                                             type="number"
                                             value={bargeInConfig.talk_detect_initial_protection_ms ?? 1500}
                                             onChange={(e) => updateBargeInConfig('talk_detect_initial_protection_ms', parseInt(e.target.value))}
-                                            tooltip="How long after agent audio starts the caller's speech is ignored by Asterisk TALK_DETECT and Silero VAD: the earliest a caller can interrupt a reply. It rejects phone echo of the agent's own voice; 0 lets the caller interrupt from the first millisecond (only with echo cancellation on the line). Counted from the stream start, about 200-300 ms before the first audible sound. Speech before the reply's first sound is never blocked by it: the reply is discarded instead (Streaming page → Interrupted Replies)."
+                                            tooltip="How long after agent audio starts the caller's speech may not interrupt a reply, against phone echo of the agent's own voice. With Silero VAD the window only defers: speech that starts inside it and is still going when it ends interrupts the reply then, and is recognized whole; speech that stops inside it does not interrupt. Asterisk TALK_DETECT ignores a talking-start inside the window; 0 lets the caller interrupt from the first millisecond (only with echo cancellation on the line). Counted from the stream start, about 200-300 ms before the first audible sound. Speech before the reply's first sound is never blocked by it: the reply is discarded instead (Streaming page → Interrupted Replies)."
                                         />
                                     )}
                                     <FormInput

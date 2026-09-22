@@ -322,3 +322,45 @@ async def test_tracker_needs_a_loaded_model_and_goes_with_the_call(monkeypatch):
     assert "call-sv-life2" not in engine._silero_trackers
     assert "call-sv-life2" not in engine._pipeline_turn_source
     assert "call-sv-life2" not in engine._pipeline_stt_final_expected_at
+
+
+@pytest.mark.asyncio
+async def test_speech_that_starts_inside_the_protection_and_goes_on_barges_in_when_it_ends(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-deferred", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 0.7  # inside the 1500 ms window
+        await _hear(engine, session, model, [0.9, 0.9, 0.9, 0.9, 0.9])
+        engine._apply_barge_in_action.assert_not_awaited()
+        assert "call-sv-deferred" in engine._silero_deferred_barge_in
+
+        session.tts_started_ts = time.time() - 1.6  # the window has passed; the caller is still talking
+        await _hear(engine, session, model, [0.9])
+        engine._apply_barge_in_action.assert_awaited_once()
+        assert engine._apply_barge_in_action.await_args.kwargs["source"] == "silero_vad"
+        assert session.audio_capture_enabled is True
+        assert "call-sv-deferred" not in engine._silero_deferred_barge_in
+    finally:
+        await engine._cleanup_call("call-sv-deferred")
+
+
+@pytest.mark.asyncio
+async def test_speech_that_stops_inside_the_protection_does_not_barge_in_later(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-short", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 0.7
+        await _hear(engine, session, model, [0.9, 0.9, 0.9, 0.1, 0.1, 0.1])  # start, then stop, inside the window
+        assert "call-sv-short" not in engine._silero_deferred_barge_in
+
+        session.tts_started_ts = time.time() - 1.6
+        await _hear(engine, session, model, [0.1, 0.1])
+        engine._apply_barge_in_action.assert_not_awaited()
+    finally:
+        await engine._cleanup_call("call-sv-short")
