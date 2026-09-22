@@ -17,6 +17,12 @@ onset Silero needed to make up its mind), or a piece of a very long one so a
 model trained on short clips is never given a minute of speech at once.
 :class:`SttUtterance` is the item that carries such an utterance through the
 pipeline's STT queue next to the raw frames of the streaming path.
+
+Frames that reach the cutter while the agent is audible are flagged as muted
+and read back as zeros, so the recognizer never hears the agent. The one
+exception is the utterance that cuts the agent off: it is the caller's from
+its first frame, and it goes to the recognizer whole, the words spoken while
+the agent was still audible included.
 """
 
 from __future__ import annotations
@@ -42,6 +48,9 @@ class SttUtterance:
     # How much of it is real caller audio: frames muted while the agent was
     # audible are zeros and do not count.
     signal_ms: float = 0.0
+    # It cut the agent off: sent whole, the frames muted while the agent was
+    # still audible included as audio, and all of it counted as signal.
+    interrupted_agent: bool = False
 
     @property
     def duration_ms(self) -> float:
@@ -82,7 +91,9 @@ class UtteranceCutter:
     ``speech_stopped`` returns everything from there to the frame that closed
     it, which already includes Silero's stop silence. An utterance that grows
     past ``max_ms`` is split by ``split_overflow`` at the newest quiet chunk in
-    its second half, or at its end when none was seen.
+    its second half, or at its end when none was seen. Muted frames are kept
+    with their audio but read back as zeros, except in the utterance that cut
+    the agent off (``note_barge_in``), which is returned whole.
     """
 
     def __init__(
@@ -105,10 +116,13 @@ class UtteranceCutter:
         self.position = 0
         self._open: Optional[_OpenSegment] = None
         self.utterances = 0
+        # Absolute sample position at which the caller's speech cut the agent
+        # off; the utterance around it is returned whole.
+        self._barge_in_at: Optional[int] = None
 
     # ── feeding ──────────────────────────────────────────────────────────────
     def append(self, pcm16: bytes, *, muted: bool = False) -> None:
-        """Add one frame of PCM16 at the cutter's rate; a muted frame is stored as zeros."""
+        """Add one frame of PCM16 at the cutter's rate; a muted frame reads back as zeros."""
         if not pcm16:
             return
         if len(pcm16) % 2:
@@ -116,8 +130,7 @@ class UtteranceCutter:
         samples = len(pcm16) // 2
         if samples <= 0:
             return
-        data = bytes(samples * 2) if muted else bytes(pcm16)
-        self._chunks.append(_Chunk(start=self.position, data=data, muted=bool(muted)))
+        self._chunks.append(_Chunk(start=self.position, data=bytes(pcm16), muted=bool(muted)))
         self.position += samples
         self._trim()
 
@@ -125,6 +138,10 @@ class UtteranceCutter:
         """The newest chunk scored quiet: a candidate split point for a long utterance."""
         if self._open is not None:
             self._open.quiet_at = self.position
+
+    def note_barge_in(self) -> None:
+        """The caller's speech just cut the agent off: the utterance around now is sent whole."""
+        self._barge_in_at = self.position
 
     def _trim(self) -> None:
         floor = self.position - self._keep_samples
@@ -160,6 +177,10 @@ class UtteranceCutter:
             return
         oldest = self._chunks[0].start if self._chunks else self.position
         start = max(oldest, self.position - self.preroll_samples)
+        if self._barge_in_at is not None and self._barge_in_at < start:
+            # A barge-in no utterance carried (the detector fired on something
+            # Silero never confirmed): it does not belong to this one.
+            self._barge_in_at = None
         self._open = _OpenSegment(start=start)
 
     def speech_stopped(self, *, reason: str = "stop") -> Optional[SttUtterance]:
@@ -189,8 +210,12 @@ class UtteranceCutter:
             if close:
                 self._open = None
             return None
-        pcm = self.read(start, end)
-        signal = self._signal_samples_between(start, end)
+        # The utterance that cut the agent off is the caller's from its first
+        # frame: what they said while the agent was still audible goes to the
+        # recognizer as audio, not as the silence other utterances carry there.
+        interrupted = self._barge_in_at is not None and start <= self._barge_in_at <= end
+        pcm = self.read(start, end, unmute=interrupted)
+        signal = (end - start) if interrupted else self._signal_samples_between(start, end)
         now = time.monotonic()
         self.utterances += 1
         utterance = SttUtterance(
@@ -201,15 +226,22 @@ class UtteranceCutter:
             ended_at=now - (self.position - end) / self.sample_rate,
             reason=reason,
             signal_ms=signal / self.sample_rate * 1000.0,
+            interrupted_agent=interrupted,
         )
+        if interrupted:
+            self._barge_in_at = None
         if close:
             self._open = None
         else:
             self._open = _OpenSegment(start=end)
         return utterance
 
-    def read(self, start: int, end: int) -> bytes:
-        """The buffered audio between two absolute sample positions (zeros where it is gone)."""
+    def read(self, start: int, end: int, *, unmute: bool = False) -> bytes:
+        """The buffered audio between two absolute sample positions.
+
+        Zeros where the audio is gone, and for the frames muted while the agent
+        was audible unless ``unmute`` asks for what the caller actually said.
+        """
         if end <= start:
             return b""
         out = bytearray()
@@ -224,7 +256,10 @@ class UtteranceCutter:
                 pos = chunk.start
             take_from = pos - chunk.start
             take_to = min(chunk.samples, end - chunk.start)
-            out.extend(chunk.data[take_from * 2 : take_to * 2])
+            if chunk.muted and not unmute:
+                out.extend(bytes((take_to - take_from) * 2))
+            else:
+                out.extend(chunk.data[take_from * 2 : take_to * 2])
             pos = chunk.start + take_to
             if pos >= end:
                 break

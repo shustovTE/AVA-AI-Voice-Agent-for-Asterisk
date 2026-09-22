@@ -8322,6 +8322,7 @@ class Engine:
             utterance_id=utterance.utterance_id,
             duration_ms=int(utterance.duration_ms),
             signal_ms=int(utterance.signal_ms),
+            interrupted_agent=bool(utterance.interrupted_agent),
             reason=utterance.reason,
         )
         if expect_result:
@@ -13439,6 +13440,16 @@ class Engine:
                 await self._cancel_terminal_hangup_for_barge_in(call_id, session)
             except Exception:
                 logger.debug("Farewell hangup cancellation failed during barge-in", call_id=call_id, exc_info=True)
+
+            # The utterance that cuts the agent off goes to the recognizer whole:
+            # its head, spoken while the agent was still audible, is kept as
+            # audio instead of the silence gated frames are stored as.
+            try:
+                cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+                if cutter is not None:
+                    cutter.note_barge_in()
+            except Exception:
+                logger.debug("Utterance cutter barge-in note failed", call_id=call_id, exc_info=True)
 
             provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
             local_provider_notified = False

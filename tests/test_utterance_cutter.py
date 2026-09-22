@@ -115,3 +115,62 @@ def test_the_preroll_never_reaches_before_the_first_frame():
     utterance = cutter.speech_stopped()
 
     assert utterance.duration_ms == 100
+
+
+def test_the_utterance_that_cut_the_agent_off_is_returned_whole():
+    cutter = _cutter(preroll_ms=0)
+    cutter.speech_started()
+    cutter.append(_frame(100, 0x33), muted=True)  # the agent was audible: gated
+    cutter.note_barge_in()  # ...until this speech cut it off
+    cutter.append(_frame(100, 0x44))
+    utterance = cutter.speech_stopped()
+
+    assert utterance.interrupted_agent is True
+    assert utterance.pcm16[:2] == b"\x33\x33"  # the gated head, as the caller said it
+    assert utterance.pcm16[-2:] == b"\x44\x44"
+    assert utterance.signal_ms == 200
+
+
+def test_a_barge_in_noted_inside_the_preroll_counts_for_the_utterance_that_opens_after_it():
+    cutter = _cutter(preroll_ms=100)
+    cutter.append(_frame(60, 0x33), muted=True)
+    cutter.note_barge_in()  # Asterisk talk detection fired before Silero's start
+    cutter.append(_frame(20, 0x44))
+    cutter.speech_started()  # the pre-roll reaches back over the barge-in
+    cutter.append(_frame(100, 0x55))
+    utterance = cutter.speech_stopped()
+
+    assert utterance.interrupted_agent is True
+    assert utterance.duration_ms == 180
+    assert utterance.pcm16[:2] == b"\x33\x33" and utterance.signal_ms == 180
+
+
+def test_only_the_interrupting_utterance_is_unmuted():
+    cutter = _cutter(preroll_ms=0)
+    cutter.speech_started()
+    cutter.append(_frame(100, 0x33), muted=True)
+    cutter.note_barge_in()
+    cutter.append(_frame(100, 0x44))
+    assert cutter.speech_stopped().interrupted_agent is True
+
+    cutter.speech_started()  # a later utterance over the next reply
+    cutter.append(_frame(100, 0x55), muted=True)
+    cutter.append(_frame(100, 0x66))
+    later = cutter.speech_stopped()
+
+    assert later.interrupted_agent is False
+    assert set(later.pcm16[: RATE * 100 // 1000 * 2]) == {0}
+    assert later.signal_ms == 100
+
+
+def test_a_barge_in_before_the_preroll_is_forgotten():
+    cutter = _cutter(preroll_ms=20)
+    cutter.append(_frame(100, 0x33), muted=True)
+    cutter.note_barge_in()
+    cutter.append(_frame(200, 0x44), muted=True)  # well past the pre-roll of the next utterance
+    cutter.speech_started()
+    cutter.append(_frame(100, 0x55))
+    utterance = cutter.speech_stopped()
+
+    assert utterance.interrupted_agent is False
+    assert utterance.signal_ms == 100

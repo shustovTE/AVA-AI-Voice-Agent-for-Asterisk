@@ -198,7 +198,11 @@ all (Silero VAD, which owns barge-in, has already scored them), and with
 `vad.silero_stt_utterances` nothing streams to the recognizer in the first
 place: the engine keeps the caller's audio and sends whole utterances, in which
 the stretch where the agent was actually audible is zeros unless listening is
-on. The gate closes at the stream start, but echo needs sound, so the 200–300 ms
+on. The one exception is the utterance that interrupts the agent: the words
+that cut a reply off are sent whole, the part spoken while the agent was still
+audible included, so a barge-in never loses its own first words (the log line
+`Caller utterance sent to the recognizer` carries `interrupted_agent=True`).
+The gate closes at the stream start, but echo needs sound, so the 200–300 ms
 before the first audible chunk are never muted.
 
 ### Golden Baselines
@@ -576,7 +580,7 @@ Controls interruption of TTS playback when the caller speaks.
 - barge_in.post_tts_end_protection_ms: 250–500 ms. Short guard to avoid clipping the start of the next caller utterance.
 - barge_in.talk_detect_initial_protection_ms: default 1500. Pipelines: how long after agent audio starts the caller's speech is ignored by Asterisk `TALK_DETECT` and Silero VAD, the earliest a caller can interrupt a reply; it rejects phone echo of the agent's own voice at the start of a reply. Counted from the stream start (the gating token), which is 200–300 ms before the first audible sound with a streaming TTS. `0` lets the caller interrupt from the first millisecond (only sensible with echo cancellation on the line). Speech before the reply's first sound is never held by it: such a reply is discarded instead (`streaming.pipeline_discard_unheard_reply`). The Barge-In page exposes it as *Talk-Detect / Silero Initial Protection*.
 - barge_in.greeting_protection_ms: default 0. Not a third window: while the greeting plays (the call's `conversation_state` is `greeting` until the first playback ends), the window in force, whichever detector's, is replaced by this value when it is longer; it never shortens it. The Barge-In page shows it as *Greeting Protection Override*.
-- barge_in.pipeline_listen_during_playback: default `false`. Pipelines with Silero VAD owning barge-in: the caller's frames keep reaching the recognizer while the agent speaks instead of being replaced by silence (see [Pipeline Gated Audio](#pipeline-gated-audio)), so what they say over a reply is transcribed whether or not it interrupts the reply; the protection window above still decides when speech may interrupt. Words spoken into a reply that is already audible are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard it. Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent transcribes itself. Barge-In page: *Keep listening while the agent speaks*.
+- barge_in.pipeline_listen_during_playback: default `false`. Pipelines with Silero VAD owning barge-in: the caller's frames keep reaching the recognizer while the agent speaks instead of being replaced by silence (see [Pipeline Gated Audio](#pipeline-gated-audio)), so what they say over a reply is transcribed whether or not it interrupts the reply (the utterance that does interrupt it is recognized whole in either setting); the protection window above still decides when speech may interrupt. Words spoken into a reply that is already audible are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard it. Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent transcribes itself. Barge-In page: *Keep listening while the agent speaks*.
 - barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only minimum talk duration before the engine's energy detector triggers barge-in. Read only when neither Silero VAD nor `TALK_DETECT` decides pipeline barge-in; the Barge-In page hides it otherwise.
 - barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold of the same energy detector (more sensitive than full-agent mode); hidden with it.
 - barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.

@@ -319,7 +319,7 @@ const BargeInPage = () => {
                                 <FormSwitch
                                     label="Keep listening while the agent speaks"
                                     description="Pipelines with Silero VAD: the caller's audio keeps reaching the recognizer while the agent speaks, so what they say over a reply is transcribed whether or not it interrupts the reply. The protection window above still decides when speech may interrupt. Off: the recognizer gets silence while the agent is audible."
-                                    tooltip="Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent may transcribe itself. Words spoken into an audible reply are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard the reply."
+                                    tooltip="Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent may transcribe itself. Words spoken into an audible reply are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard the reply. The utterance that interrupts a reply is recognized whole either way."
                                     checked={bargeInConfig.pipeline_listen_during_playback ?? false}
                                     onChange={(e) => updateBargeInConfig('pipeline_listen_during_playback', e.target.checked)}
                                     disabled={!sileroOwnsBargeIn}

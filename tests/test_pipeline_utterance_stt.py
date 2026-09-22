@@ -281,3 +281,30 @@ async def test_a_caller_who_never_pauses_is_sent_in_pieces(monkeypatch):
 def test_the_stt_queue_item_reports_its_length():
     item = SttUtterance(pcm16=b"\x00" * 3200, sample_rate=16000, utterance_id="u", started_at=0.0, ended_at=0.1)
     assert item.duration_ms == 100
+
+
+@pytest.mark.asyncio
+async def test_the_utterance_that_cuts_the_agent_off_reaches_the_recognizer_whole(monkeypatch):
+    """Its head was spoken while the agent was audible: it is the caller's audio, not zeros."""
+    stt = _UtteranceStubSTT()
+    engine, session, model, llm = await _start_call(
+        monkeypatch, stt=stt, barge_in={"talk_detect_initial_protection_ms": 0}
+    )
+    try:
+        playback = engine.streaming_playback_manager
+        playback.active = True
+        playback.position_ms = 400  # the reply is audible: the caller's frames are muted
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 2.0
+        await _hear(engine, session, model, [0.9, 0.9, 0.9])  # Silero start: barge-in
+        assert session.audio_capture_enabled is True
+        await _hear(engine, session, model, [0.1, 0.1, 0.1])
+        assert await _wait_for(lambda: len(stt.utterances) == 1)
+
+        sent = stt.utterances[0]
+        assert len(sent["audio"]) == 2560 * 2
+        assert sent["audio"][:2] == b"\x11\x22"  # the gated head, as the caller said it
+        assert 0 not in sent["audio"]
+    finally:
+        await engine._cleanup_call(session.call_id)
