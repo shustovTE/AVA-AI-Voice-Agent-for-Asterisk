@@ -14,6 +14,7 @@ from ..audio.resampler import (
     resample_audio,
     resolve_output_resampler_policy,
 )
+import asyncio
 import time
 import uuid
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
@@ -28,7 +29,7 @@ from ..utils.proxy_url import (  # noqa: F401 - re-exported
     sanitize_proxy_url,
     split_proxy_credentials,
 )
-from .base import TTSComponent
+from .base import TTSComponent, TTSUnavailable
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,10 @@ logger = get_logger(__name__)
 # two 8 kHz telephony codecs. The API also offers mp3_* and opus_*, which need
 # a decoder the engine does not ship; those are refused before a request is
 # made rather than failing on the first audio chunk.
+# Seconds without a byte from ElevenLabs after which a request is a dead
+# stream (providers.<name>.read_timeout_sec). Chunks of a live stream arrive
+# every few milliseconds; the first byte takes a few hundred.
+DEFAULT_READ_TIMEOUT_SEC = 8.0
 _OUTPUT_FORMAT_SAMPLE_RATES = {
     "pcm_8000": 8000,
     "pcm_16000": 16000,
@@ -116,6 +121,7 @@ class ElevenLabsTTSAdapter(TTSComponent):
             self._setting("proxy")
         )
         self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+        self._read_timeout_sec = self._resolve_read_timeout()
         self._trace_enabled = False
 
     def _trace_kwargs(self, trace: HttpTrace) -> Dict[str, Any]:
@@ -147,6 +153,46 @@ class ElevenLabsTTSAdapter(TTSComponent):
             )
             return None
         return value if value > 0 else None
+
+    def _resolve_read_timeout(self) -> Optional[float]:
+        """Seconds without a byte after which a request is a dead stream; None = no limit."""
+        raw = self._setting("read_timeout_sec")
+        if raw is None:
+            return DEFAULT_READ_TIMEOUT_SEC
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring unparsable ElevenLabs read_timeout_sec",
+                component=self.component_key,
+                value=repr(raw),
+            )
+            return DEFAULT_READ_TIMEOUT_SEC
+        return value if value > 0 else None
+
+    def _request_timeout(self) -> Optional[aiohttp.ClientTimeout]:
+        """Per-request timeout: no byte for ``read_timeout_sec`` is a dead stream; no overall cap."""
+        if self._read_timeout_sec is None:
+            return None
+        return aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=min(10.0, self._read_timeout_sec),
+            sock_read=self._read_timeout_sec,
+        )
+
+    async def _reset_session(self) -> None:
+        """Drop the HTTP session with its pooled connections; the next request opens fresh ones."""
+        session, self._session = self._session, None
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                logger.debug(
+                    "ElevenLabs HTTP session close failed",
+                    component=self.component_key,
+                    exc_info=True,
+                )
+        await self._ensure_session()
 
     async def start(self) -> None:
         """Initialize the adapter."""
@@ -285,89 +331,127 @@ class ElevenLabsTTSAdapter(TTSComponent):
         
         started_at = time.perf_counter()
         trace = HttpTrace()
-        
-        try:
-            async with self._session.post(
-                url,
-                json=payload,
-                headers=headers,
-                params=params,
-                proxy=self._proxy_url,
-                proxy_headers=self._proxy_headers,
-                **self._trace_kwargs(trace),
-            ) as response:
-                if response.status >= 400:
-                    body = await response.text()
-                    logger.error(
-                        "ElevenLabs TTS synthesis failed",
-                        call_id=call_id,
-                        request_id=request_id,
-                        status=response.status,
-                        body=body,
+        # A stream that goes quiet is given up after the read timeout. When
+        # nothing had arrived yet the request is retried once on fresh
+        # connections (a pooled connection through a proxy can die silently);
+        # a stream that stalls after its first bytes, or a second failure,
+        # fails the reply: the dialog must not wait on a dead service.
+        attempt = 0
+        while True:
+            attempt += 1
+            delivered = False
+            request_timeout = self._request_timeout()
+            timeout_kwargs = {"timeout": request_timeout} if request_timeout is not None else {}
+            try:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    params=params,
+                    proxy=self._proxy_url,
+                    proxy_headers=self._proxy_headers,
+                    **timeout_kwargs,
+                    **self._trace_kwargs(trace),
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.error(
+                            "ElevenLabs TTS synthesis failed",
+                            call_id=call_id,
+                            request_id=request_id,
+                            status=response.status,
+                            body=body,
+                        )
+                        response.raise_for_status()
+
+                    if use_stream:
+                        async for frame in self._iter_streamed_frames(
+                            response,
+                            call_id=call_id,
+                            request_id=request_id,
+                            started_at=started_at,
+                            trace=trace,
+                            output_format=output_format,
+                            target_encoding=target_encoding,
+                            target_sample_rate=target_sample_rate,
+                            chunk_ms=int(merged.get("chunk_size_ms", 20)),
+                        ):
+                            delivered = True
+                            yield frame
+                        return
+
+                    # Read the full audio response
+                    raw_audio = await response.read()
+                    delivered = True
+                    latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+                    pcm_audio = _decode_to_pcm16le(raw_audio, output_format)
+
+                    if source_rate != target_sample_rate:
+                        pcm_audio, _ = resample_audio(
+                            pcm_audio,
+                            source_rate,
+                            target_sample_rate,
+                            mode=merged["output_resampler"],
+                        )
+                    converted = convert_pcm16le_to_target_format(
+                        pcm_audio, target_encoding
                     )
-                    response.raise_for_status()
-                
-                if use_stream:
-                    async for frame in self._iter_streamed_frames(
-                        response,
+
+                    logger.info(
+                        "ElevenLabs TTS synthesis completed",
                         call_id=call_id,
                         request_id=request_id,
-                        started_at=started_at,
-                    trace=trace,
-                        output_format=output_format,
+                        latency_ms=round(latency_ms, 2),
+                        raw_bytes=len(raw_audio),
+                        output_bytes=len(converted),
                         target_encoding=target_encoding,
                         target_sample_rate=target_sample_rate,
-                        chunk_ms=int(merged.get("chunk_size_ms", 20)),
-                    ):
-                        yield frame
-                    return
-
-                # Read the full audio response
-                raw_audio = await response.read()
-                latency_ms = (time.perf_counter() - started_at) * 1000.0
-
-                pcm_audio = _decode_to_pcm16le(raw_audio, output_format)
-
-                if source_rate != target_sample_rate:
-                    pcm_audio, _ = resample_audio(
-                        pcm_audio,
-                        source_rate,
-                        target_sample_rate,
-                        mode=merged["output_resampler"],
+                        streamed=False,
+                        **self._trace_fields(trace),
                     )
-                converted = convert_pcm16le_to_target_format(
-                    pcm_audio, target_encoding
-                )
-                
-                logger.info(
-                    "ElevenLabs TTS synthesis completed",
+
+                    # Yield in chunks for streaming playback
+                    chunk_ms = int(merged.get("chunk_size_ms", 20))
+                    for chunk in self._chunk_audio(
+                        converted, target_encoding, target_sample_rate, chunk_ms
+                    ):
+                        if chunk:
+                            yield chunk
+                    return
+            except asyncio.TimeoutError:
+                # aiohttp's own timeout error is a ClientError too: it has to
+                # be told apart before the clause below.
+                if delivered or attempt >= 2:
+                    logger.error(
+                        "ElevenLabs TTS stalled",
+                        call_id=call_id,
+                        request_id=request_id,
+                        attempt=attempt,
+                        audio_delivered=delivered,
+                        read_timeout_sec=self._read_timeout_sec,
+                        **self._trace_fields(trace),
+                    )
+                    raise TTSUnavailable(
+                        f"ElevenLabs TTS stalled: no audio for {self._read_timeout_sec} s"
+                    ) from None
+                logger.warning(
+                    "ElevenLabs TTS gave no audio in time; retrying on a fresh connection",
                     call_id=call_id,
                     request_id=request_id,
-                    latency_ms=round(latency_ms, 2),
-                    raw_bytes=len(raw_audio),
-                    output_bytes=len(converted),
-                    target_encoding=target_encoding,
-                    target_sample_rate=target_sample_rate,
-                    streamed=False,
+                    read_timeout_sec=self._read_timeout_sec,
                     **self._trace_fields(trace),
                 )
-                
-                # Yield in chunks for streaming playback
-                chunk_ms = int(merged.get("chunk_size_ms", 20))
-                for chunk in self._chunk_audio(
-                    converted, target_encoding, target_sample_rate, chunk_ms
-                ):
-                    if chunk:
-                        yield chunk
-                        
-        except aiohttp.ClientError as exc:
-            logger.error(
-                "ElevenLabs TTS HTTP error",
-                call_id=call_id,
-                request_id=request_id,
-                error=str(exc),
-            )
-            raise
+                await self._reset_session()
+                trace = HttpTrace()
+            except aiohttp.ClientError as exc:
+                logger.error(
+                    "ElevenLabs TTS HTTP error",
+                    call_id=call_id,
+                    request_id=request_id,
+                    error=str(exc),
+                )
+                raise
 
     async def _iter_streamed_frames(
         self,

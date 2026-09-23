@@ -308,3 +308,102 @@ async def test_words_from_before_the_reply_started_still_cut_it(monkeypatch):
         assert playback.stops >= 1
     finally:
         await engine._cleanup_call(session.call_id)
+
+
+class _StallingTTS(TTSComponent):
+    """A synthesis that never produces a byte, like a dead upstream."""
+
+    downstream_mode_override = "stream"
+
+    def __init__(self):
+        self.requests = 0
+        self.closed = 0
+
+    async def synthesize(self, call_id, text, options):
+        self.requests += 1
+        try:
+            await asyncio.Event().wait()
+            yield b""  # pragma: no cover
+        finally:
+            self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_a_reply_whose_synthesis_has_not_produced_a_byte_is_dropped_the_moment_the_caller_goes_on(monkeypatch):
+    llm = _GatedLLM(block=False)
+    tts = _StallingTTS()
+    engine, session, stt, playback, tracker = await _start(monkeypatch, llm=llm, tts=tts)
+    try:
+        await stt.results.put("подождите")
+        assert await _wait_for(lambda: playback.starts == ["stream-1"] and tts.requests == 1)
+        assert playback.position_ms == 0
+
+        await _caller_resumes(engine, session, tracker)
+        assert await _wait_for(lambda: playback.stops == 1)
+        assert await _wait_for(lambda: tts.closed == 1)  # the stalled request is cancelled
+        assert await _wait_for(lambda: session.call_id not in engine._pipeline_reply_inflight)
+        assert session.conversation_history == []
+
+        _caller_stops(engine, session, tracker)
+        await stt.results.put("я ещё думаю")
+        assert await _wait_for(lambda: len(llm.transcripts) == 2)
+        assert llm.transcripts[-1] == "подождите я ещё думаю"
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_frees_a_turn_whose_synthesis_has_stalled(monkeypatch):
+    llm = _GatedLLM(block=False)
+    tts = _StallingTTS()
+    engine, session, stt, playback, tracker = await _start(monkeypatch, llm=llm, tts=tts)
+    try:
+        await stt.results.put("подождите")
+        assert await _wait_for(lambda: playback.starts == ["stream-1"] and tts.requests == 1)
+        # Some audio reached the caller before the stream went quiet.
+        playback.position_ms = 800
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 5.0
+
+        await _caller_resumes(engine, session, tracker)  # past the protection window: a barge-in
+        assert await _wait_for(lambda: playback.stops == 1)
+        assert await _wait_for(lambda: tts.closed == 1)
+        assert await _wait_for(lambda: session.call_id not in engine._pipeline_reply_inflight)
+
+        _caller_stops(engine, session, tracker)
+        await stt.results.put("нет")
+        assert await _wait_for(lambda: len(llm.transcripts) == 2)
+        assert llm.transcripts[-1] == "нет"
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+class _DeadTTS(TTSComponent):
+    """The service reports a dead stream, as the ElevenLabs adapter does after its timeout."""
+
+    downstream_mode_override = "stream"
+
+    async def synthesize(self, call_id, text, options):
+        from src.pipelines.base import TTSUnavailable
+
+        raise TTSUnavailable("stalled")
+        yield b""  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_a_dead_tts_skips_the_reply_and_keeps_it_out_of_the_history(monkeypatch):
+    llm = _GatedLLM(block=False)
+    engine, session, stt, playback, tracker = await _start(monkeypatch, llm=llm, tts=_DeadTTS())
+    try:
+        await stt.results.put("подождите")
+        assert await _wait_for(lambda: len(llm.transcripts) == 1)
+        assert await _wait_for(lambda: playback.stops == 1)
+        assert await _wait_for(lambda: session.call_id not in engine._pipeline_reply_inflight)
+        assert [m["role"] for m in session.conversation_history] == ["user"]
+
+        _caller_stops(engine, session, tracker)
+        await stt.results.put("вы тут?")
+        assert await _wait_for(lambda: len(llm.transcripts) == 2)  # the dialog goes on
+    finally:
+        await engine._cleanup_call(session.call_id)

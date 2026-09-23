@@ -60,7 +60,7 @@ class _FakeHttpSession:
         self.requests = []
         self.closed = False
 
-    def post(self, url, json=None, headers=None, params=None, proxy=None, proxy_headers=None):
+    def post(self, url, json=None, headers=None, params=None, proxy=None, proxy_headers=None, timeout=None, **kwargs):
         self.requests.append(
             {
                 "url": url,
@@ -68,6 +68,7 @@ class _FakeHttpSession:
                 "json": json,
                 "proxy": proxy,
                 "proxy_headers": proxy_headers,
+                "timeout": timeout,
             }
         )
         return self.response
@@ -293,3 +294,92 @@ async def test_any_8khz_format_is_raised_to_pcm_16000_on_a_wideband_call():
 
         assert session.requests[0]["params"]["output_format"] == "pcm_16000", output_format
         assert session.requests[0]["url"].endswith("/stream")
+
+
+# ── A stream that goes quiet ──────────────────────────────────────────────────
+import asyncio
+
+from src.pipelines.base import TTSUnavailable
+
+
+class _StallingContent(_FakeContent):
+    """The body stops after ``chunks``: aiohttp's read timeout then fires."""
+
+    async def iter_any(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise asyncio.TimeoutError()
+
+
+class _StallingResponse(_FakeAudioResponse):
+    def __init__(self, chunks):
+        super().__init__(chunks)
+        self.content = _StallingContent(chunks)
+
+
+class _SequenceSession(_FakeHttpSession):
+    """Serves one response per request, in order, and counts pool resets."""
+
+    def __init__(self, responses):
+        super().__init__(responses[0])
+        self.responses = list(responses)
+        self.close_calls = 0
+
+    def post(self, *args, **kwargs):
+        self.response = self.responses.pop(0)
+        return super().post(*args, **kwargs)
+
+    async def close(self):
+        self.close_calls += 1
+        await super().close()
+
+
+MULAW = {"format": {"encoding": "mulaw", "sample_rate": 8000}}
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_never_starts_is_retried_once_on_a_fresh_connection():
+    good = bytes([0x7F]) * 320
+    session = _SequenceSession([_StallingResponse([]), _FakeAudioResponse([good])])
+    adapter = _adapter(session)
+
+    frames = await _collect(adapter, MULAW)
+
+    assert len(session.requests) == 2
+    assert session.close_calls == 1  # the pool was dropped before the retry
+    assert b"".join(frames) == convert_pcm16le_to_target_format(mulaw_to_pcm16le(good), "mulaw")
+    assert session.requests[0]["timeout"].sock_read == 8.0  # the default read timeout
+    assert session.requests[0]["timeout"].total is None
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_stalls_after_its_first_bytes_fails_the_reply_without_a_retry():
+    session = _SequenceSession([_StallingResponse([bytes([0x7F]) * 160])])
+    adapter = _adapter(session)
+
+    with pytest.raises(TTSUnavailable):
+        await _collect(adapter, MULAW)
+
+    assert len(session.requests) == 1
+    assert session.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_two_dead_streams_in_a_row_fail_the_reply():
+    session = _SequenceSession([_StallingResponse([]), _StallingResponse([])])
+    adapter = _adapter(session)
+
+    with pytest.raises(TTSUnavailable):
+        await _collect(adapter, MULAW)
+
+    assert len(session.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_read_timeout_can_be_switched_off():
+    session = _FakeHttpSession(_FakeAudioResponse([bytes([0x7F]) * 160]))
+    adapter = _adapter(session, provider_config=ElevenLabsProviderConfig(api_key="test-key", read_timeout_sec=0))
+
+    await _collect(adapter, MULAW)
+
+    assert session.requests[0]["timeout"] is None

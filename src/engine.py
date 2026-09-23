@@ -19,7 +19,7 @@ import sqlite3
 from collections import deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import TYPE_CHECKING, Dict, Any, Optional, List, Set, Tuple, Callable
+from typing import TYPE_CHECKING, AsyncIterator, Dict, Any, Optional, List, Set, Tuple, Callable
 
 # Simple audio capture system removed - not used in production
 
@@ -107,7 +107,7 @@ from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
 from .utils.diagnostic_paths import DEFAULT_DIAGNOSTIC_CAPTURE_DIR
 from .utils.voice_catalog import known_voice_map
-from src.pipelines.base import LLMResponse
+from src.pipelines.base import LLMResponse, TTSUnavailable
 from src.tools.telephony.hangup_policy import (
     DEFAULT_HANGUP_MARKERS,
     resolve_effective_hangup_policy,
@@ -7985,6 +7985,56 @@ class Engine:
         farewell_mode, _timeout = self._resolve_local_farewell_settings(local_config)
         return farewell_mode != "asterisk"
 
+    async def _tts_chunks_while_wanted(
+        self, call_id: str, stream_id: Optional[str], chunks: Any
+    ) -> AsyncIterator[bytes]:
+        """Yield the chunks of a reply's synthesis while the reply is still wanted.
+
+        The wait for the next chunk ends the moment the caller goes on: a reply
+        superseded before its first sound, or a stream a barge-in stopped, is
+        given up at once instead of at the next chunk, so a synthesis that has
+        stalled cannot hold the turn. The synthesis generator is closed on the
+        way out, which cancels its HTTP request.
+        """
+        event = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        iterator = chunks.__aiter__()
+        next_task: Optional[asyncio.Task] = None
+        try:
+            while True:
+                if next_task is None:
+                    next_task = asyncio.ensure_future(iterator.__anext__())
+                waiters = {next_task}
+                wake_task = asyncio.ensure_future(event.wait()) if event is not None else None
+                if wake_task is not None:
+                    waiters.add(wake_task)
+                done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                if wake_task is not None and wake_task not in done:
+                    wake_task.cancel()
+                if next_task in done:
+                    task, next_task = next_task, None
+                    try:
+                        chunk = task.result()
+                    except StopAsyncIteration:
+                        return
+                    yield chunk
+                    continue
+                # The caller spoke while the next chunk was awaited.
+                if self._pipeline_reply_superseded(call_id):
+                    raise _PipelinePlaybackInterrupted("reply superseded while its audio was awaited")
+                if stream_id and not self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                    raise _PipelinePlaybackInterrupted(f"pipeline stream {stream_id} is no longer active")
+                if event is not None:
+                    event.clear()
+        finally:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await next_task
+            aclose = getattr(chunks, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
+
     async def _put_pipeline_stream_chunk(
         self,
         call_id: str,
@@ -8536,6 +8586,24 @@ class Engine:
             if not waiter.done():
                 waiter.cancel()
         return gen_task.result()
+
+    async def _drop_unspoken_reply_history(self, session: CallSession, response_text: str) -> None:
+        """Take a reply that never reached the caller back out of the history; their words stay."""
+        history = getattr(session, "conversation_history", None)
+        wanted = str(response_text or "").strip()
+        if not isinstance(history, list) or not history or not wanted:
+            return
+        entry = history[-1]
+        if (
+            isinstance(entry, dict)
+            and entry.get("role") == "assistant"
+            and str(entry.get("content") or "").strip() == wanted
+        ):
+            history.pop()
+            try:
+                await self.session_store.upsert_call(session)
+            except Exception:
+                logger.debug("Failed to persist the history without the unspoken reply", call_id=session.call_id, exc_info=True)
 
     async def _drop_unheard_reply_history(
         self, session: CallSession, transcript_text: str, response_text: str
@@ -13633,6 +13701,11 @@ class Engine:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
             except Exception:
                 logger.debug("Streaming playback stop failed during barge-in", call_id=call_id, exc_info=True)
+            # A synthesis still awaiting its next chunk for that stream is woken
+            # so it notices the stop now, not at a chunk that may never come.
+            resumed = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+            if resumed is not None:
+                resumed.set()
             # Ensure subsequent provider audio can restart playback cleanly.
             # If we keep the old queue, on_provider_event will continue enqueueing but never restart streaming.
             try:
@@ -17767,8 +17840,10 @@ class Engine:
                                     if to_speak:
                                         if heard_rec:
                                             heard_rec.open_segment(to_speak)
-                                        async for tts_chunk in pipeline.tts_adapter.synthesize(
-                                            call_id, to_speak, pipeline.tts_options,
+                                        async for tts_chunk in self._tts_chunks_while_wanted(
+                                            call_id,
+                                            stream_id,
+                                            pipeline.tts_adapter.synthesize(call_id, to_speak, pipeline.tts_options),
                                         ):
                                             if tts_chunk:
                                                 if heard_rec:
@@ -17796,8 +17871,10 @@ class Engine:
                             if remainder:
                                 if heard_rec:
                                     heard_rec.open_segment(remainder)
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(
-                                    call_id, remainder, pipeline.tts_options,
+                                async for tts_chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, remainder, pipeline.tts_options),
                                 ):
                                     if tts_chunk:
                                         if heard_rec:
@@ -18212,7 +18289,11 @@ class Engine:
                                     heard_rec.open_segment(response_text)
                                     heard_rec.persisted_text = response_text
 
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
+                                async for tts_chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options),
+                                ):
                                     if not tts_chunk:
                                         continue
                                     if heard_rec:
@@ -18264,6 +18345,34 @@ class Engine:
                                         await self._patch_interrupted_reply_history(session, heard_rec)
                                     except Exception:
                                         logger.debug("Heard-reply history patch failed", call_id=call_id, exc_info=True)
+                                return
+                            except TTSUnavailable as exc:
+                                # The service gave no audio: there is nothing to fall
+                                # back to, and the reply must not stay in the history
+                                # as if it had been spoken.
+                                played_ms = 0
+                                try:
+                                    played_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
+                                except Exception:
+                                    played_ms = 0
+                                logger.error(
+                                    "Pipeline TTS gave no audio; the reply is skipped",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                    played_ms=played_ms,
+                                    error=str(exc),
+                                )
+                                if played_ms > 0:
+                                    try:
+                                        await self._note_pipeline_reply_interrupted(session, played_ms)
+                                    except Exception:
+                                        logger.debug("Heard-reply bookkeeping failed after a TTS stall", call_id=call_id, exc_info=True)
+                                else:
+                                    await self._drop_unspoken_reply_history(session, response_text)
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
                                 return
                             except Exception:
                                 logger.error("Pipeline streaming playback failed; falling back to file playback", call_id=call_id, exc_info=True)

@@ -597,6 +597,11 @@ class ElevenLabsProviderConfig(BaseModel):
     # dropped connection costs a full TLS handshake mid-conversation, so a
     # window longer than aiohttp's 15 s default is usually worth it.
     keepalive_timeout_sec: Optional[float] = None
+    # No audio for this long, before the first byte or between chunks, means a
+    # dead stream: the request is given up, retried once on fresh connections
+    # when nothing had arrived yet, and then fails the reply instead of holding
+    # the dialog until aiohttp's own five-minute limit. 0 turns the timeout off.
+    read_timeout_sec: float = Field(default=8.0, ge=0.0, le=120.0)
 
 
 class CambAiProviderConfig(BaseModel):

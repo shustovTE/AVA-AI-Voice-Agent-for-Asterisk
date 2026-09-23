@@ -575,6 +575,7 @@ providers:
   elevenlabs_tts:
     proxy: "http://xray:8080"      # empty or absent = direct connection
     keepalive_timeout_sec: 120     # absent = aiohttp's 15 s default
+    read_timeout_sec: 8            # no byte for this long = a dead stream; 0 = no limit
 ```
 
 - **`proxy`**: an HTTP proxy URL, for example a local Xray or 3x-ui HTTP
@@ -598,6 +599,20 @@ providers:
   sentence reused the connection is in its `ElevenLabs TTS synthesis
   completed` log line: `connection=reused`, or `connection=new` with
   `connect_ms` for the handshake it paid.
+- **`read_timeout_sec`** (default `8`): how long a request may go without a
+  byte, before the first one or between chunks, before it counts as a dead
+  stream. A live stream delivers a chunk every few milliseconds and its first
+  byte within a few hundred, so eight seconds of silence is a connection that
+  will never answer: a pooled connection through a proxy can die without a
+  reset, and without this limit aiohttp waits five minutes while the dialog
+  worker sits on the reply, unable to answer the caller's next words. When
+  nothing had arrived yet the adapter drops its connection pool and retries the
+  request once on a fresh connection (`ElevenLabs TTS gave no audio in time;
+  retrying on a fresh connection`); a stream that stalls after its first bytes,
+  or a second dead stream, fails the reply (`ElevenLabs TTS stalled`). The
+  engine then skips that reply rather than falling back to file playback,
+  keeps only what was heard of it in the history, and answers the caller's
+  next words as usual. `0` removes the limit.
 
 Both keys are also accepted per pipeline under `options.tts`, where they
 override the provider block. The Admin UI exposes them in either editor: under

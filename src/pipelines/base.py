@@ -278,6 +278,10 @@ class Component(ABC):
             return {"healthy": False, "error": f"Unknown protocol in URL: {base_url}", "details": {"url": base_url}}
 
 
+class TTSUnavailable(RuntimeError):
+    """The TTS service produced no audio in time; the reply cannot be spoken now."""
+
+
 class STTComponent(Component):
     """Speech-to-text component."""
 
