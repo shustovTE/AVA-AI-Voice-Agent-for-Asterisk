@@ -12804,6 +12804,8 @@ class Engine:
                 await self._retry_deferred_silero_barge_in(session, tracker, source=source, since=deferred_since)
             else:
                 self._silero_deferred_barge_in.pop(call_id, None)
+        if tracker.talking:
+            await self._interrupt_output_started_over_speech(session, tracker, source=source)
         if cutter is not None and tracker.talking:
             # A caller who never pauses: the recognizer gets the utterance in
             # pieces rather than a minute of speech at once.
@@ -12826,9 +12828,11 @@ class Engine:
         resumed = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
         if resumed is not None:
             resumed.set()
+        # The inactivity watchdog pauses while the caller talks, whatever this
+        # speech leads to (a barge-in included); the stop tells it they are done.
+        await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
         try:
             if await self._discard_unheard_reply(session):
-                await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
                 return
         except Exception:
             logger.debug("Unheard-reply discard failed", call_id=call_id, exc_info=True)
@@ -12836,7 +12840,6 @@ class Engine:
             getattr(session, "tts_playing", False)
         )
         if listening:
-            await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
             return
         outcome = await self._silero_barge_in(session, tracker, source=source)
         if outcome == "protected":
@@ -12932,6 +12935,66 @@ class Engine:
         outcome = await self._silero_barge_in(session, tracker, source=source, deferred_since=since)
         if outcome != "protected":
             self._silero_deferred_barge_in.pop(call_id, None)
+
+    async def _interrupt_output_started_over_speech(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+    ) -> None:
+        """The agent became audible while the caller was already talking: the caller was first.
+
+        Barge-in is otherwise decided at Silero's speech start, and the start
+        that opened this speech came before the output existed, so nothing
+        would ever cut it. Output that starts over speech (an inactivity
+        check-in, a filler, a reply whose turn ended on a pause the caller did
+        not take) is cut at once, without the protection window: speech that
+        predates the agent's audio cannot be its echo. The greeting is left to
+        its own protection, as a callee's "hello" runs into it by design.
+        """
+        if bool(getattr(session, "audio_capture_enabled", True)) or not bool(
+            getattr(session, "tts_playing", False)
+        ):
+            return
+        if getattr(session, "conversation_state", None) == "greeting":
+            return
+        started_at = getattr(tracker, "segment_started_at", None)
+        if started_at is None:
+            return
+        try:
+            tts_started = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if tts_started <= 0.0:
+            return
+        speech_started_wall = time.time() - (time.monotonic() - float(started_at))
+        if tts_started <= speech_started_wall:
+            return  # the caller spoke into the output: the ordinary rules apply
+        call_id = session.call_id
+        if not self._silero_config()["barge_in"]:
+            return
+        cfg = getattr(self.config, "barge_in", None)
+        if not cfg or not getattr(cfg, "enabled", True):
+            return
+        now = time.time()
+        cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
+        last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
+        if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
+            return
+        try:
+            if await self._discard_unheard_reply(session):
+                logger.info("Reply discarded: it started over the caller's speech", call_id=call_id)
+                return
+        except Exception:
+            logger.debug("Unheard-reply discard failed", call_id=call_id, exc_info=True)
+        await self._no_input_note_activity(call_id, "engine:silero_vad_barge_in")
+        await self._apply_barge_in_action(call_id, source="silero_vad", reason="output_over_speech")
+        session.audio_capture_enabled = True
+        logger.info(
+            "🎧 BARGE-IN (Silero VAD) triggered",
+            call_id=call_id,
+            source=source,
+            tts_elapsed_ms=int((now - tts_started) * 1000),
+            probability=round(tracker.last_probability, 3),
+            over_speech=True,
+        )
 
     async def _on_silero_speech_finished(
         self,

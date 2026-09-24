@@ -364,3 +364,83 @@ async def test_speech_that_stops_inside_the_protection_does_not_barge_in_later(m
         engine._apply_barge_in_action.assert_not_awaited()
     finally:
         await engine._cleanup_call("call-sv-short")
+
+
+@pytest.mark.asyncio
+async def test_speech_that_barges_in_still_tells_the_watchdog_the_caller_is_talking(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-watchdog", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        engine._no_input_note_input_state = AsyncMock()
+        session.conversation_state = "listening"
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 5.0
+        await _hear(engine, session, model, [0.9, 0.9, 0.9])
+        engine._apply_barge_in_action.assert_awaited_once()
+        engine._no_input_note_input_state.assert_any_await("call-sv-watchdog", True, "engine:silero_vad")
+
+        await _hear(engine, session, model, [0.1, 0.1, 0.1])
+        engine._no_input_note_input_state.assert_any_await("call-sv-watchdog", False, "engine:silero_vad")
+    finally:
+        await engine._cleanup_call("call-sv-watchdog")
+
+
+@pytest.mark.asyncio
+async def test_output_that_starts_over_the_callers_speech_is_cut_at_once(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-first", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        session.conversation_state = "listening"
+        session.audio_capture_enabled = True
+        session.tts_playing = False
+        await _hear(engine, session, model, [0.9, 0.9, 0.9, 0.9])  # the caller talks; nothing plays
+        engine._apply_barge_in_action.assert_not_awaited()
+
+        # An inactivity check-in (or any output) starts while they are still talking.
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time()
+        await _hear(engine, session, model, [0.9])
+        engine._apply_barge_in_action.assert_awaited_once()
+        assert engine._apply_barge_in_action.await_args.kwargs["reason"] == "output_over_speech"
+        assert session.audio_capture_enabled is True
+    finally:
+        await engine._cleanup_call("call-sv-first")
+
+
+@pytest.mark.asyncio
+async def test_output_the_caller_spoke_into_keeps_the_ordinary_barge_in_rules(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-second", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        session.conversation_state = "listening"
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time() - 0.5  # the agent was first; the caller starts inside the window
+        await _hear(engine, session, model, [0.9, 0.9, 0.9, 0.9, 0.9])
+        engine._apply_barge_in_action.assert_not_awaited()  # deferred to the window's end, not cut at once
+    finally:
+        await engine._cleanup_call("call-sv-second")
+
+
+@pytest.mark.asyncio
+async def test_the_greeting_is_not_cut_by_speech_that_came_first(monkeypatch):
+    model = _ScriptedModel()
+    engine, session, stt, llm = await _start_call(monkeypatch, "call-sv-greet", GRACE, model)
+    try:
+        engine._apply_barge_in_action = AsyncMock()
+        session.conversation_state = "greeting"
+        session.audio_capture_enabled = True
+        session.tts_playing = False
+        await _hear(engine, session, model, [0.9, 0.9, 0.9])  # "алло?" as the call connects
+        session.audio_capture_enabled = False
+        session.tts_playing = True
+        session.tts_started_ts = time.time()
+        await _hear(engine, session, model, [0.9, 0.9])
+        engine._apply_barge_in_action.assert_not_awaited()
+    finally:
+        await engine._cleanup_call("call-sv-greet")
