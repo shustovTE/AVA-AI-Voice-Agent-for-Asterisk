@@ -8844,6 +8844,13 @@ class Engine:
         if expected_at is None:
             cutter = self._utterance_cutters.get(call_id)
             if cutter is not None:
+                # Speech that began inside the reply's protection window was
+                # still waiting for the window to end when the call did: the
+                # hangup decides it now, as the window's end would have, so the
+                # utterance carries the caller's audio rather than the silence
+                # its muted frames read back as.
+                if call_id in self._silero_deferred_barge_in:
+                    cutter.note_barge_in()
                 # Whatever the caller was saying when they hung up goes to the
                 # recognizer as it stands.
                 last = cutter.flush(reason="hangup")
@@ -17701,6 +17708,15 @@ class Engine:
                         outcome = await run_turn_body(transcript_text)
                     finally:
                         self._end_pipeline_reply(call_id)
+                    # The call ended while the turn was being answered and the
+                    # body left on an output boundary instead of being cancelled
+                    # (the LLM answered in the moment between the cleanup's
+                    # start and the worker's cancellation, or its request failed
+                    # with the call): the caller's words, and what they heard of
+                    # a reply the hangup cut, still go into the record. Words
+                    # already there are not repeated.
+                    if outcome != "superseded" and self._call_cleanup_started(session):
+                        await self._record_turn_cut_by_hangup(session, transcript_text)
                     return outcome or "answered"
 
                 async def run_turn_body(transcript_text: str) -> Optional[str]:

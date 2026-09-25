@@ -18,7 +18,8 @@ import pytest
 
 from src.config import AppConfig
 from src.core.models import CallSession
-from src.engine import Engine
+from src.core.utterances import UtteranceCutter
+from src.engine import Engine, _cleanup_in_progress
 from src.pipelines.base import LLMComponent, TTSComponent
 from tests.test_pipeline_runner_lifecycle import _ResultStreamingStubSTT, _StubResolution
 
@@ -244,6 +245,82 @@ async def test_a_turn_cancelled_in_the_llm_keeps_the_callers_words(monkeypatch):
 
     assert _users(session) == [LAST_WORDS]
     assert not any(m.get("role") == "assistant" for m in session.conversation_history)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_the_llm_answered_after_the_hangup_keeps_the_callers_words(monkeypatch):
+    """The caller answered and hung up; the reply came back after the cleanup began, before it cancelled the worker."""
+
+    class _AnswersAfterHangupLLM(LLMComponent):
+        supports_streaming = False
+
+        def __init__(self):
+            self.answered = asyncio.Event()
+
+        async def generate(self, call_id, transcript, context, options):
+            # The cleanup marks the call first and cancels the dialog worker a
+            # few awaits later: this answer lands in between.
+            _cleanup_in_progress.add(call_id)
+            self.answered.set()
+            return "ответ, которого никто не услышит"
+
+    engine = Engine(_config())
+    engine.pipeline_orchestrator._started = True
+    monkeypatch.setattr(engine, "streaming_playback_manager", _PlaybackStub())
+    stt = _ResultStreamingStubSTT()
+    llm = _AnswersAfterHangupLLM()
+    resolution = _StubResolution(
+        stt_adapter=stt,
+        stt_options={"streaming": True, "chunk_ms": 80},
+        llm_adapter=llm,
+        tts_adapter=_SilentTTS(),
+    )
+    resolution.llm_options = {"end_of_turn_silence_ms": 50}
+    monkeypatch.setattr(engine.pipeline_orchestrator, "get_pipeline", lambda *a, **k: resolution)
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+    call_id = _new_call_id()
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "serial"
+    await engine.session_store.upsert_call(session)
+    await engine._ensure_pipeline_runner(session, forced=True)
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+
+    await stt.results.put(LAST_WORDS)
+    await asyncio.wait_for(llm.answered.wait(), timeout=2)
+    for _ in range(100):
+        if _users(session) == [LAST_WORDS]:
+            break
+        await asyncio.sleep(0.01)
+    assert _users(session) == [LAST_WORDS]
+    assert not any(m.get("role") == "assistant" for m in session.conversation_history)
+
+    # The cleanup itself then finds the words already there and does not repeat them.
+    _cleanup_in_progress.discard(call_id)
+    await engine._cleanup_call(call_id)
+    assert _users(session) == [LAST_WORDS]
+    assert not any(m.get("role") == "assistant" for m in session.conversation_history)
+
+
+@pytest.mark.asyncio
+async def test_speech_waiting_for_the_protection_window_reaches_the_recognizer_at_hangup(monkeypatch):
+    """The caller spoke into the start of a reply and hung up before the window let them interrupt."""
+    engine, session, stt, llm = await _start(monkeypatch, wait_ms=200)
+    call_id = session.call_id
+    cutter = UtteranceCutter(sample_rate=16000, preroll_ms=0)
+    engine._utterance_cutters[call_id] = cutter
+    cutter.speech_started()
+    frame = b"\x10\x00" * 320  # 20 ms of signal
+    for _ in range(25):  # half a second said while the agent was audible: muted for the recognizer
+        cutter.append(frame, muted=True)
+    engine._silero_deferred_barge_in[call_id] = time.monotonic()
+    engine._pipeline_caller_talking[call_id] = True
+    engine._pipeline_caller_talk_changed_at[call_id] = time.monotonic()
+
+    await engine._cleanup_call(call_id)
+
+    spoken = [audio for audio, _ in stt.sent if audio.count(0) != len(audio)]
+    assert spoken and spoken[0].startswith(frame) and len(spoken[0]) == len(frame) * 25
+    assert llm.calls == []
 
 
 # --- the call history record follows the conversation to the end of the cleanup ----
