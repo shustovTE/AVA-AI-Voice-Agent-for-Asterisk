@@ -629,6 +629,9 @@ onward), `Cannot connect to proxy …` (nothing listens there), `Reached
 ElevenLabs via proxy …, but the API key was rejected` (the route works, the
 key does not), or a timeout on the route. A `socks5://` value is reported as
 rejected right there, exactly as the engine would refuse it at startup.
+The probe runs inside the `ai_engine` container, so a proxy that only the
+engine host can reach is tested through the same route the adapter takes; the
+verdict says where it was produced.
 
 ### Pipeline Configuration
 

@@ -9,6 +9,7 @@ import { MODULAR_SUBTYPES, inferSubtype } from '../../../config/modularProviderS
 import type { ProviderSubtype, Capability as SubtypeCapability } from '../../../config/modularProviderSubtypes';
 import ModularSubtypeForm from './ModularSubtypeForm';
 import ProviderCredentialsCard from './ProviderCredentialsCard';
+import VoiceRegistrationCard from './VoiceRegistrationCard';
 
 interface GenericProviderFormProps {
     config: any;
@@ -454,6 +455,14 @@ const GenericProviderForm: React.FC<GenericProviderFormProps> = ({ config, onCha
                                     config={config}
                                     onChange={handleSubtypeFieldChange}
                                 />
+                                {cap === 'tts' && selectedSubtype.yamlType === 'openai' && (
+                                    <VoiceRegistrationCard
+                                        providerKey={isNew ? undefined : config.name}
+                                        voicesDir={config.tts_voices_dir || '/voices'}
+                                        currentVoice={config.voice}
+                                        onUseVoice={(voice) => updateConfig({ voice })}
+                                    />
+                                )}
                                 {cap === 'llm' && ['openai', 'google', 'telnyx', 'telenyx', 'minimax'].includes(selectedSubtype.yamlType) && (
                                     <ProviderCredentialsCard
                                         providerKey={isNew ? undefined : config.name}

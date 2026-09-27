@@ -22552,6 +22552,10 @@ class Engine:
             app.router.add_post('/reload', self._reload_handler)
             app.router.add_get('/mcp/status', self._mcp_status_handler)
             app.router.add_post('/mcp/test/{server_id}', self._mcp_test_handler)
+            # Provider checks run here, next to the calls: the Admin UI container may
+            # sit in another network than the engine host's endpoints.
+            app.router.add_post('/providers/test', self._provider_test_handler)
+            app.router.add_post('/providers/{name}/voices', self._provider_voice_register_handler)
             # Read-only tool catalog for Admin UI: includes built-in, HTTP, and MCP tool wrappers
             # registered in the engine's tool registry. This is intentionally unauthenticated
             # (similar to /mcp/status) and should not include secrets or PII.
@@ -22700,6 +22704,99 @@ class Engine:
         except Exception as exc:
             logger.debug("MCP test handler failed", error=str(exc), exc_info=True)
             return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+
+    def _saved_provider_blocks(self) -> Dict[str, Any]:
+        """Provider blocks as saved on disk, falling back to the loaded config.
+
+        The Admin UI saves a block before it tests it, and the engine may not
+        have reloaded yet; the file is what the operator means.
+        """
+        try:
+            from .config.loaders import load_yaml_with_local_override, resolve_config_path
+
+            raw = load_yaml_with_local_override(resolve_config_path("config/ai-agent.yaml"))
+            providers = raw.get("providers") if isinstance(raw, dict) else None
+            if isinstance(providers, dict):
+                return providers
+        except Exception:
+            logger.debug("Could not read saved provider blocks; using the loaded config", exc_info=True)
+        providers = getattr(self.config, "providers", None) or {}
+        return dict(providers) if isinstance(providers, dict) else {}
+
+    async def _provider_test_handler(self, request):
+        """Probe a provider block from the engine's own network position.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN. A self-hosted host
+        is probed only when the saved block names it (see probes.providers).
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
+        name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+        config = payload.get("config") if isinstance(payload, dict) else None
+        if not name or not isinstance(config, dict):
+            return web.json_response(
+                {"success": False, "message": 'Expected {"name": "<provider key>", "config": {...}}'},
+                status=400,
+            )
+        from .probes.providers import probe_provider
+
+        result = await probe_provider(name, config, saved_providers=self._saved_provider_blocks())
+        result["source"] = "ai_engine"
+        return web.json_response(result)
+
+    async def _provider_voice_register_handler(self, request):
+        """Register a reference voice on a saved self-hosted speech provider.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN. The target host is
+        the saved block's own, and the request names only a file inside the
+        provider's voices directory.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        name = str(request.match_info.get("name") or "").strip()
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
+        if not name or not isinstance(payload, dict):
+            return web.json_response(
+                {"success": False, "message": 'Expected {"file": "<name in the voices directory>", "ref_text": "..."}'},
+                status=400,
+            )
+        blocks = self._saved_provider_blocks()
+        block = blocks.get(name)
+        if not isinstance(block, dict):
+            for key, value in blocks.items():
+                if str(key).lower() == name.lower() and isinstance(value, dict):
+                    block = value
+                    break
+        if not isinstance(block, dict):
+            return web.json_response(
+                {"success": False, "message": f"Provider '{name}' is not saved; save the provider first"},
+                status=404,
+            )
+        from .probes.voices import register_voice
+
+        result = await register_voice(
+            name,
+            block,
+            file=str(payload.get("file") or ""),
+            name=payload.get("name"),
+            ref_text=str(payload.get("ref_text") or ""),
+            consent=payload.get("consent"),
+        )
+        result["source"] = "ai_engine"
+        return web.json_response(result)
 
     async def _execute_provider_tool(
         self,

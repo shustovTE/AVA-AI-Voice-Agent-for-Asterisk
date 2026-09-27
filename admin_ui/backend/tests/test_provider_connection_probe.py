@@ -1,9 +1,10 @@
-"""Provider "Test connection" probes must mirror what the engine actually does.
+"""Provider "Test connection" runs in ai_engine, where the calls run.
 
-Two regressions are covered here: the Local AI probe never authenticated (so a
-token-protected server reported "status invalid"), and the OpenAI-compatible
-probe sent the operator's key to api.openai.com whenever the configured host
-was not a known vendor (reporting a meaningless 401 for self-hosted vLLM).
+The Admin UI container may sit in another Docker network than the engine
+host's endpoints (a vLLM on the host's loopback, an OpenAI-compatible LLM on
+the host, an ElevenLabs proxy only the host reaches), so a probe from here
+reported them dead. The backend now relays to the engine and runs the same
+probe itself only when the engine cannot be reached, saying so in the verdict.
 """
 import sys
 from pathlib import Path
@@ -15,135 +16,128 @@ sys.path.insert(0, str(BACKEND_ROOT))
 
 pytest.importorskip("fastapi")
 
-import httpx  # noqa: E402
-import websockets  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 
 from api import config as config_api  # noqa: E402
-from api.config import ProviderTestRequest  # noqa: E402
+from api import engine_relay  # noqa: E402
+from api.config import ProviderTestRequest, VoiceRegisterRequest  # noqa: E402
 
 
-class _FakeWebSocket:
-    def __init__(self, replies):
-        self._replies = list(replies)
-        self.sent = []
+class _Relay:
+    def __init__(self, result=None, exc=None):
+        self.result = result
+        self.exc = exc
+        self.calls = []
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    async def send(self, payload):
-        self.sent.append(payload)
-
-    async def recv(self):
-        if not self._replies:
-            raise AssertionError("probe asked for more replies than expected")
-        return self._replies.pop(0)
-
-
-def _fake_connect(replies, seen):
-    def connect(url, **_kwargs):
-        seen.append(url)
-        return _FakeWebSocket(replies)
-
-    return connect
-
-
-def _status_response(*, stt=True, llm=False, tts=False, runtime_mode="full"):
-    import json
-
-    return json.dumps(
-        {
-            "type": "status_response",
-            "status": "ok",
-            "stt_backend": "tone",
-            "tts_backend": "piper",
-            "models": {
-                "stt": {"loaded": stt},
-                "llm": {"loaded": llm, "path": ""},
-                "tts": {"loaded": tts},
-            },
-            "config": {"runtime_mode": runtime_mode},
-        }
-    )
-
-
-AUTH_OK = '{"type": "auth_response", "status": "ok"}'
-AUTH_FAIL = '{"type": "auth_response", "status": "error", "message": "invalid_auth_token"}'
+    async def __call__(self, path, payload, *, timeout=30.0):
+        self.calls.append({"path": path, "payload": payload, "timeout": timeout})
+        if self.exc is not None:
+            raise self.exc
+        return self.result
 
 
 @pytest.mark.asyncio
-async def test_local_probe_authenticates_and_scopes_to_declared_capabilities(
-    monkeypatch,
-):
-    seen = []
-    monkeypatch.setattr(
-        websockets, "connect", _fake_connect([AUTH_OK, _status_response()], seen)
-    )
+async def test_probe_is_relayed_to_the_engine(monkeypatch):
+    relay = _Relay({"success": True, "message": "Connected (OpenAI-compatible). Found 3 models.", "source": "ai_engine"})
+    monkeypatch.setattr(engine_relay, "post_engine_json", relay)
 
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="local_stt",
-            config={
-                "type": "local",
-                "capabilities": ["stt"],
-                "ws_url": "ws://172.17.0.1:8765",
-                "auth_token": "secret-token",
-            },
-        )
-    )
+    async def never(*_args, **_kwargs):
+        raise AssertionError("the local probe must not run while the engine answers")
 
-    assert seen == ["ws://172.17.0.1:8765"]
+    monkeypatch.setattr(config_api, "probe_provider", never)
+    config = {"type": "openai", "tts_base_url": "http://127.0.0.1:8091/v1/audio/speech", "api_key": "local"}
+
+    result = await config_api.test_provider_connection(ProviderTestRequest(name="fish_tts", config=config))
+
+    assert relay.calls == [{"path": "/providers/test", "payload": {"name": "fish_tts", "config": config}, "timeout": 60.0}]
     assert result["success"] is True
-    assert "STT: tone" in result["message"]
+    assert result["source"] == "ai_engine"
+    assert result["message"] == "Connected (OpenAI-compatible). Found 3 models. (checked from ai_engine)"
 
 
 @pytest.mark.asyncio
-async def test_local_probe_reports_rejected_token(monkeypatch):
-    seen = []
-    monkeypatch.setattr(websockets, "connect", _fake_connect([AUTH_FAIL], seen))
+async def test_probe_runs_locally_only_when_the_engine_is_unreachable(monkeypatch, tmp_path):
+    monkeypatch.setattr(engine_relay, "post_engine_json", _Relay(None))
+    env_file = tmp_path / ".env"
+    env_file.write_text('OPENAI_API_KEY="sk-from-dotenv"\n# comment\nEMPTY=\n')
+    monkeypatch.setattr(config_api.settings, "ENV_PATH", str(env_file))
+    saved = {"native_llm": {"type": "openai", "chat_base_url": "https://ai-api.example/v1"}}
+    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: {"providers": saved})
+    seen = {}
+
+    async def fake_probe(name, config, *, saved_providers=None, env=None):
+        seen.update(name=name, config=config, saved=saved_providers, env=env)
+        return {"success": False, "message": "Cannot connect to provider at https://ai-api.example/v1 (see server logs)"}
+
+    monkeypatch.setattr(config_api, "probe_provider", fake_probe)
 
     result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="local_stt",
-            config={
-                "type": "local",
-                "capabilities": ["stt"],
-                "ws_url": "ws://172.17.0.1:8765",
-                "auth_token": "wrong-token",
-            },
-        )
+        ProviderTestRequest(name="native_llm", config={"type": "openai", "chat_base_url": "https://ai-api.example/v1"})
     )
 
+    assert seen["name"] == "native_llm"
+    assert seen["saved"] == saved
+    assert seen["env"] == {"OPENAI_API_KEY": "sk-from-dotenv", "EMPTY": ""}
     assert result["success"] is False
-    assert "auth token" in result["message"].lower()
+    assert result["source"] == "admin_ui"
+    assert result["message"].endswith(
+        "(ai_engine unreachable, checked from the Admin UI container, "
+        "which may not reach endpoints only the engine host sees)"
+    )
 
 
 @pytest.mark.asyncio
-async def test_local_probe_does_not_require_llm_in_minimal_mode(monkeypatch):
-    seen = []
-    monkeypatch.setattr(
-        websockets,
-        "connect",
-        _fake_connect(
-            [_status_response(stt=True, llm=False, tts=True, runtime_mode="minimal")],
-            seen,
-        ),
+async def test_an_engine_error_reaches_the_browser_as_is(monkeypatch):
+    monkeypatch.setattr(engine_relay, "post_engine_json", _Relay(exc=HTTPException(status_code=504, detail="AI Engine did not answer in time")))
+
+    with pytest.raises(HTTPException) as excinfo:
+        await config_api.test_provider_connection(ProviderTestRequest(name="x", config={"type": "openai"}))
+
+    assert excinfo.value.status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_voice_registration_is_relayed_to_the_engine(monkeypatch):
+    relay = _Relay({"success": True, "voice": "anna", "message": "Voice 'anna' registered", "source": "ai_engine"})
+    monkeypatch.setattr(engine_relay, "post_engine_json", relay)
+
+    result = await config_api.register_provider_voice(
+        "fish tts", VoiceRegisterRequest(file="anna.wav", ref_text="Здравствуйте", consent=None)
     )
 
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="local",
-            config={"type": "local", "ws_url": "ws://127.0.0.1:8765"},
-        )
-    )
-
-    assert result["success"] is True
+    assert result["voice"] == "anna"
+    assert relay.calls[0]["path"] == "/providers/fish%20tts/voices"
+    assert relay.calls[0]["payload"] == {"file": "anna.wav", "name": None, "ref_text": "Здравствуйте", "consent": None}
 
 
-class _FakeHttpxClient:
-    calls: list = []
+@pytest.mark.asyncio
+async def test_voice_registration_needs_the_engine(monkeypatch):
+    monkeypatch.setattr(engine_relay, "post_engine_json", _Relay(None))
+
+    with pytest.raises(HTTPException) as excinfo:
+        await config_api.register_provider_voice("fish_tts", VoiceRegisterRequest(file="anna.wav", ref_text="t"))
+
+    assert excinfo.value.status_code == 503
+    assert "engine host" in excinfo.value.detail
+
+
+class _Response:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _HttpxClient:
+    """Scripts one answer per base URL; a missing base is a connection error."""
+
+    answers = {}
+    calls = []
 
     def __init__(self, **_kwargs):
         pass
@@ -154,302 +148,75 @@ class _FakeHttpxClient:
     async def __aexit__(self, *_args):
         return False
 
-    async def get(self, url, **kwargs):
-        _FakeHttpxClient.calls.append((url, kwargs))
-        return type(
-            "Response",
-            (),
-            {"status_code": 200, "json": lambda self: {"data": [{"id": "m"}]}},
-        )()
+    async def post(self, url, headers=None, json=None):
+        import httpx
+
+        _HttpxClient.calls.append({"url": url, "headers": headers, "json": json})
+        for base, answer in _HttpxClient.answers.items():
+            if url.startswith(base):
+                return answer
+        raise httpx.ConnectError("refused")
 
 
 @pytest.mark.asyncio
-async def test_openai_probe_calls_saved_self_hosted_endpoint(monkeypatch):
-    _FakeHttpxClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
-    monkeypatch.setattr(
-        config_api,
-        "_read_merged_config_dict",
-        lambda: {
-            "providers": {
-                "native_llm": {
-                    "type": "openai",
-                    "chat_base_url": "https://ai-api.example/v1",
-                }
-            }
-        },
-    )
+async def test_relay_tries_each_engine_address_with_the_token(monkeypatch):
+    import httpx
 
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="native_llm",
-            config={
-                "type": "openai",
-                "chat_base_url": "https://ai-api.example/v1",
-                "api_key": "self-hosted-token",
-            },
-        )
-    )
+    _HttpxClient.answers = {"http://ai_engine:15000": _Response(200, {"success": True, "message": "ok"})}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://127.0.0.1:15000", "http://ai_engine:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "tok-1")
 
-    assert result["success"] is True
-    url, kwargs = _FakeHttpxClient.calls[0]
-    assert url == "https://ai-api.example/v1/models"
-    assert kwargs["headers"]["Authorization"] == "Bearer self-hosted-token"
+    result = await engine_relay.post_engine_json("/providers/test", {"name": "x", "config": {}})
+
+    assert result == {"success": True, "message": "ok"}
+    assert [c["url"] for c in _HttpxClient.calls] == [
+        "http://127.0.0.1:15000/providers/test",
+        "http://ai_engine:15000/providers/test",
+    ]
+    assert _HttpxClient.calls[1]["headers"] == {"Authorization": "Bearer tok-1"}
 
 
 @pytest.mark.asyncio
-async def test_openai_probe_never_sends_the_key_to_an_unsaved_host(monkeypatch):
-    _FakeHttpxClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
-    monkeypatch.setattr(
-        config_api,
-        "_read_merged_config_dict",
-        lambda: {
-            "providers": {
-                "native_llm": {
-                    "type": "openai",
-                    "chat_base_url": "https://ai-api.example/v1",
-                }
-            }
-        },
-    )
+async def test_relay_falls_back_to_the_docker_socket_when_no_address_answers(monkeypatch):
+    import httpx
 
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="native_llm",
-            config={
-                "type": "openai",
-                "chat_base_url": "https://attacker.example/v1",
-                "api_key": "self-hosted-token",
-            },
-        )
-    )
+    _HttpxClient.answers = {}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://127.0.0.1:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "")
+    seen = {}
 
-    assert result["success"] is False
-    assert _FakeHttpxClient.calls == []
+    def fake_exec(path, payload, timeout):
+        seen.update(path=path, payload=payload)
+        return {"success": False, "message": "from exec"}
 
+    monkeypatch.setattr(engine_relay, "_exec_post_sync", fake_exec)
 
-class _RecordingHttpxClient:
-    """Records how the probe builds its client and lets a test script the outcome."""
+    result = await engine_relay.post_engine_json("/providers/test", {"name": "x", "config": {}})
 
-    kwargs: list = []
-    calls: list = []
-    outcome = 200  # an HTTP status, or an exception instance to raise
-
-    def __init__(self, **kwargs):
-        _RecordingHttpxClient.kwargs.append(kwargs)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    async def get(self, url, **kwargs):
-        _RecordingHttpxClient.calls.append((url, kwargs))
-        outcome = _RecordingHttpxClient.outcome
-        if isinstance(outcome, Exception):
-            raise outcome
-        return type(
-            "Response",
-            (),
-            {"status_code": outcome, "json": lambda self: {"voices": [{"id": "a"}, {"id": "b"}]}},
-        )()
-
-
-def _reset_recording(outcome=200):
-    _RecordingHttpxClient.kwargs = []
-    _RecordingHttpxClient.calls = []
-    _RecordingHttpxClient.outcome = outcome
-
-
-ELEVENLABS_TTS = {
-    "type": "elevenlabs",
-    "capabilities": ["tts"],
-    "api_key": "xi-test-key",
-    "proxy": "http://user:secret@10.0.0.5:8080",
-}
+    assert result == {"success": False, "message": "from exec"}
+    assert seen == {"path": "/providers/test", "payload": {"name": "x", "config": {}}}
 
 
 @pytest.mark.asyncio
-async def test_elevenlabs_probe_takes_the_configured_proxy(monkeypatch):
-    """A modular TTS provider of type elevenlabs is probed through its proxy."""
-    _reset_recording()
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
+async def test_relay_surfaces_an_engine_refusal(monkeypatch):
+    import httpx
 
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="eleven_tts", config=dict(ELEVENLABS_TTS))
-    )
+    _HttpxClient.answers = {"http://127.0.0.1:15000": _Response(404, {"success": False, "message": "Provider 'x' is not saved"})}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://127.0.0.1:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "")
 
-    assert result["success"] is True
-    assert "via proxy http://10.0.0.5:8080" in result["message"]
-    assert "secret" not in result["message"]
-    assert result["proxy"] == "http://10.0.0.5:8080"
-    client_kwargs = _RecordingHttpxClient.kwargs[0]
-    assert client_kwargs["trust_env"] is False
-    proxy = client_kwargs["proxy"]
-    assert isinstance(proxy, httpx.Proxy)
-    assert str(proxy.url) == "http://10.0.0.5:8080"
-    assert proxy.headers["Proxy-Authorization"].startswith("Basic ")
-    url, call_kwargs = _RecordingHttpxClient.calls[0]
-    assert url == "https://api.elevenlabs.io/v1/voices"
-    assert call_kwargs["headers"]["xi-api-key"] == "xi-test-key"
+    # A verdict (it carries "success") is returned as data, whatever the status.
+    result = await engine_relay.post_engine_json("/providers/x/voices", {"file": "a.wav"})
+    assert result == {"success": False, "message": "Provider 'x' is not saved"}
 
-
-@pytest.mark.asyncio
-async def test_elevenlabs_probe_goes_direct_without_a_proxy(monkeypatch):
-    _reset_recording()
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="elevenlabs_tts", config={**ELEVENLABS_TTS, "proxy": ""})
-    )
-
-    assert result["success"] is True
-    assert "directly" in result["message"]
-    assert result["proxy"] is None
-    assert "proxy" not in _RecordingHttpxClient.kwargs[0]
-    # The engine ignores HTTPS_PROXY in the container; so must the probe.
-    assert _RecordingHttpxClient.kwargs[0]["trust_env"] is False
-
-
-@pytest.mark.asyncio
-async def test_elevenlabs_probe_rejects_a_proxy_the_engine_would_reject(monkeypatch):
-    _reset_recording()
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="elevenlabs_tts", config={**ELEVENLABS_TTS, "proxy": "socks5://10.0.0.5:1080"})
-    )
-
-    assert result["success"] is False
-    assert "rejected" in result["message"]
-    assert "socks5" in result["message"]
-    assert _RecordingHttpxClient.calls == []
-
-
-@pytest.mark.asyncio
-async def test_elevenlabs_probe_names_the_proxy_when_the_tunnel_fails(monkeypatch):
-    _reset_recording(httpx.ProxyError("403 Forbidden"))
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="elevenlabs_tts", config=dict(ELEVENLABS_TTS))
-    )
-
-    assert result["success"] is False
-    assert result["message"].startswith("Proxy http://10.0.0.5:8080 refused the tunnel")
-
-
-@pytest.mark.asyncio
-async def test_elevenlabs_probe_names_the_proxy_when_it_is_unreachable(monkeypatch):
-    _reset_recording(httpx.ConnectError("Connection refused"))
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="elevenlabs_tts", config=dict(ELEVENLABS_TTS))
-    )
-
-    assert result["success"] is False
-    assert result["message"].startswith("Cannot connect to proxy http://10.0.0.5:8080")
-
-
-@pytest.mark.asyncio
-async def test_elevenlabs_probe_tells_a_rejected_key_from_a_broken_route(monkeypatch):
-    _reset_recording(401)
-    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="elevenlabs_tts", config=dict(ELEVENLABS_TTS))
-    )
-
-    assert result["success"] is False
-    assert "Reached ElevenLabs via proxy http://10.0.0.5:8080" in result["message"]
-    assert "HTTP 401" in result["message"]
-
-
-@pytest.mark.asyncio
-async def test_openai_probe_of_a_tts_only_block_asks_its_own_host_for_models(monkeypatch):
-    """A speech-only openai block has no chat_base_url; its host, not api.openai.com, is probed.
-
-    The probe used to fall back to api.openai.com/v1/models for such a block
-    and report that vendor's answer (an HTTP 403 from a blocked region, or a
-    401 for the self-hosted token) as the state of the operator's own server.
-    """
-    _FakeHttpxClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
-    saved = {
-        "type": "openai",
-        "capabilities": ["tts"],
-        "tts_base_url": "http://10.0.0.5:8091/v1/audio/speech",
-        "tts_model": "fishaudio/s2-pro",
-    }
-    monkeypatch.setattr(
-        config_api, "_read_merged_config_dict", lambda: {"providers": {"fish_tts": saved}}
-    )
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="fish_tts", config={**saved, "api_key": "local"})
-    )
-
-    assert result["success"] is True
-    url, kwargs = _FakeHttpxClient.calls[0]
-    assert url == "http://10.0.0.5:8091/v1/models"
-    assert kwargs["headers"]["Authorization"] == "Bearer local"
-
-
-@pytest.mark.asyncio
-async def test_openai_probe_of_an_stt_only_block_asks_its_own_host_for_models(monkeypatch):
-    _FakeHttpxClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
-    saved = {
-        "type": "openai",
-        "capabilities": ["stt"],
-        "stt_base_url": "https://stt.example/v1/audio/transcriptions/",
-    }
-    monkeypatch.setattr(
-        config_api, "_read_merged_config_dict", lambda: {"providers": {"whisper_stt": saved}}
-    )
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(name="whisper_stt", config={**saved, "api_key": "self-hosted-token"})
-    )
-
-    assert result["success"] is True
-    url, _kwargs = _FakeHttpxClient.calls[0]
-    assert url == "https://stt.example/v1/models"
-
-
-@pytest.mark.asyncio
-async def test_openai_probe_of_an_unsaved_speech_host_never_falls_back_to_openai(monkeypatch):
-    _FakeHttpxClient.calls = []
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
-    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: {"providers": {}})
-
-    result = await config_api.test_provider_connection(
-        ProviderTestRequest(
-            name="fish_tts",
-            config={
-                "type": "openai",
-                "capabilities": ["tts"],
-                "tts_base_url": "http://10.0.0.5:8091/v1/audio/speech",
-                "api_key": "local",
-            },
-        )
-    )
-
-    assert result["success"] is False
-    assert "tts_base_url" in result["message"]
-    assert _FakeHttpxClient.calls == []
-
-
-def test_openai_probe_base_url_drops_only_the_speech_route():
-    assert config_api._openai_probe_base_url({"chat_base_url": "https://llm.example/v1"}) == "https://llm.example/v1"
-    assert config_api._openai_probe_base_url(
-        {"chat_base_url": "https://llm.example/v1", "tts_base_url": "http://tts.lan/v1/audio/speech"}
-    ) == "https://llm.example/v1"
-    assert config_api._openai_probe_base_url({"tts_base_url": "http://tts.lan:8091/v1/audio/speech"}) == "http://tts.lan:8091/v1"
-    assert config_api._openai_probe_base_url({"stt_base_url": "http://stt.lan/v1/audio/transcriptions"}) == "http://stt.lan/v1"
-    assert config_api._openai_probe_base_url({"tts_base_url": "http://tts.lan:8091/speech"}) == "http://tts.lan:8091/speech"
-    assert config_api._openai_probe_base_url({"tts_base_url": ""}) == ""
-    assert config_api._openai_probe_base_url({}) == ""
+    _HttpxClient.answers = {"http://127.0.0.1:15000": _Response(500, {"error": "internal_error"})}
+    with pytest.raises(HTTPException) as excinfo:
+        await engine_relay.post_engine_json("/providers/test", {"name": "x", "config": {}})
+    assert excinfo.value.status_code == 500
+    assert excinfo.value.detail == "internal_error"

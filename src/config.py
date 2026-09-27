@@ -389,6 +389,10 @@ class OpenAIProviderConfig(BaseModel):
     # `sample_rate`, ...). The fields the engine sets itself (`model`, `input`,
     # `voice`, `response_format`, `stream`) cannot be overridden here.
     tts_extra_body: Dict[str, Any] = Field(default_factory=dict)
+    # Directory, inside the engine container, that holds reference samples a
+    # self-hosted speech endpoint can register as voices (Providers page,
+    # *Reference voice*); the engine reads the file and uploads it.
+    tts_voices_dir: str = Field(default="/voices")
     default_modalities: List[str] = Field(default_factory=lambda: ["text"])
     input_encoding: str = Field(default="linear16")
     input_sample_rate_hz: int = Field(default=24000)
