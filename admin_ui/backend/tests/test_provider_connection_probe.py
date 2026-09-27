@@ -20,7 +20,9 @@ from fastapi import HTTPException  # noqa: E402
 
 from api import config as config_api  # noqa: E402
 from api import engine_relay  # noqa: E402
-from api.config import ProviderTestRequest, VoiceRegisterRequest  # noqa: E402
+from fastapi import UploadFile  # noqa: E402
+
+from api.config import ProviderTestRequest  # noqa: E402
 
 
 class _Relay:
@@ -96,29 +98,90 @@ async def test_an_engine_error_reaches_the_browser_as_is(monkeypatch):
     assert excinfo.value.status_code == 504
 
 
+class _MultipartRelay:
+    def __init__(self, result=None):
+        self.result = result
+        self.calls = []
+
+    async def __call__(self, path, *, fields, sample, timeout=120.0):
+        self.calls.append({"path": path, "fields": fields, "sample": sample, "timeout": timeout})
+        return self.result
+
+
+def _upload(name="anna.wav", data=b"RIFF-bytes", content_type="audio/wav"):
+    import io
+
+    from starlette.datastructures import Headers
+
+    return UploadFile(file=io.BytesIO(data), filename=name, headers=Headers({"content-type": content_type}))
+
+
 @pytest.mark.asyncio
-async def test_voice_registration_is_relayed_to_the_engine(monkeypatch):
-    relay = _Relay({"success": True, "voice": "anna", "message": "Voice 'anna' registered", "source": "ai_engine"})
-    monkeypatch.setattr(engine_relay, "post_engine_json", relay)
+async def test_voice_upload_is_relayed_to_the_engine(monkeypatch):
+    relay = _MultipartRelay({"success": True, "voice": "anna", "message": "Voice 'anna' registered", "source": "ai_engine"})
+    monkeypatch.setattr(engine_relay, "post_engine_multipart", relay)
 
     result = await config_api.register_provider_voice(
-        "fish tts", VoiceRegisterRequest(file="anna.wav", ref_text="Здравствуйте", consent=None)
+        "fish tts", audio_sample=_upload(), ref_text="Здравствуйте", voice_name=" anna ", consent=None
     )
 
     assert result["voice"] == "anna"
-    assert relay.calls[0]["path"] == "/providers/fish%20tts/voices"
-    assert relay.calls[0]["payload"] == {"file": "anna.wav", "name": None, "ref_text": "Здравствуйте", "consent": None}
+    call = relay.calls[0]
+    assert call["path"] == "/providers/fish%20tts/voices"
+    assert call["fields"] == {"ref_text": "Здравствуйте", "name": "anna"}
+    assert call["sample"] == ("anna.wav", b"RIFF-bytes", "audio/wav")
 
 
 @pytest.mark.asyncio
-async def test_voice_registration_needs_the_engine(monkeypatch):
-    monkeypatch.setattr(engine_relay, "post_engine_json", _Relay(None))
+async def test_voice_upload_refuses_empty_and_oversized_samples(monkeypatch):
+    relay = _MultipartRelay({"success": True})
+    monkeypatch.setattr(engine_relay, "post_engine_multipart", relay)
+
+    with pytest.raises(HTTPException) as empty:
+        await config_api.register_provider_voice("fish_tts", audio_sample=_upload(data=b""), ref_text="t")
+    with pytest.raises(HTTPException) as huge:
+        await config_api.register_provider_voice(
+            "fish_tts", audio_sample=_upload(data=b"x" * (10 * 1024 * 1024 + 1)), ref_text="t"
+        )
+
+    assert empty.value.status_code == 400
+    assert huge.value.status_code == 413
+    assert relay.calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_upload_needs_the_engine(monkeypatch):
+    monkeypatch.setattr(engine_relay, "post_engine_multipart", _MultipartRelay(None))
 
     with pytest.raises(HTTPException) as excinfo:
-        await config_api.register_provider_voice("fish_tts", VoiceRegisterRequest(file="anna.wav", ref_text="t"))
+        await config_api.register_provider_voice("fish_tts", audio_sample=_upload(), ref_text="t")
 
     assert excinfo.value.status_code == 503
     assert "engine host" in excinfo.value.detail
+
+
+@pytest.mark.asyncio
+async def test_voice_list_is_relayed_to_the_engine(monkeypatch):
+    seen = {}
+
+    async def fake_get(path, *, timeout=30.0):
+        seen["path"] = path
+        return {"success": True, "voices": [{"name": "anna"}], "builtin": ["default"], "message": "1 registered voice(s)"}
+
+    monkeypatch.setattr(engine_relay, "get_engine_json", fake_get)
+
+    result = await config_api.list_provider_voices("fish_tts")
+
+    assert seen["path"] == "/providers/fish_tts/voices"
+    assert result["voices"] == [{"name": "anna"}]
+
+    async def unreachable(path, *, timeout=30.0):
+        return None
+
+    monkeypatch.setattr(engine_relay, "get_engine_json", unreachable)
+    with pytest.raises(HTTPException) as excinfo:
+        await config_api.list_provider_voices("fish_tts")
+    assert excinfo.value.status_code == 503
 
 
 class _Response:
@@ -148,10 +211,10 @@ class _HttpxClient:
     async def __aexit__(self, *_args):
         return False
 
-    async def post(self, url, headers=None, json=None):
+    async def request(self, method, url, headers=None, **kwargs):
         import httpx
 
-        _HttpxClient.calls.append({"url": url, "headers": headers, "json": json})
+        _HttpxClient.calls.append({"method": method, "url": url, "headers": headers, **kwargs})
         for base, answer in _HttpxClient.answers.items():
             if url.startswith(base):
                 return answer
@@ -189,16 +252,16 @@ async def test_relay_falls_back_to_the_docker_socket_when_no_address_answers(mon
     monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "")
     seen = {}
 
-    def fake_exec(path, payload, timeout):
-        seen.update(path=path, payload=payload)
+    def fake_exec(method, path, payload, timeout):
+        seen.update(method=method, path=path, payload=payload)
         return {"success": False, "message": "from exec"}
 
-    monkeypatch.setattr(engine_relay, "_exec_post_sync", fake_exec)
+    monkeypatch.setattr(engine_relay, "_exec_request_sync", fake_exec)
 
     result = await engine_relay.post_engine_json("/providers/test", {"name": "x", "config": {}})
 
     assert result == {"success": False, "message": "from exec"}
-    assert seen == {"path": "/providers/test", "payload": {"name": "x", "config": {}}}
+    assert seen == {"method": "POST", "path": "/providers/test", "payload": {"name": "x", "config": {}}}
 
 
 @pytest.mark.asyncio
@@ -220,3 +283,106 @@ async def test_relay_surfaces_an_engine_refusal(monkeypatch):
         await engine_relay.post_engine_json("/providers/test", {"name": "x", "config": {}})
     assert excinfo.value.status_code == 500
     assert excinfo.value.detail == "internal_error"
+
+
+@pytest.mark.asyncio
+async def test_multipart_relay_sends_the_file_over_the_network(monkeypatch):
+    import httpx
+
+    _HttpxClient.answers = {"http://ai_engine:15000": _Response(200, {"success": True, "voice": "anna"})}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://ai_engine:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "tok-1")
+
+    result = await engine_relay.post_engine_multipart(
+        "/providers/fish_tts/voices", fields={"ref_text": "t", "name": "anna"}, sample=("anna.wav", b"RIFF", "audio/wav")
+    )
+
+    assert result == {"success": True, "voice": "anna"}
+    call = _HttpxClient.calls[0]
+    assert call["method"] == "POST"
+    assert call["data"] == {"ref_text": "t", "name": "anna"}
+    assert call["files"] == {"audio_sample": ("anna.wav", b"RIFF", "audio/wav")}
+    assert call["headers"] == {"Authorization": "Bearer tok-1"}
+
+
+@pytest.mark.asyncio
+async def test_multipart_relay_stages_the_file_through_the_docker_socket(monkeypatch):
+    import httpx
+
+    _HttpxClient.answers = {}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://127.0.0.1:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "")
+    staged = {}
+
+    def fake_stage(filename, data):
+        staged.update(filename=filename, data=data)
+        return "deadbeef.wav"
+
+    seen = {}
+
+    def fake_exec(method, path, payload, timeout):
+        seen.update(method=method, path=path, payload=payload)
+        return {"success": True, "voice": "anna"}
+
+    monkeypatch.setattr(engine_relay, "_stage_sample_sync", fake_stage)
+    monkeypatch.setattr(engine_relay, "_exec_request_sync", fake_exec)
+
+    result = await engine_relay.post_engine_multipart(
+        "/providers/fish_tts/voices", fields={"ref_text": "t"}, sample=("anna.wav", b"RIFF", "audio/wav")
+    )
+
+    assert result == {"success": True, "voice": "anna"}
+    assert staged == {"filename": "anna.wav", "data": b"RIFF"}
+    assert seen == {
+        "method": "POST",
+        "path": "/providers/fish_tts/voices",
+        "payload": {"ref_text": "t", "staged_file": "deadbeef.wav", "filename": "anna.wav"},
+    }
+
+
+def test_staging_archive_holds_the_sample_under_the_staging_directory(monkeypatch):
+    import io
+    import tarfile
+
+    class _Container:
+        def __init__(self):
+            self.archives = []
+
+        def put_archive(self, path, data):
+            self.archives.append((path, data))
+            return True
+
+    container = _Container()
+    monkeypatch.setattr(engine_relay, "_engine_container", lambda: container)
+
+    staged = engine_relay._stage_sample_sync("Anna Voice.MP3", b"ID3-bytes")
+
+    assert staged.endswith(".mp3") and "/" not in staged
+    path, data = container.archives[0]
+    assert path == "/tmp"
+    with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+        names = archive.getnames()
+        member = archive.extractfile(f"ava-voice-uploads/{staged}")
+        assert member is not None and member.read() == b"ID3-bytes"
+    assert names == ["ava-voice-uploads", f"ava-voice-uploads/{staged}"]
+
+
+@pytest.mark.asyncio
+async def test_get_relay_carries_no_body(monkeypatch):
+    import httpx
+
+    _HttpxClient.answers = {"http://127.0.0.1:15000": _Response(200, {"success": True, "voices": []})}
+    _HttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpxClient)
+    monkeypatch.setattr(engine_relay, "_engine_base_urls", lambda: ["http://127.0.0.1:15000"])
+    monkeypatch.setattr(engine_relay, "_health_api_token", lambda: "")
+
+    result = await engine_relay.get_engine_json("/providers/fish_tts/voices")
+
+    assert result == {"success": True, "voices": []}
+    assert _HttpxClient.calls[0]["method"] == "GET"
+    assert "json" not in _HttpxClient.calls[0]

@@ -22544,7 +22544,8 @@ class Engine:
     async def _start_health_server(self):
         """Start aiohttp health/metrics server (defaults to 127.0.0.1:15000)."""
         try:
-            app = web.Application()
+            # A reference voice sample (up to 10 MB) is uploaded through this server.
+            app = web.Application(client_max_size=16 * 1024 * 1024)
             app.router.add_get('/live', self._live_handler)
             app.router.add_get('/ready', self._ready_handler)
             app.router.add_get('/health', self._health_handler)
@@ -22556,6 +22557,7 @@ class Engine:
             # sit in another network than the engine host's endpoints.
             app.router.add_post('/providers/test', self._provider_test_handler)
             app.router.add_post('/providers/{name}/voices', self._provider_voice_register_handler)
+            app.router.add_get('/providers/{name}/voices', self._provider_voices_list_handler)
             # Read-only tool catalog for Admin UI: includes built-in, HTTP, and MCP tool wrappers
             # registered in the engine's tool registry. This is intentionally unauthenticated
             # (similar to /mcp/status) and should not include secrets or PII.
@@ -22751,12 +22753,25 @@ class Engine:
         result["source"] = "ai_engine"
         return web.json_response(result)
 
+    def _saved_provider_block(self, name: str) -> Optional[Dict[str, Any]]:
+        blocks = self._saved_provider_blocks()
+        block = blocks.get(name)
+        if isinstance(block, dict):
+            return block
+        for key, value in blocks.items():
+            if str(key).lower() == name.lower() and isinstance(value, dict):
+                return value
+        return None
+
     async def _provider_voice_register_handler(self, request):
         """Register a reference voice on a saved self-hosted speech provider.
 
         SECURITY: Requires localhost or HEALTH_API_TOKEN. The target host is
-        the saved block's own, and the request names only a file inside the
-        provider's voices directory.
+        the saved block's own. The sample arrives as a multipart upload
+        (``audio_sample``, relayed from the operator's browser), or as JSON
+        naming a file the Admin UI staged into this container
+        (``staged_file``) or a file inside the provider's voices directory
+        (``file``, for scripts); a name is always a bare file name.
         """
         if not self._is_request_authorized(request):
             return web.json_response(
@@ -22764,37 +22779,97 @@ class Engine:
                 status=403,
             )
         name = str(request.match_info.get("name") or "").strip()
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
-        if not name or not isinstance(payload, dict):
-            return web.json_response(
-                {"success": False, "message": 'Expected {"file": "<name in the voices directory>", "ref_text": "..."}'},
-                status=400,
-            )
-        blocks = self._saved_provider_blocks()
-        block = blocks.get(name)
-        if not isinstance(block, dict):
-            for key, value in blocks.items():
-                if str(key).lower() == name.lower() and isinstance(value, dict):
-                    block = value
-                    break
-        if not isinstance(block, dict):
+        block = self._saved_provider_block(name) if name else None
+        if block is None:
             return web.json_response(
                 {"success": False, "message": f"Provider '{name}' is not saved; save the provider first"},
                 status=404,
             )
-        from .probes.voices import register_voice
-
-        result = await register_voice(
-            name,
-            block,
-            file=str(payload.get("file") or ""),
-            name=payload.get("name"),
-            ref_text=str(payload.get("ref_text") or ""),
-            consent=payload.get("consent"),
+        from .probes.voices import (
+            VoiceRegistrationError,
+            register_voice,
+            register_voice_bytes,
+            take_staged_sample,
         )
+
+        content_type = str(getattr(request, "content_type", "") or "").lower()
+        if content_type.startswith("multipart/"):
+            try:
+                form = await request.post()
+            except Exception as exc:
+                return web.json_response({"success": False, "message": f"Malformed upload: {exc}"}, status=400)
+            sample = form.get("audio_sample")
+            if sample is None or not hasattr(sample, "file"):
+                return web.json_response(
+                    {"success": False, "message": "audio_sample (the sample file) is required"}, status=400
+                )
+            data = sample.file.read()
+            result = await register_voice_bytes(
+                name,
+                block,
+                sample=data,
+                filename=str(getattr(sample, "filename", "") or ""),
+                name=str(form.get("name") or "") or None,
+                ref_text=str(form.get("ref_text") or ""),
+                consent=str(form.get("consent") or "") or None,
+            )
+        else:
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
+            if not isinstance(payload, dict):
+                return web.json_response({"success": False, "message": "Request body must be a JSON object"}, status=400)
+            common = {
+                "name": str(payload.get("name") or "") or None,
+                "ref_text": str(payload.get("ref_text") or ""),
+                "consent": str(payload.get("consent") or "") or None,
+            }
+            if payload.get("staged_file"):
+                try:
+                    data, staged_name = take_staged_sample(str(payload["staged_file"]))
+                except VoiceRegistrationError as exc:
+                    return web.json_response({"success": False, "message": str(exc)}, status=400)
+                result = await register_voice_bytes(
+                    name,
+                    block,
+                    sample=data,
+                    filename=str(payload.get("filename") or staged_name),
+                    **common,
+                )
+            elif payload.get("file"):
+                result = await register_voice(name, block, file=str(payload["file"]), **common)
+            else:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "message": 'Expected a multipart upload (audio_sample) or JSON with "staged_file" or "file"',
+                    },
+                    status=400,
+                )
+        result["source"] = "ai_engine"
+        return web.json_response(result)
+
+    async def _provider_voices_list_handler(self, request):
+        """List the voices a saved self-hosted speech provider's server knows.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        name = str(request.match_info.get("name") or "").strip()
+        block = self._saved_provider_block(name) if name else None
+        if block is None:
+            return web.json_response(
+                {"success": False, "message": f"Provider '{name}' is not saved; save the provider first"},
+                status=404,
+            )
+        from .probes.voices import list_voices
+
+        result = await list_voices(name, block)
         result["source"] = "ai_engine"
         return web.json_response(result)
 

@@ -28,7 +28,6 @@ providers:
     tts_base_url: http://10.0.0.5:8091/v1/audio/speech
     tts_model: fishaudio/s2-pro
     voice: anna                         # registered via POST /v1/audio/voices, or from the Providers page
-    tts_voices_dir: /voices             # samples for the Reference voice card; mount the server's voices dir into ai_engine
     tts_response_format: pcm            # the request's response_format: pcm or wav
     tts_streaming: true                 # frames are played while the sentence is still being generated
     tts_pcm_sample_rate_hz: 44100       # S2-Pro speaks 44.1 kHz and vLLM-Omni cannot resample it

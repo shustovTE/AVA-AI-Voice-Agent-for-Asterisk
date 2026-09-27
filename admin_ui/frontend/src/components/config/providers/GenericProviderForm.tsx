@@ -458,7 +458,6 @@ const GenericProviderForm: React.FC<GenericProviderFormProps> = ({ config, onCha
                                 {cap === 'tts' && selectedSubtype.yamlType === 'openai' && (
                                     <VoiceRegistrationCard
                                         providerKey={isNew ? undefined : config.name}
-                                        voicesDir={config.tts_voices_dir || '/voices'}
                                         currentVoice={config.voice}
                                         onUseVoice={(voice) => updateConfig({ voice })}
                                     />

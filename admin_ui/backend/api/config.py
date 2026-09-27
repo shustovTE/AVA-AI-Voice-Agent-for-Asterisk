@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, SequenceNode, ScalarNode
@@ -1830,35 +1830,63 @@ async def test_provider_connection(request: ProviderTestRequest):
     return _with_probe_origin(result, "admin_ui")
 
 
-class VoiceRegisterRequest(BaseModel):
-    file: str
-    name: Optional[str] = None
-    ref_text: str
-    consent: Optional[str] = None
+_VOICE_SAMPLE_MAX_BYTES = 10 * 1024 * 1024
 
 
 @router.post("/providers/{name}/voices")
-async def register_provider_voice(name: str, request: VoiceRegisterRequest):
+async def register_provider_voice(
+    name: str,
+    audio_sample: UploadFile = File(...),
+    ref_text: str = Form(...),
+    voice_name: Optional[str] = Form(None),
+    consent: Optional[str] = Form(None),
+):
     """Register a reference voice on a saved self-hosted speech provider.
 
-    The sample lives next to the engine (the provider's ``tts_voices_dir``,
-    ``/voices`` by default) and the engine uploads it to the provider's own
-    ``/audio/voices``; this backend only relays, it has neither the file nor
-    the endpoint's network.
+    The sample comes from the operator's browser. This backend relays it to
+    the engine (over the network as multipart, or staged into the engine
+    container through the Docker socket), and the engine uploads it to the
+    provider's own ``/audio/voices``; this backend has neither the endpoint's
+    network nor the server's registry.
     """
-    payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    data = await audio_sample.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The sample file is empty")
+    if len(data) > _VOICE_SAMPLE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The sample is larger than 10 MB, which the speech server refuses")
+    fields: Dict[str, str] = {"ref_text": ref_text}
+    # Called through FastAPI the optional fields are str or None; a direct call
+    # without them carries the Form() marker instead, which is not a value.
+    if isinstance(voice_name, str) and voice_name.strip():
+        fields["name"] = voice_name.strip()
+    if isinstance(consent, str) and consent.strip():
+        fields["consent"] = consent.strip()
     from urllib.parse import quote
 
-    result = await engine_relay.post_engine_json(
-        f"/providers/{quote(name, safe='')}/voices", payload, timeout=150.0
+    result = await engine_relay.post_engine_multipart(
+        f"/providers/{quote(name, safe='')}/voices",
+        fields=fields,
+        sample=(audio_sample.filename or "sample.wav", data, audio_sample.content_type or "application/octet-stream"),
+        timeout=150.0,
     )
     if result is None:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "AI Engine is not reachable. A voice is registered from the engine host, "
-                "where the voices directory and the speech server are."
-            ),
+            detail="AI Engine is not reachable. A voice is registered from the engine host, where the speech server is.",
+        )
+    return result
+
+
+@router.get("/providers/{name}/voices")
+async def list_provider_voices(name: str):
+    """List the voices the saved provider's speech server knows (registered ones in full)."""
+    from urllib.parse import quote
+
+    result = await engine_relay.get_engine_json(f"/providers/{quote(name, safe='')}/voices", timeout=40.0)
+    if result is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AI Engine is not reachable. Voices are listed from the engine host, where the speech server is.",
         )
     return result
 
