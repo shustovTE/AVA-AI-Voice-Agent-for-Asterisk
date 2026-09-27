@@ -371,6 +371,24 @@ class OpenAIProviderConfig(BaseModel):
     tts_model: str = Field(default="tts-1")
     voice: str = Field(default="alloy")
     tts_response_format: str = Field(default="wav")
+    # A self-hosted OpenAI-compatible speech endpoint (vLLM-Omni serving Fish
+    # Speech S2-Pro, for one) is driven through the same adapter; the four keys
+    # below are what such a server needs beyond the OpenAI fields.
+    # `stream: true`: play the reply while it is still being generated. The
+    # engine already hands pipeline TTS one sentence at a time; with this the
+    # first sound waits for the first frames of the sentence, not for all of it.
+    # Only `pcm` and `wav` bodies are understood.
+    tts_streaming: bool = Field(default=False)
+    # Sample rate of a `pcm` body, which carries no header: OpenAI speaks
+    # 24 kHz, Fish Speech S2-Pro 44.1 kHz. A `wav` body is read from its header.
+    tts_pcm_sample_rate_hz: int = Field(default=24000)
+    # Put in front of the text of every request, e.g. the `<|speaker:0|>` tag
+    # that keeps Fish Speech on the reference voice.
+    tts_text_prefix: str = Field(default="")
+    # Request-body fields forwarded verbatim (`stream_format`, `extra_params`,
+    # `sample_rate`, ...). The fields the engine sets itself (`model`, `input`,
+    # `voice`, `response_format`, `stream`) cannot be overridden here.
+    tts_extra_body: Dict[str, Any] = Field(default_factory=dict)
     default_modalities: List[str] = Field(default_factory=lambda: ["text"])
     input_encoding: str = Field(default="linear16")
     input_sample_rate_hz: int = Field(default=24000)

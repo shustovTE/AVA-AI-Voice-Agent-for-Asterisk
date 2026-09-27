@@ -24,6 +24,7 @@ import aiohttp
 import websockets
 
 from ..audio import (
+    StreamingResampler,
     convert_pcm16le_to_target_format,
     resample_audio,
     resolve_output_resampler_policy,
@@ -98,6 +99,65 @@ _ENGINE_OWNED_PAYLOAD_KEYS = frozenset(
 def _as_dict(value: Any) -> Dict[str, Any]:
     """Return *value* when it is a mapping, else an empty dict."""
     return dict(value) if isinstance(value, dict) else {}
+
+
+# Speech-request fields the engine sets itself; a `tts_extra_body` entry for
+# one of these would break the response handling or the streaming contract.
+_TTS_ENGINE_OWNED_PAYLOAD_KEYS = frozenset({"model", "input", "voice", "response_format", "stream"})
+
+# A streamed WAV body whose header has not shown its data chunk after this many
+# bytes is not a WAV body.
+_WAV_HEADER_SCAN_LIMIT = 64 * 1024
+
+
+def _is_openai_host(url: str) -> bool:
+    """True for OpenAI's own endpoints, where the model and voice enums are known."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "openai.com" or host.endswith(".openai.com")
+
+
+def _parse_wav_header(buffer: bytes) -> Optional[tuple[int, int]]:
+    """Return ``(sample_rate, data_offset)`` once a mono PCM16 WAV header is complete.
+
+    ``None`` means more bytes are needed. A streamed WAV carries a header with
+    a placeholder data size, so only the format chunk and the position of the
+    data chunk matter; the samples run until the body ends.
+    """
+    if len(buffer) < 12:
+        return None
+    if buffer[:4] != b"RIFF" or buffer[8:12] != b"WAVE":
+        raise RuntimeError(
+            "Expected a RIFF/WAVE body from the speech endpoint "
+            f"but received bytes starting with {buffer[:12]!r}"
+        )
+    sample_rate: Optional[int] = None
+    offset = 12
+    while True:
+        if len(buffer) < offset + 8:
+            return None
+        chunk_id = buffer[offset : offset + 4]
+        chunk_size = int.from_bytes(buffer[offset + 4 : offset + 8], "little")
+        if chunk_id == b"data":
+            if sample_rate is None:
+                raise RuntimeError("WAV body has a data chunk before its format chunk")
+            return sample_rate, offset + 8
+        if chunk_id == b"fmt ":
+            if len(buffer) < offset + 8 + 16:
+                return None
+            fmt = buffer[offset + 8 : offset + 24]
+            channels = int.from_bytes(fmt[2:4], "little")
+            sample_rate = int.from_bytes(fmt[4:8], "little")
+            bits = int.from_bytes(fmt[14:16], "little")
+            if channels != 1 or bits != 16:
+                raise RuntimeError(
+                    f"Only mono PCM16 WAV is supported; got channels={channels} bits={bits}"
+                )
+        offset += 8 + chunk_size + (chunk_size & 1)
+        if offset > _WAV_HEADER_SCAN_LIMIT:
+            raise RuntimeError("WAV body shows no data chunk within its first 64 KiB")
 
 
 def _make_http_headers(options: Dict[str, Any]) -> Dict[str, str]:
@@ -1306,11 +1366,17 @@ class OpenAITTSAdapter(TTSComponent):
         if not api_key:
             raise RuntimeError("OpenAI TTS requires an API key")
 
+        url = merged["tts_base_url"]
+        # The model and voice enums below are OpenAI's. A self-hosted endpoint
+        # (vLLM-Omni, ...) names its models `org/name` and its voices freely,
+        # so the fallbacks only apply to OpenAI's own hosts.
+        openai_host = _is_openai_host(url)
+
         # OpenAI audio.speech expects a small enum set for model/voice/response_format. We avoid hard-failing
         # on unknown values (to reduce drift with upstream), but we keep "safe fallbacks" + retries for the
         # common case where a pipeline TTS provider is swapped and stale options remain (e.g., Groq model/voice).
         model = (merged.get("tts_model") or "").strip()
-        if not model or "/" in model:
+        if not model or (openai_host and "/" in model):
             fallback_model = (self._provider_defaults.tts_model or "tts-1").strip()
             logger.warning(
                 "OpenAI TTS model looks invalid for OpenAI; falling back",
@@ -1321,7 +1387,7 @@ class OpenAITTSAdapter(TTSComponent):
             merged["tts_model"] = fallback_model
 
         voice = (merged.get("voice") or "").strip().lower()
-        if voice in {
+        if openai_host and voice in {
             "autumn",
             "diana",
             "hannah",
@@ -1353,15 +1419,39 @@ class OpenAITTSAdapter(TTSComponent):
             merged["response_format"] = response_format
 
         headers = _make_http_headers(merged)
-        url = merged["tts_base_url"]
+
+        text_prefix = merged.get("text_prefix") or ""
+        request_text = text if not text_prefix or text.startswith(text_prefix) else f"{text_prefix}{text}"
+        streaming = bool(merged.get("streaming"))
 
         # Per OpenAI API spec (/v1/audio/speech), request field is `response_format` (not `format`).
-        payload = {
+        payload: Dict[str, Any] = {
             "model": merged["tts_model"],
-            "input": text,
+            "input": request_text,
             "voice": merged["voice"],
             "response_format": response_format,
         }
+        if streaming:
+            payload["stream"] = True
+
+        extra_body = merged.get("extra_body") or {}
+        forwarded: list = []
+        for key, value in extra_body.items():
+            if key in _TTS_ENGINE_OWNED_PAYLOAD_KEYS:
+                logger.warning(
+                    "OpenAI TTS extra_body field is set by the engine; ignored",
+                    call_id=call_id,
+                    field=key,
+                )
+                continue
+            payload[key] = value
+            forwarded.append(key)
+        if forwarded:
+            logger.debug(
+                "Forwarding extra_body fields to the speech endpoint",
+                call_id=call_id,
+                fields=sorted(forwarded),
+            )
 
         logger.info(
             "OpenAI TTS synthesis started",
@@ -1369,7 +1459,13 @@ class OpenAITTSAdapter(TTSComponent):
             model=payload["model"],
             voice=payload["voice"],
             text_preview=text[:64],
+            streamed=streaming,
         )
+
+        if streaming:
+            async for frame in self._stream_frames(call_id, url, headers, payload, merged):
+                yield frame
+            return
 
         async def _post_tts(req_payload: Dict[str, Any]) -> tuple[int, bytes, str]:
             async with self._session.post(url, json=req_payload, headers=headers, timeout=merged["timeout_sec"]) as resp:
@@ -1434,6 +1530,7 @@ class OpenAITTSAdapter(TTSComponent):
             output_bytes=len(converted),
             target_encoding=merged["target_format"]["encoding"],
             target_sample_rate=merged["target_format"]["sample_rate"],
+            streamed=False,
         )
 
         chunk_ms = int(merged.get("chunk_size_ms", self._chunk_size_ms))
@@ -1445,6 +1542,131 @@ class OpenAITTSAdapter(TTSComponent):
         ):
             if chunk:
                 yield chunk
+
+    async def _stream_frames(
+        self,
+        call_id: str,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        merged: Dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """POST with ``stream: true`` and emit playback frames as the body arrives.
+
+        A ``pcm`` body is raw PCM16 at ``pcm_sample_rate_hz``; a ``wav`` body
+        starts with a header that names the rate and is followed by the same
+        raw samples. Each network chunk is brought to the call's rate by a
+        stateful resampler (no click at chunk boundaries, no drift) and to its
+        encoding, then cut into ``chunk_size_ms`` frames. The read timeout is
+        the time the endpoint may stay silent between two chunks; a whole
+        reply is not bounded, the engine drops a reply it no longer wants.
+        """
+        assert self._session
+        response_format = str(merged.get("response_format") or "wav").lower()
+        target_encoding = merged["target_format"]["encoding"]
+        target_rate = int(merged["target_format"]["sample_rate"])
+        chunk_ms = int(merged.get("chunk_size_ms", self._chunk_size_ms))
+        bytes_per_sample = _bytes_per_sample(target_encoding)
+        frame_bytes = max(bytes_per_sample, int(target_rate * (chunk_ms / 1000.0) * bytes_per_sample))
+        read_timeout = float(merged["timeout_sec"])
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=read_timeout, sock_read=read_timeout)
+
+        started_at = time.perf_counter()
+        first_audio_ms: Optional[float] = None
+        source_rate: Optional[int] = None if response_format == "wav" else int(merged["pcm_sample_rate_hz"])
+        resampler: Optional[StreamingResampler] = None
+        header = b""
+        partial_sample = b""
+        pending = b""
+        raw_bytes = 0
+        output_bytes = 0
+
+        def _to_frames(pcm: bytes) -> Iterable[bytes]:
+            nonlocal pending, output_bytes, first_audio_ms
+            if not pcm:
+                return
+            converted = convert_pcm16le_to_target_format(pcm, target_encoding)
+            if not converted:
+                return
+            if first_audio_ms is None:
+                first_audio_ms = (time.perf_counter() - started_at) * 1000.0
+                logger.info(
+                    "OpenAI TTS first audio chunk",
+                    call_id=call_id,
+                    first_audio_ms=round(first_audio_ms, 2),
+                    source_sample_rate=source_rate,
+                )
+            pending += converted
+            while len(pending) >= frame_bytes:
+                frame, pending = pending[:frame_bytes], pending[frame_bytes:]
+                output_bytes += len(frame)
+                yield frame
+
+        async with self._session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status >= 400:
+                body = (await resp.read()).decode("utf-8", errors="ignore")
+                logger.error(
+                    "OpenAI TTS synthesis failed",
+                    call_id=call_id,
+                    status=resp.status,
+                    body_preview=body[:128],
+                    streamed=True,
+                )
+                raise RuntimeError(
+                    f"OpenAI TTS request failed (status {resp.status}): {body[:256]}"
+                )
+
+            async for raw in resp.content.iter_any():
+                if not raw:
+                    continue
+                raw_bytes += len(raw)
+                if source_rate is None:
+                    # Still inside the WAV header.
+                    header += raw
+                    parsed = _parse_wav_header(header)
+                    if parsed is None:
+                        continue
+                    source_rate, data_offset = parsed
+                    raw = header[data_offset:]
+                    header = b""
+                    if not raw:
+                        continue
+                if resampler is None:
+                    resampler = StreamingResampler(source_rate, target_rate, merged["output_resampler"])
+                # A PCM16 sample can straddle a chunk boundary; hold the odd
+                # trailing byte back for the next chunk.
+                buffered = partial_sample + raw
+                aligned = len(buffered) - (len(buffered) % 2)
+                partial_sample = buffered[aligned:]
+                for frame in _to_frames(resampler.process(buffered[:aligned])):
+                    yield frame
+
+        if resampler is not None:
+            for frame in _to_frames(resampler.flush()):
+                yield frame
+        if pending:
+            output_bytes += len(pending)
+            yield pending
+
+        if output_bytes == 0:
+            logger.warning(
+                "OpenAI TTS stream produced no audio",
+                call_id=call_id,
+                raw_bytes=raw_bytes,
+                response_format=response_format,
+            )
+        logger.info(
+            "OpenAI TTS synthesis completed",
+            call_id=call_id,
+            output_bytes=output_bytes,
+            raw_bytes=raw_bytes,
+            first_audio_ms=round(first_audio_ms, 2) if first_audio_ms is not None else None,
+            total_ms=round((time.perf_counter() - started_at) * 1000.0, 2),
+            source_sample_rate=source_rate,
+            target_encoding=target_encoding,
+            target_sample_rate=target_rate,
+            streamed=True,
+        )
 
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
@@ -1507,6 +1729,33 @@ class OpenAITTSAdapter(TTSComponent):
                     "output_resampler", self._provider_defaults.output_resampler
                 ),
             ),
+            "streaming": bool(
+                runtime_options.get(
+                    "streaming",
+                    self._pipeline_defaults.get("streaming", self._provider_defaults.tts_streaming),
+                )
+            ),
+            "pcm_sample_rate_hz": int(
+                runtime_options.get(
+                    "pcm_sample_rate_hz",
+                    self._pipeline_defaults.get(
+                        "pcm_sample_rate_hz", self._provider_defaults.tts_pcm_sample_rate_hz
+                    ),
+                )
+            ),
+            "text_prefix": str(
+                runtime_options.get(
+                    "text_prefix",
+                    self._pipeline_defaults.get("text_prefix", self._provider_defaults.tts_text_prefix),
+                )
+                or ""
+            ),
+            # Provider block, then pipeline options, then per-call overrides.
+            "extra_body": {
+                **_as_dict(self._provider_defaults.tts_extra_body),
+                **_as_dict(self._pipeline_defaults.get("extra_body")),
+                **_as_dict(runtime_options.get("extra_body")),
+            },
         }
         merged["output_resampler"] = resolve_output_resampler_policy(
             provider_mode=merged.get("output_resampler")

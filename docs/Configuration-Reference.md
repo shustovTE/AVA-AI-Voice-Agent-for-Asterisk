@@ -866,7 +866,39 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 
 - `openai_llm`: Chat Completions (`chat_base_url`, `chat_model`)
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
-- `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
+- `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`; for a self-hosted endpoint also `tts_streaming`, `tts_pcm_sample_rate_hz`, `tts_text_prefix`, `tts_extra_body`, see below)
+
+**Self-hosted speech endpoints (TTS).** The same `openai_tts` component drives any server that speaks the `/v1/audio/speech` protocol, such as vLLM-Omni serving Fish Speech S2-Pro. Four keys cover what such a server needs beyond the OpenAI fields; each can also be given per pipeline under `options.tts` without the `tts_` prefix (`streaming`, `pcm_sample_rate_hz`, `text_prefix`, `extra_body`):
+
+```yaml
+providers:
+  fish_tts:
+    type: openai
+    api_key: local                      # vLLM-Omni without --api-key ignores it, but the adapter needs a value
+    tts_base_url: http://10.0.0.5:8091/v1/audio/speech
+    tts_model: fishaudio/s2-pro
+    voice: anna                         # a voice registered once via POST /v1/audio/voices
+    response_format: pcm
+    tts_streaming: true                 # stream: true, frames are played as they arrive
+    tts_pcm_sample_rate_hz: 44100       # Fish Speech S2-Pro speaks 44.1 kHz; a pcm body carries no header
+    tts_text_prefix: "<|speaker:0|>"    # keeps Fish Speech on the reference voice
+    tts_extra_body:                     # forwarded verbatim in the request body
+      stream_format: audio
+      extra_params:
+        top_p: 0.8
+        temperature: 0.7
+    target_encoding: mulaw
+    target_sample_rate_hz: 8000
+    output_resampler: bandlimited       # low-pass before 44.1 kHz is brought down to 8 or 16 kHz
+```
+
+- `tts_streaming`: the request carries `stream: true` and the adapter plays the reply while it is still being generated. The engine already hands pipeline TTS one sentence at a time (`streaming.pipeline_streaming_overlap`), so the caller waits for the first frames of a sentence instead of the whole sentence. Only `pcm` and `wav` bodies are understood; a streamed `wav` is read from its header. `response_timeout_sec` is then the time the endpoint may stay silent between two chunks.
+- `tts_pcm_sample_rate_hz`: rate of a `pcm` body (OpenAI 24000, Fish Speech S2-Pro 44100). A non-integer ratio to the call's rate is resampled with a fractional-phase, stateful resampler so chunk boundaries stay seamless; with `output_resampler: bandlimited` or `fir` the audio is low-passed at the source rate first, so the band above the target is removed instead of folded back.
+- `tts_text_prefix`: put in front of the text of every request unless it is already there.
+- `tts_extra_body`: request-body fields forwarded verbatim. `model`, `input`, `voice`, `response_format` and `stream` are set by the engine and cannot be overridden here; a `tts_extra_body` entry for one of them is ignored with a warning.
+- The OpenAI model and voice fallbacks (an `org/model` name or a Groq voice name is replaced by the provider default) apply only when `tts_base_url` points at an `openai.com` host; a self-hosted endpoint gets the configured model and voice as they are.
+
+An example pipeline lives in `examples/pipelines/fish_s2_vllm_omni.yaml`.
 
 **Vendor fields (LLM).** A provider block describes one endpoint, so any key the engine has no meaning for is treated as a parameter for that endpoint and is forwarded verbatim in the Chat Completions body. Write the vendor's own parameter name directly in the block:
 

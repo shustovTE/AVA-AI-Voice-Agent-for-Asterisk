@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from src.audio import (
+    StreamingResampler,
     convert_pcm16le_to_target_format,
     mulaw_to_pcm16le,
     pcm16le_to_mulaw,
@@ -369,3 +370,91 @@ def test_resample_mono_explicit_args_still_works():
     pcm_8k = b"\x00\x01" * 160
     out, _ = resample_audio(pcm_8k, 8000, 16000, sample_width=2, channels=1)
     assert len(out) == 640
+
+
+# --- StreamingResampler: non-integer ratios, chunk by chunk ---------------------
+
+
+def _tone_pcm16(rate: int, seconds: float, freq: float = 440.0, amplitude: int = 8000) -> bytes:
+    n = int(rate * seconds)
+    samples = amplitude * np.sin(2.0 * np.pi * freq * np.arange(n) / rate)
+    return samples.astype(np.int16).tobytes()
+
+
+def _split(data: bytes, sizes) -> list:
+    chunks, offset = [], 0
+    for size in sizes:
+        chunks.append(data[offset : offset + size])
+        offset += size
+    if offset < len(data):
+        chunks.append(data[offset:])
+    return chunks
+
+
+@pytest.mark.parametrize("mode", ["linear", "bandlimited", "fir"])
+@pytest.mark.parametrize(("source_rate", "target_rate"), [(44100, 8000), (44100, 16000), (24000, 8000), (16000, 8000)])
+def test_streaming_resampler_chunking_does_not_change_the_result(mode, source_rate, target_rate):
+    pcm = _tone_pcm16(source_rate, 0.5)
+
+    whole = StreamingResampler(source_rate, target_rate, mode)
+    expected = whole.process(pcm) + whole.flush()
+
+    chunked = StreamingResampler(source_rate, target_rate, mode)
+    # Uneven chunks, some of them odd-length in samples, one of them tiny.
+    pieces = _split(pcm, [2 * 1000, 2 * 333, 2 * 7, 2 * 4096, 2 * 999, 2 * 1])
+    produced = b"".join(chunked.process(piece) for piece in pieces) + chunked.flush()
+
+    assert len(produced) == len(expected)
+    got = np.frombuffer(produced, dtype=np.int16).astype(np.int32)
+    want = np.frombuffer(expected, dtype=np.int16).astype(np.int32)
+    # Only floating-point rounding of the carried position may differ.
+    assert int(np.max(np.abs(got - want))) <= 1
+
+
+@pytest.mark.parametrize(("source_rate", "target_rate"), [(44100, 8000), (44100, 16000), (22050, 8000)])
+def test_streaming_resampler_output_length_follows_the_ratio_without_drift(source_rate, target_rate):
+    seconds = 3.0
+    pcm = _tone_pcm16(source_rate, seconds)
+    resampler = StreamingResampler(source_rate, target_rate, "linear")
+    produced = b"".join(resampler.process(piece) for piece in _split(pcm, [2 * 441] * 300))
+    produced += resampler.flush()
+    expected_samples = round(len(pcm) // 2 * target_rate / source_rate)
+    assert abs(len(produced) // 2 - expected_samples) <= 1
+
+
+def test_streaming_resampler_bandlimits_before_downsampling():
+    # A 6 kHz tone lies above the 8 kHz target band: linear interpolation folds
+    # it back as a 2 kHz alias, the filtered modes remove it.
+    pcm = _tone_pcm16(44100, 1.0, freq=6000.0)
+    linear = StreamingResampler(44100, 8000, "linear")
+    filtered = StreamingResampler(44100, 8000, "bandlimited")
+    out_linear = np.frombuffer(linear.process(pcm) + linear.flush(), dtype=np.int16).astype(np.float64)
+    out_filtered = np.frombuffer(filtered.process(pcm) + filtered.flush(), dtype=np.int16).astype(np.float64)
+    # Skip the filter's settling time.
+    rms_linear = float(np.sqrt(np.mean(out_linear[800:] ** 2)))
+    rms_filtered = float(np.sqrt(np.mean(out_filtered[800:] ** 2)))
+    assert rms_linear > 2000.0
+    assert rms_filtered < rms_linear / 20.0
+
+
+def test_streaming_resampler_passes_equal_rates_through():
+    pcm = _tone_pcm16(16000, 0.1)
+    resampler = StreamingResampler(16000, 16000, "bandlimited")
+    assert resampler.process(pcm) == pcm
+    assert resampler.flush() == b""
+    assert resampler.filtered is False
+
+
+def test_streaming_resampler_first_output_is_the_first_input_sample():
+    pcm = struct.pack("<8h", 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000)
+    resampler = StreamingResampler(16000, 8000, "linear")
+    out = np.frombuffer(resampler.process(pcm), dtype=np.int16)
+    assert out[0] == 1000
+    assert list(out) == [1000, 3000, 5000, 7000]
+
+
+def test_streaming_resampler_rejects_bad_arguments():
+    with pytest.raises(ValueError):
+        StreamingResampler(0, 8000)
+    with pytest.raises(ValueError):
+        StreamingResampler(16000, 8000, mode="cubic")

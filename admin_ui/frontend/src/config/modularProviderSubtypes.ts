@@ -215,6 +215,9 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
       { key: 'voice', label: 'Voice', type: 'combobox', required: false, default: 'alloy', suggestions: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer'] },
       { key: 'api_key', label: 'API Key', type: 'password', required: true, placeholder: '${OPENAI_API_KEY}' },
       OUTPUT_RESAMPLER_FIELD,
+      { key: 'tts_streaming', label: 'Stream Reply', type: 'boolean', required: false, tooltip: 'Optional, off by default. Sends stream: true and plays the reply while it is still being generated, so the caller waits for the first frames of a sentence instead of the whole sentence. For self-hosted OpenAI-compatible endpoints such as vLLM-Omni; only pcm and wav bodies are understood.' },
+      { key: 'tts_pcm_sample_rate_hz', label: 'PCM Sample Rate (Hz)', type: 'number', required: false, default: 24000, tooltip: 'Rate of a pcm response, which carries no header: OpenAI 24000, Fish Speech S2-Pro on vLLM-Omni 44100. A wav response is read from its header.' },
+      { key: 'tts_text_prefix', label: 'Text Prefix', type: 'text', required: false, placeholder: '<|speaker:0|>', tooltip: 'Optional. Put in front of the text of every request unless already there, e.g. the <|speaker:0|> tag that keeps Fish Speech on the reference voice. Extra request-body fields (stream_format, extra_params) are set in YAML as tts_extra_body.' },
     ],
   },
   {

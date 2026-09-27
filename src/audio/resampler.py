@@ -354,6 +354,109 @@ def resample_audio(
     return resampled.tobytes(), new_state
 
 
+class StreamingResampler:
+    """Stateful PCM16 mono resampler for any rate ratio, fed one chunk at a time.
+
+    ``resample_audio`` is exact for the integer ratios the engine uses towards
+    Asterisk (8 k ↔ 16 k), but a self-hosted TTS that speaks at 44.1 kHz (Fish
+    Speech S2-Pro on vLLM-Omni) has to be brought to 8 or 16 kHz through a
+    non-integer ratio while the reply is still arriving. This resampler keeps
+    the fractional read position between chunks, so the boundary between two
+    chunks is interpolated once and the output sample count never drifts, and
+    in the ``bandlimited`` and ``fir`` modes it low-passes the audio at the
+    source rate before a downsampling step (the Blackman-windowed sinc of the
+    integer path), so what lies above the target band is removed instead of
+    folded back into it. ``linear`` skips the filter. Equal rates pass the
+    bytes through untouched.
+
+    Usage: ``out = r.process(chunk)`` for every chunk, then ``out = r.flush()``
+    once, which drains the filter's delay line.
+    """
+
+    def __init__(self, source_rate: int, target_rate: int, mode: str = "linear") -> None:
+        source_rate = int(source_rate)
+        target_rate = int(target_rate)
+        if source_rate <= 0 or target_rate <= 0:
+            raise ValueError(
+                f"StreamingResampler needs positive rates; got {source_rate} -> {target_rate}"
+            )
+        normalized_mode = str(mode or "linear").strip().lower()
+        if normalized_mode not in RESAMPLE_MODES:
+            raise ValueError(
+                f"Unsupported resample mode {mode!r}; expected 'linear', 'bandlimited' or 'fir'."
+            )
+        self.source_rate = source_rate
+        self.target_rate = target_rate
+        self.mode = normalized_mode
+        self._passthrough = source_rate == target_rate
+        self._step = float(source_rate) / float(target_rate)
+        self._taps: Optional[np.ndarray] = None
+        self._history: Optional[np.ndarray] = None
+        if not self._passthrough and normalized_mode in ("bandlimited", "fir") and target_rate < source_rate:
+            self._taps = _bandlimited_downsample_filter(source_rate, target_rate)
+            self._history = np.zeros(len(self._taps) - 1, dtype=np.float64)
+        # Last input sample of the previous chunk and the position, relative to
+        # it, of the next output sample. None until the first chunk.
+        self._prev: Optional[float] = None
+        self._pos = 0.0
+
+    @property
+    def filtered(self) -> bool:
+        """True when a low-pass filter runs ahead of the interpolation."""
+        return self._taps is not None
+
+    def _filter(self, audio: np.ndarray) -> np.ndarray:
+        if self._taps is None or self._history is None:
+            return audio
+        extended = np.concatenate((self._history, audio))
+        # The symmetric FIR makes np.convolve's coefficient reversal immaterial.
+        filtered = np.convolve(extended, self._taps, mode="valid")
+        self._history = extended[-len(self._history):].copy()
+        return filtered
+
+    def _interpolate(self, audio: np.ndarray) -> np.ndarray:
+        if self._prev is None:
+            extended = audio
+        else:
+            extended = np.concatenate(([self._prev], audio))
+        last_index = len(extended) - 1
+        if last_index < 0:
+            return np.zeros(0, dtype=np.float64)
+        count = int(np.floor((last_index - self._pos) / self._step)) + 1 if self._pos <= last_index else 0
+        if count > 0:
+            positions = self._pos + np.arange(count, dtype=np.float64) * self._step
+            resampled = np.interp(positions, np.arange(len(extended), dtype=np.float64), extended)
+        else:
+            resampled = np.zeros(0, dtype=np.float64)
+        # The next output falls past this chunk: keep its distance from the
+        # last sample, which becomes index 0 of the next extended chunk.
+        self._pos = (self._pos + count * self._step) - last_index
+        self._prev = float(extended[-1])
+        return resampled
+
+    def process(self, pcm_bytes: bytes) -> bytes:
+        """Resample one chunk; the returned length follows the carried phase."""
+        if not pcm_bytes:
+            return b""
+        if self._passthrough:
+            return pcm_bytes
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
+        resampled = self._interpolate(self._filter(audio))
+        if len(resampled) == 0:
+            return b""
+        return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16).tobytes()
+
+    def flush(self) -> bytes:
+        """Drain the filter's delay line at the end of a stream."""
+        if self._passthrough or self._history is None:
+            return b""
+        tail = np.zeros(len(self._history), dtype=np.float64)
+        resampled = self._interpolate(self._filter(tail))
+        if len(resampled) == 0:
+            return b""
+        return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16).tobytes()
+
+
 def convert_pcm16le_to_target_format(pcm_bytes: bytes, target_format: str) -> bytes:
     """
     Convert PCM16 little-endian audio into the target encoding.
