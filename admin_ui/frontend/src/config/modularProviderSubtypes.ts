@@ -213,6 +213,7 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
       { key: 'tts_base_url', label: 'TTS API Base URL', type: 'text', required: false, default: 'https://api.openai.com/v1/audio/speech' },
       { key: 'tts_model', label: 'Model', type: 'combobox', required: false, default: 'tts-1', suggestions: ['tts-1', 'tts-1-hd', 'gpt-4o-mini-tts'] },
       { key: 'voice', label: 'Voice', type: 'combobox', required: false, default: 'alloy', suggestions: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer'] },
+      { key: 'tts_response_format', label: 'Response Format', type: 'combobox', required: false, default: 'wav', suggestions: ['wav', 'pcm'], tooltip: 'The response_format the endpoint is asked for. wav carries its sample rate in a header; pcm is headerless and is read at the PCM Sample Rate below (Fish Speech S2-Pro on vLLM-Omni: pcm at 44100).' },
       { key: 'api_key', label: 'API Key', type: 'password', required: true, placeholder: '${OPENAI_API_KEY}' },
       OUTPUT_RESAMPLER_FIELD,
       { key: 'tts_streaming', label: 'Stream Reply', type: 'boolean', required: false, tooltip: 'Optional, off by default. Sends stream: true and plays the reply while it is still being generated, so the caller waits for the first frames of a sentence instead of the whole sentence. For self-hosted OpenAI-compatible endpoints such as vLLM-Omni; only pcm and wav bodies are understood.' },

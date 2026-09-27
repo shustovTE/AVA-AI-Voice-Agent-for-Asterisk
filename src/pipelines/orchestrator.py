@@ -849,7 +849,7 @@ class PipelineOrchestrator:
         else:
             logger.debug("Ollama LLM adapter disabled by provider configuration")
 
-        self._register_configured_llm_factories()
+        self._register_configured_modular_factories()
 
         # Azure STT adapters
         if self._azure_stt_provider_config:
@@ -895,98 +895,155 @@ class PipelineOrchestrator:
             logger.debug("Azure TTS pipeline adapter not registered - API key unavailable or config missing")
 
 
-    def _register_configured_llm_factories(self) -> None:
-        """Register every supported modular ``*_llm`` provider by its YAML key."""
+    def _register_configured_modular_factories(self) -> None:
+        """Register every modular ``<name>_<role>`` provider block under its own key.
+
+        A block's ``type`` names the adapter and the part of the key in front
+        of the role is the operator's own (``deepseek_llm``, ``fish_tts``), so
+        one config can hold several endpoints of the same kind. Every role
+        accepts ``openai`` (any OpenAI-compatible endpoint) and ``local``; an
+        LLM also accepts ``ollama``, ``google``, ``telnyx`` and ``minimax``.
+        The canonical keys (``openai_tts``, ``local_stt``, ...) are registered
+        by the builtin path, with their base block merged in, and are left as
+        they are. A block that cannot be registered keeps the wildcard
+        placeholder, and the pipeline validation names it.
+        """
         providers = getattr(self.config, "providers", {}) or {}
         if not isinstance(providers, dict):
             return
 
+        registered: list[str] = []
         for name, cfg in providers.items():
             if not isinstance(cfg, dict):
                 continue
+            key = str(name)
             try:
-                role = _extract_role(name)
+                role = _extract_role(key)
             except Exception:
-                continue
-            if role != "llm":
                 continue
             if cfg.get("enabled") is False:
                 continue
             provider_type = str(cfg.get("type", "")).strip().lower()
-            provider_prefix = _extract_provider(str(name))
+            # The builtin path already registered this key from the same block,
+            # with its base block merged in; keep that registration.
+            if key in self._openai_component_configs and provider_type in ("", "openai"):
+                continue
+            if key in self._local_component_configs and provider_type in ("", "local"):
+                continue
+            provider_prefix = _extract_provider(key)
             if not provider_prefix:
                 continue
 
-            payload = dict(cfg)
             try:
-                if provider_type == "openai":
-                    payload["api_key"] = resolve_secret_value(
-                        payload,
-                        file_field="api_key_file",
-                        env_field="api_key_env",
-                        inline_field="api_key",
-                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY",),
-                    )
-                    if not payload["api_key"]:
-                        continue
-                    factory = self._make_openai_llm_factory(
-                        OpenAIProviderConfig(**_with_openai_passthrough(payload))
-                    )
-                elif provider_type == "ollama":
-                    factory = self._make_ollama_llm_factory(payload)
-                elif provider_type == "local":
-                    local_cfg = self._hydrate_local_config(payload, component_key=str(name))
-                    if local_cfg is None:
-                        continue
-                    factory = self._make_local_llm_factory(local_cfg)
-                elif provider_type == "google":
-                    payload["api_key"] = resolve_secret_value(
-                        payload,
-                        file_field="api_key_file",
-                        env_field="api_key_env",
-                        inline_field="api_key",
-                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "GOOGLE_API_KEY"),
-                    )
-                    if not (
-                        payload["api_key"]
-                        or payload.get("credentials_path")
-                        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-                    ):
-                        continue
-                    factory = self._make_google_llm_factory(GoogleProviderConfig(**payload))
-                elif provider_type in {"telnyx", "telenyx"}:
-                    payload["api_key"] = resolve_secret_value(
-                        payload,
-                        file_field="api_key_file",
-                        env_field="api_key_env",
-                        inline_field="api_key",
-                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "TELNYX_API_KEY"),
-                    )
-                    if not payload["api_key"]:
-                        continue
-                    factory = self._make_telnyx_llm_factory(TelnyxLLMProviderConfig(**payload))
-                elif provider_type == "minimax":
-                    payload["api_key"] = resolve_secret_value(
-                        payload,
-                        file_field="api_key_file",
-                        env_field="api_key_env",
-                        inline_field="api_key",
-                        legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "MINIMAX_API_KEY"),
-                    )
-                    if not payload["api_key"]:
-                        continue
-                    factory = self._make_minimax_llm_factory(MiniMaxLLMProviderConfig(**payload))
-                else:
-                    continue
+                factory = self._configured_modular_factory(
+                    key, role, provider_type, provider_prefix, dict(cfg)
+                )
             except Exception:
                 logger.warning(
-                    "Failed to register configured modular LLM",
-                    component=str(name),
+                    "Failed to register configured modular pipeline component",
+                    component=key,
+                    role=role,
                     provider_type=provider_type,
                     exc_info=True,
                 )
                 continue
-            self.register_factory(str(name), factory)
+            if factory is None:
+                continue
+            self.register_factory(key, factory)
+            registered.append(key)
+
+        if registered:
+            logger.info(
+                "Configured modular pipeline adapters registered",
+                components=sorted(registered),
+            )
+
+    def _configured_modular_factory(
+        self,
+        component_key: str,
+        role: str,
+        provider_type: str,
+        provider_prefix: str,
+        payload: Dict[str, Any],
+    ) -> Optional[ComponentFactory]:
+        """Build the factory for one ``<name>_<role>`` block, or ``None`` to leave it unregistered."""
+        if provider_type == "openai":
+            payload["api_key"] = resolve_secret_value(
+                payload,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=(f"{provider_prefix.upper()}_API_KEY",),
+            )
+            if not payload["api_key"]:
+                logger.warning(
+                    "OpenAI-compatible pipeline component requires an API key; using placeholder adapter",
+                    component=component_key,
+                    role=role,
+                )
+                return None
+            config = OpenAIProviderConfig(**_with_openai_passthrough(payload))
+            openai_builders = {
+                "stt": self._make_openai_stt_factory,
+                "llm": self._make_openai_llm_factory,
+                "tts": self._make_openai_tts_factory,
+            }
+            return openai_builders[role](config)
+
+        if provider_type == "local":
+            local_cfg = self._hydrate_local_config(payload, component_key=component_key)
+            if local_cfg is None:
+                return None
+            local_builders = {
+                "stt": self._make_local_stt_factory,
+                "llm": self._make_local_llm_factory,
+                "tts": self._make_local_tts_factory,
+            }
+            return local_builders[role](local_cfg)
+
+        if role != "llm":
+            return None
+
+        if provider_type == "ollama":
+            return self._make_ollama_llm_factory(payload)
+        if provider_type == "google":
+            payload["api_key"] = resolve_secret_value(
+                payload,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "GOOGLE_API_KEY"),
+            )
+            if not (
+                payload["api_key"]
+                or payload.get("credentials_path")
+                or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            ):
+                return None
+            return self._make_google_llm_factory(GoogleProviderConfig(**payload))
+        if provider_type in {"telnyx", "telenyx"}:
+            payload["api_key"] = resolve_secret_value(
+                payload,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "TELNYX_API_KEY"),
+            )
+            if not payload["api_key"]:
+                return None
+            return self._make_telnyx_llm_factory(TelnyxLLMProviderConfig(**payload))
+        if provider_type == "minimax":
+            payload["api_key"] = resolve_secret_value(
+                payload,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=(f"{provider_prefix.upper()}_API_KEY", "MINIMAX_API_KEY"),
+            )
+            if not payload["api_key"]:
+                return None
+            return self._make_minimax_llm_factory(MiniMaxLLMProviderConfig(**payload))
+        return None
 
     def _make_ollama_llm_factory(self, provider_config: Dict[str, Any]) -> ComponentFactory:
         """Create factory for Ollama LLM adapter (self-hosted local models)."""
@@ -1947,6 +2004,37 @@ class PipelineOrchestrator:
             hints.append("Set TELNYX_API_KEY and configure providers.telnyx_llm.")
         elif provider == "minimax":
             hints.append("Set MINIMAX_API_KEY and configure providers.minimax_llm.")
+
+        # A block saved under the component's own key says more than its prefix.
+        providers = getattr(self.config, "providers", {}) or {}
+        block = providers.get(component_key) if isinstance(providers, dict) else None
+        if isinstance(block, dict):
+            block_type = str(block.get("type") or "").strip().lower()
+            env_name = f"{(provider or component_key).upper()}_API_KEY"
+            if block.get("enabled") is False:
+                hints.append(f"providers.{component_key} is disabled (enabled: false).")
+            elif not block_type:
+                hints.append(
+                    f"providers.{component_key} has no type; set type: openai for an "
+                    "OpenAI-compatible endpoint or type: local for the local AI server."
+                )
+            elif block_type == "openai":
+                hints.append(
+                    f"providers.{component_key} (type: openai) needs an api_key (any value for a "
+                    f"self-hosted endpoint that checks none), api_key_file, api_key_env or {env_name}; "
+                    "a startup warning names any other problem with the block."
+                )
+            elif block_type == "local":
+                hints.append(
+                    f"providers.{component_key} (type: local) could not be hydrated; "
+                    "a startup warning names the problem."
+                )
+            elif role in ("stt", "tts"):
+                hints.append(
+                    f"providers.{component_key} has type '{block_type}', which is not registered "
+                    f"as a {role} component under a custom key (openai and local are); "
+                    f"reference the provider's own component key instead."
+                )
 
         hint = f" Hint: {' '.join(hints)}" if hints else ""
         return f"Pipeline '{pipeline_name}' cannot resolve {role} component '{component_key}' (placeholder adapter).{hint}"

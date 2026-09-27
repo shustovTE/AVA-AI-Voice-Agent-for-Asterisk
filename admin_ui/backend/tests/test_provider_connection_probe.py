@@ -366,3 +366,90 @@ async def test_elevenlabs_probe_tells_a_rejected_key_from_a_broken_route(monkeyp
     assert result["success"] is False
     assert "Reached ElevenLabs via proxy http://10.0.0.5:8080" in result["message"]
     assert "HTTP 401" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_openai_probe_of_a_tts_only_block_asks_its_own_host_for_models(monkeypatch):
+    """A speech-only openai block has no chat_base_url; its host, not api.openai.com, is probed.
+
+    The probe used to fall back to api.openai.com/v1/models for such a block
+    and report that vendor's answer (an HTTP 403 from a blocked region, or a
+    401 for the self-hosted token) as the state of the operator's own server.
+    """
+    _FakeHttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
+    saved = {
+        "type": "openai",
+        "capabilities": ["tts"],
+        "tts_base_url": "http://10.0.0.5:8091/v1/audio/speech",
+        "tts_model": "fishaudio/s2-pro",
+    }
+    monkeypatch.setattr(
+        config_api, "_read_merged_config_dict", lambda: {"providers": {"fish_tts": saved}}
+    )
+
+    result = await config_api.test_provider_connection(
+        ProviderTestRequest(name="fish_tts", config={**saved, "api_key": "local"})
+    )
+
+    assert result["success"] is True
+    url, kwargs = _FakeHttpxClient.calls[0]
+    assert url == "http://10.0.0.5:8091/v1/models"
+    assert kwargs["headers"]["Authorization"] == "Bearer local"
+
+
+@pytest.mark.asyncio
+async def test_openai_probe_of_an_stt_only_block_asks_its_own_host_for_models(monkeypatch):
+    _FakeHttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
+    saved = {
+        "type": "openai",
+        "capabilities": ["stt"],
+        "stt_base_url": "https://stt.example/v1/audio/transcriptions/",
+    }
+    monkeypatch.setattr(
+        config_api, "_read_merged_config_dict", lambda: {"providers": {"whisper_stt": saved}}
+    )
+
+    result = await config_api.test_provider_connection(
+        ProviderTestRequest(name="whisper_stt", config={**saved, "api_key": "self-hosted-token"})
+    )
+
+    assert result["success"] is True
+    url, _kwargs = _FakeHttpxClient.calls[0]
+    assert url == "https://stt.example/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_openai_probe_of_an_unsaved_speech_host_never_falls_back_to_openai(monkeypatch):
+    _FakeHttpxClient.calls = []
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeHttpxClient)
+    monkeypatch.setattr(config_api, "_read_merged_config_dict", lambda: {"providers": {}})
+
+    result = await config_api.test_provider_connection(
+        ProviderTestRequest(
+            name="fish_tts",
+            config={
+                "type": "openai",
+                "capabilities": ["tts"],
+                "tts_base_url": "http://10.0.0.5:8091/v1/audio/speech",
+                "api_key": "local",
+            },
+        )
+    )
+
+    assert result["success"] is False
+    assert "tts_base_url" in result["message"]
+    assert _FakeHttpxClient.calls == []
+
+
+def test_openai_probe_base_url_drops_only_the_speech_route():
+    assert config_api._openai_probe_base_url({"chat_base_url": "https://llm.example/v1"}) == "https://llm.example/v1"
+    assert config_api._openai_probe_base_url(
+        {"chat_base_url": "https://llm.example/v1", "tts_base_url": "http://tts.lan/v1/audio/speech"}
+    ) == "https://llm.example/v1"
+    assert config_api._openai_probe_base_url({"tts_base_url": "http://tts.lan:8091/v1/audio/speech"}) == "http://tts.lan:8091/v1"
+    assert config_api._openai_probe_base_url({"stt_base_url": "http://stt.lan/v1/audio/transcriptions"}) == "http://stt.lan/v1"
+    assert config_api._openai_probe_base_url({"tts_base_url": "http://tts.lan:8091/speech"}) == "http://tts.lan:8091/speech"
+    assert config_api._openai_probe_base_url({"tts_base_url": ""}) == ""
+    assert config_api._openai_probe_base_url({}) == ""

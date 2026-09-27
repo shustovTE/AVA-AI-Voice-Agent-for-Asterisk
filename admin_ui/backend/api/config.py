@@ -645,8 +645,38 @@ def _sanitized_http_url(user_url: str) -> str:
     return f"{parsed.scheme}://{netloc}{path}"
 
 
+_OPENAI_SPEECH_ROUTES = ("/audio/speech", "/audio/transcriptions")
+
+
+def _openai_probe_base_url(block: Dict[str, Any]) -> str:
+    """The base URL an OpenAI-compatible block is verified at, as configured.
+
+    A chat block names it directly.  A speech-only block (``fish_tts``,
+    ``whisper_stt``) names only its route, so the ``/audio/speech`` or
+    ``/audio/transcriptions`` tail is dropped and that host's own ``/models``
+    is asked, instead of api.openai.com, where such a block never sends a
+    request.  Returns "" when the block names no endpoint at all.
+    """
+    if not isinstance(block, dict):
+        return ""
+    for key in ("chat_base_url", "base_url"):
+        value = str(block.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("tts_base_url", "stt_base_url"):
+        value = str(block.get(key) or "").strip().rstrip("/")
+        if not value:
+            continue
+        for route in _OPENAI_SPEECH_ROUTES:
+            if value.lower().endswith(route):
+                value = value[: -len(route)]
+                break
+        return value
+    return ""
+
+
 def _saved_provider_base_host(provider_key: str) -> str:
-    """Host of the chat/base URL stored on disk for *provider_key*."""
+    """Host of the endpoint stored on disk for *provider_key* (chat, else speech)."""
     if not provider_key:
         return ""
     try:
@@ -663,8 +693,7 @@ def _saved_provider_base_host(provider_key: str) -> str:
                 break
     if not isinstance(block, dict):
         return ""
-    configured = block.get("chat_base_url") or block.get("base_url") or ""
-    return _url_host(str(configured))
+    return _url_host(_openai_probe_base_url(block))
 
 
 def _verification_base_url(user_url: str, fallback: str, provider_key: str = "") -> str:
@@ -2280,11 +2309,9 @@ async def test_provider_connection(request: ProviderTestRequest):
         # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.) - validate /models
         # ============================================================
         if provider_type == 'openai':
-            configured_chat_base = (
-                provider_config.get('chat_base_url')
-                or provider_config.get('base_url')
-                or ''
-            )
+            # A speech-only block (fish_tts, whisper_stt) has no chat_base_url;
+            # its own host is probed at /models, never api.openai.com.
+            configured_chat_base = _openai_probe_base_url(provider_config)
             chat_base_url = _verification_base_url(
                 configured_chat_base,
                 'https://api.openai.com/v1',
@@ -2294,7 +2321,8 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {
                     "success": False,
                     "message": (
-                        "Cannot verify this endpoint: chat_base_url must be an "
+                        "Cannot verify this endpoint: chat_base_url (or, for a "
+                        "speech-only block, stt_base_url / tts_base_url) must be an "
                         "http(s) URL, and a self-hosted host is only probed once "
                         "the provider is saved with that same host."
                     ),
