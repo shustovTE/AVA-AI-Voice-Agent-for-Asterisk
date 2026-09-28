@@ -154,11 +154,22 @@ The GPU compose file (`docker-compose.gpu.yml`) builds a CUDA-enabled `local_ai_
 > not currently implemented by the Docker deployment path; those hosts must use
 > CPU mode unless they maintain a custom inference server.
 
-The default llama.cpp build remains portable across supported NVIDIA GPUs. If a
-source build fails or you deliberately want to target one GPU generation, set
-`LLAMA_CUDA_ARCHITECTURES` before building (for example `70` for Tesla
-V100/V100S). This is a build-time CMake value, not the number of LLM layers, and
-changing it requires rebuilding `local_ai_server`.
+The image is built on the `nvidia/cuda` CUDA 13.2 / cuDNN 9 pair on Ubuntu 24.04 with
+Python 3.11, which gives the ONNX Runtime (onnx-asr), faster-whisper and llama.cpp
+backends native kernels for Blackwell GPUs (RTX 50xx, RTX PRO 6000, B200); the torch
+backends (Kokoro, MeloTTS, Silero) keep the pinned torch 2.5.1, which has none. Keep the CUDA version at or below the one `nvidia-smi` prints
+for the host driver: `LOCAL_AI_CUDA_VERSION` and `LOCAL_AI_UBUNTU_VERSION` in `.env`
+select another pair. CUDA 13 no longer compiles for Maxwell, Pascal and Volta GPUs
+(compute capability below 7.5, for example a Tesla V100): those hosts set
+`LOCAL_AI_CUDA_VERSION=12.9.1` and `LOCAL_AI_UBUNTU_VERSION=22.04`, and the build
+then installs the last `onnxruntime-gpu` published for CUDA 12.
+
+The default llama.cpp build remains portable across the GPUs the chosen CUDA
+supports. If a source build fails or you deliberately want to target one GPU
+generation, set `LLAMA_CUDA_ARCHITECTURES` before building (for example `120`
+for Blackwell, `75` for a T4, or `70` for a Tesla V100/V100S on the CUDA 12 base).
+This is a build-time CMake value, not the number of LLM layers, and changing it
+requires rebuilding `local_ai_server`.
 
 ```bash
 docker compose -p asterisk-ai-voice-agent \

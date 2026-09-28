@@ -1,5 +1,34 @@
+# --- Base images -----------------------------------------------------------------------------
+# CUDA_VERSION / UBUNTU_VERSION pick the nvidia/cuda pair: <CUDA>-cudnn-devel-ubuntu<UBUNTU> builds the
+# wheels, <CUDA>-cudnn-runtime-ubuntu<UBUNTU> runs them. Keep CUDA_VERSION at or below the CUDA version
+# `nvidia-smi` prints for the host driver (a driver reporting CUDA 13.2 runs 13.2.x images; a 13.4.x image
+# expects a newer driver). Blackwell GPUs (RTX 50xx, RTX PRO 6000, B200: sm_100/sm_120) need CUDA 12.8+
+# and cuDNN 9.7+; older toolkits only reach them through the driver's PTX JIT of kernels built for earlier
+# generations. CUDA 13 dropped Maxwell, Pascal and Volta (compute capability below 7.5): hosts with those
+# GPUs build with CUDA_VERSION=12.9.1 UBUNTU_VERSION=22.04, and the CUDA 12 branches below then pick the
+# last onnxruntime-gpu published for CUDA 12.
+ARG CUDA_VERSION=13.2.1
+ARG UBUNTU_VERSION=24.04
+# Python of the venv. onnxruntime-gpu 1.24+ (the first line with CUDA 12.8 and CUDA 13 builds, both with
+# native Blackwell kernels) needs Python 3.11+, the CPU image already runs 3.11, and Ubuntu 24.04's own
+# 3.12 has no wheels for the tokenizers pinned by the Kokoro/MeloTTS backends. Both stages install it
+# from the deadsnakes PPA (available for Ubuntu 22.04 and 24.04); the PPA key is fetched by fingerprint
+# and checked before use.
+ARG PYTHON_VERSION=3.11
+ARG DEADSNAKES_KEY_FINGERPRINT=F23C5A6CF475977595C89F51BA6932366A755776
+
 # --- Stage 1: Builder (CUDA-enabled dependencies) ---
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG DEADSNAKES_KEY_FINGERPRINT
+# onnxruntime-gpu builds matched to the base image: PyPI packages from 1.27 are built with CUDA 13,
+# the CUDA 12 line on PyPI ends at 1.24.4 (built with CUDA 12.8). Both carry native Blackwell kernels.
+ARG ONNXRUNTIME_GPU_VERSION=1.30.0
+ARG ONNXRUNTIME_GPU_CUDA12_VERSION=1.24.4
+# faster-whisper's ctranslate2 wheels are CUDA 12 builds that load libcublas.so.12 at run time; on a
+# CUDA 13 base that library comes from this wheel (the final stage adds its directory to LD_LIBRARY_PATH).
+ARG CUBLAS_CU12_VERSION=12.9.2.10
 
 # Build args - keep parity with Dockerfile where possible
 ARG INCLUDE_VOSK=true
@@ -18,15 +47,22 @@ ARG MELOTTS_GIT_REF=209145371cff8fc3bd60d7be902ea69cbdb7965a
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# python3-dev: Ubuntu's python3-pip only recommends it, and --no-install-recommends
-# leaves the image without Python.h; T-one's kenlm (source-only on PyPI) and any other
-# package that compiles a C extension need the headers.
+# python3.11-dev: T-one's kenlm (source-only on PyPI) and any other package that compiles a C extension
+# need Python.h; python3.11-venv brings ensurepip for the venv.
 RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get install -y --no-install-recommends ca-certificates curl gpg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DEADSNAKES_KEY_FINGERPRINT}" \
+        | gpg --dearmor -o /etc/apt/keyrings/deadsnakes.gpg && \
+    gpg --show-keys --with-colons /etc/apt/keyrings/deadsnakes.gpg | grep -q "^fpr:*${DEADSNAKES_KEY_FINGERPRINT}:" && \
+    . /etc/os-release && \
+    echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/deadsnakes.list && \
+    apt-get -o Acquire::Retries=5 update && \
     apt-get install -y --no-install-recommends \
-        python3 \
-        python3-venv \
-        python3-pip \
-        python3-dev \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-venv \
+        python${PYTHON_VERSION}-dev \
         build-essential \
         cmake \
         git \
@@ -35,7 +71,7 @@ RUN apt-get -o Acquire::Retries=5 update && \
 WORKDIR /usr/src/app
 
 # Create virtual environment
-RUN python3 -m venv /opt/venv
+RUN python${PYTHON_VERSION} -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV NLTK_DATA="/opt/venv/nltk_data"
 ENV CUDA_HOME=/usr/local/cuda
@@ -70,10 +106,17 @@ RUN if [ "$INCLUDE_SHERPA" = "true" ] || [ "$INCLUDE_ONNX_ASR" = "true" ]; then 
         pip install --no-cache-dir "$SHERPA_REQUIREMENT"; \
     fi
 
+# ctranslate2 (faster-whisper's engine) ships CUDA 12 wheels: it loads libcublas.so.12 at run time and
+# nothing else from the toolkit (cudart is linked in, cuDNN is no longer used). A CUDA 13 base has no
+# libcublas.so.12, so it comes from the nvidia-cublas-cu12 wheel; its soname differs from the CUDA 13
+# cuBLAS the other backends use, so the two never collide.
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
         FASTER_WHISPER_REQUIREMENT="$(grep -m 1 '^faster-whisper==' requirements.txt || true)"; \
         if [ -z "$FASTER_WHISPER_REQUIREMENT" ]; then echo "❌ Missing faster-whisper pin" >&2; exit 1; fi; \
         pip install --no-cache-dir "$FASTER_WHISPER_REQUIREMENT"; \
+        case "$CUDA_VERSION" in \
+            13.*) pip install --no-cache-dir "nvidia-cublas-cu12==${CUBLAS_CU12_VERSION}" ;; \
+        esac; \
     fi
 
 RUN if [ "$INCLUDE_WHISPER_CPP" = "true" ]; then \
@@ -85,7 +128,9 @@ RUN if [ "$INCLUDE_TONE" = "true" ]; then \
     fi
 
 # onnx-asr: GigaAM v3 / NeMo FastConformer RU offline STT (ONNX Runtime, models fetched from Hugging Face).
-# The pin lives in requirements.txt; the extra picks the CUDA onnxruntime (cuDNN 9 is in the base image) and the hub downloader.
+# The pin lives in requirements.txt; the extra picks the CUDA onnxruntime and the hub downloader. onnxruntime-gpu
+# is installed first, pinned to the build made for this base image (see ONNXRUNTIME_GPU_*_VERSION above), so the
+# extra's open range cannot pull a wheel built for the other CUDA major; cuDNN 9 and cuBLAS come from the base image.
 RUN if [ "$INCLUDE_ONNX_ASR" = "true" ]; then \
         echo "📦 Installing onnx-asr STT (GigaAM v3 / NeMo)..." && \
         ONNX_ASR_REQUIREMENT="$(grep -m 1 '^onnx-asr==' requirements.txt || true)"; \
@@ -93,6 +138,12 @@ RUN if [ "$INCLUDE_ONNX_ASR" = "true" ]; then \
             echo "❌ INCLUDE_ONNX_ASR=true but requirements.txt has no onnx-asr entry" >&2; \
             exit 1; \
         fi; \
+        case "$CUDA_VERSION" in \
+            13.*) ONNXRUNTIME_SPEC="onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" ;; \
+            12.*) ONNXRUNTIME_SPEC="onnxruntime-gpu==${ONNXRUNTIME_GPU_CUDA12_VERSION}" ;; \
+            *) echo "❌ No onnxruntime-gpu build is known for CUDA_VERSION=${CUDA_VERSION}" >&2; exit 1 ;; \
+        esac; \
+        pip install --no-cache-dir "$ONNXRUNTIME_SPEC" && \
         ONNX_ASR_SPEC="$(printf '%s' "$ONNX_ASR_REQUIREMENT" | sed 's/^onnx-asr==/onnx-asr[gpu,hub]==/')"; \
         pip install --no-cache-dir "$ONNX_ASR_SPEC"; \
     fi
@@ -101,6 +152,11 @@ RUN if [ "$INCLUDE_PIPER" = "true" ]; then \
         pip install --no-cache-dir piper-tts==1.2.0; \
     fi
 
+# The torch backends (Kokoro, MeloTTS, Silero) use the torch pinned in requirements.txt with the CUDA
+# libraries bundled in its wheel, independent of the base image. torch 2.5.1 carries no Blackwell kernels
+# and its bundled cuDNN is a CUDA 12 build: in one process with onnxruntime-gpu (onnx_asr STT), the
+# first cuDNN loaded serves both. Raise the torch/torchaudio pins together when those backends must
+# run on Blackwell or beside onnx_asr on a CUDA 13 image.
 RUN if [ "$INCLUDE_KOKORO" = "true" ]; then \
         KOKORO_REQUIREMENT="$(grep -m 1 '^kokoro==' requirements.txt || true)"; \
         TORCH_REQUIREMENT="$(grep -m 1 '^torch==' requirements.txt || true)"; \
@@ -182,20 +238,34 @@ RUN if [ "$INCLUDE_KOKORO" = "true" ]; then \
     fi
 
 # --- Stage 2: Final Runtime Image (CUDA runtime) ---
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION}
+ARG PYTHON_VERSION
+ARG DEADSNAKES_KEY_FINGERPRINT
 
 # Build argument to optionally include Kroko embedded server
 ARG INCLUDE_KROKO_EMBEDDED=false
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install runtime dependencies
-RUN apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-venv \
+# Install runtime dependencies: the venv's interpreter from the same deadsnakes PPA as the builder
+# (the venv links to /usr/bin/python3.11) and the audio/system libraries. Ubuntu 24.04 renamed
+# libasound2 to libasound2t64; the shell picks whichever the release ships.
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get install -y --no-install-recommends ca-certificates curl gpg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DEADSNAKES_KEY_FINGERPRINT}" \
+        | gpg --dearmor -o /etc/apt/keyrings/deadsnakes.gpg && \
+    gpg --show-keys --with-colons /etc/apt/keyrings/deadsnakes.gpg | grep -q "^fpr:*${DEADSNAKES_KEY_FINGERPRINT}:" && \
+    . /etc/os-release && \
+    echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/deadsnakes.list && \
+    apt-get -o Acquire::Retries=5 update && \
+    ALSA_PACKAGE="$(apt-cache show libasound2t64 >/dev/null 2>&1 && echo libasound2t64 || echo libasound2)" && \
+    apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
     tzdata \
     libsndfile1 \
-    libasound2 \
+    "$ALSA_PACKAGE" \
     libportaudio2 \
     libgomp1 \
     libatomic1 \
@@ -203,6 +273,10 @@ RUN apt-get -o Acquire::Retries=5 update && apt-get install -y --no-install-reco
     wget \
     espeak-ng \
     && rm -rf /var/lib/apt/lists/*
+
+# faster-whisper's ctranslate2 loads the CUDA 12 cuBLAS from the nvidia-cublas-cu12 wheel (see the builder
+# stage); the directory is simply absent in builds without it or on a CUDA 12 base.
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python${PYTHON_VERSION}/site-packages/nvidia/cublas/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 # Optional: Install Kroko ONNX server for embedded mode
 ARG ONNX_RUNTIME_SHA256="89b153af88746665909c758a06797175ae366280cbf25502c41eb5955f9a555e"

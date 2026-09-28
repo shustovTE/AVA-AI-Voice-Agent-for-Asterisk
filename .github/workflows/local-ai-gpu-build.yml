@@ -26,6 +26,17 @@ jobs:
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The default CUDA 13 pair and the CUDA 12 pair kept for Maxwell/Pascal/Volta hosts
+        # (see the ARG block at the top of local_ai_server/Dockerfile.gpu).
+        include:
+          - cuda_version: "13.2.1"
+            ubuntu_version: "24.04"
+          - cuda_version: "12.9.1"
+            ubuntu_version: "22.04"
+    name: Build CUDA ${{ matrix.cuda_version }} image
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -39,21 +50,25 @@ jobs:
 
       - name: Build CUDA Local AI image
         run: |
-          # Keep the clean-runner smoke build bounded. Production builds remain
-          # portable unless LLAMA_CUDA_ARCHITECTURES is configured.
+          # Keep the clean-runner smoke build bounded: one architecture (Turing, the oldest
+          # CUDA 13 still compiles for). Production builds remain portable unless
+          # LLAMA_CUDA_ARCHITECTURES is configured.
           docker build \
             --file local_ai_server/Dockerfile.gpu \
             --tag local-ai-server-gpu:${{ github.sha }} \
+            --build-arg CUDA_VERSION=${{ matrix.cuda_version }} \
+            --build-arg UBUNTU_VERSION=${{ matrix.ubuntu_version }} \
             --build-arg INCLUDE_VOSK=false \
             --build-arg INCLUDE_SHERPA=false \
             --build-arg INCLUDE_FASTER_WHISPER=true \
             --build-arg INCLUDE_WHISPER_CPP=false \
+            --build-arg INCLUDE_ONNX_ASR=true \
             --build-arg INCLUDE_PIPER=false \
             --build-arg INCLUDE_KOKORO=true \
             --build-arg INCLUDE_MELOTTS=false \
             --build-arg INCLUDE_SILERO=false \
             --build-arg INCLUDE_LLAMA=true \
-            --build-arg LLAMA_CUDA_ARCHITECTURES=70 \
+            --build-arg LLAMA_CUDA_ARCHITECTURES=75 \
             --build-arg INCLUDE_KROKO_EMBEDDED=false \
             local_ai_server
 
@@ -62,9 +77,19 @@ jobs:
           docker run --rm local-ai-server-gpu:${{ github.sha }} \
             bash -ec '
               python -c "import faster_whisper, kokoro, importlib.util; assert importlib.util.find_spec(\"llama_cpp\"); print(\"GPU-independent imports succeed and llama_cpp is packaged\")"
-              LLAMA_LIB="$(find /opt/venv/lib/python3.10/site-packages/llama_cpp/lib -name "libllama.so" -print -quit)"
+              LLAMA_LIB="$(find /opt/venv/lib/python3.11/site-packages/llama_cpp/lib -name "libllama.so" -print -quit)"
               test -n "$LLAMA_LIB"
               ldd "$LLAMA_LIB" | tee /tmp/llama-ldd.txt
               grep -q "libcuda.so.1" /tmp/llama-ldd.txt
               echo "llama_cpp shared library is packaged with CUDA linkage"
+              # onnxruntime-gpu built for this CUDA major: every toolkit library its CUDA provider
+              # needs resolves inside the image (only the driver's libcuda.so.1 is absent on a GPU-less runner).
+              python -c "import onnxruntime as ort; assert \"CUDAExecutionProvider\" in ort.get_available_providers(), ort.get_available_providers(); print(\"onnxruntime-gpu\", ort.__version__)"
+              ORT_CUDA="$(find /opt/venv/lib/python3.11/site-packages/onnxruntime/capi -name "libonnxruntime_providers_cuda.so" -print -quit)"
+              test -n "$ORT_CUDA"
+              ldd "$ORT_CUDA" | tee /tmp/ort-ldd.txt
+              ! grep "not found" /tmp/ort-ldd.txt | grep -v "libcuda.so.1"
+              echo "onnxruntime CUDA provider links against the image toolkit"
+              # ctranslate2 (faster-whisper) loads the CUDA 12 cuBLAS by name at run time.
+              python -c "import ctypes; ctypes.CDLL(\"libcublas.so.12\"); print(\"libcublas.so.12 is loadable for ctranslate2\")"
             '

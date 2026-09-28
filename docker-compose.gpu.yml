@@ -37,6 +37,12 @@ services:
       dockerfile: Dockerfile.gpu
       network: host
       args:
+        # nvidia/cuda base image pair (cudnn-devel for the build, cudnn-runtime for the container). Keep
+        # the CUDA version at or below what `nvidia-smi` reports for the driver; CUDA 13 dropped GPUs older
+        # than Turing (compute capability < 7.5), those hosts build with 12.9.1 on Ubuntu 22.04. Defaults
+        # are pinned in Dockerfile.gpu.
+        - CUDA_VERSION=${LOCAL_AI_CUDA_VERSION:-13.2.1}
+        - UBUNTU_VERSION=${LOCAL_AI_UBUNTU_VERSION:-24.04}
         - INCLUDE_VOSK=${INCLUDE_VOSK:-true}
         - INCLUDE_SHERPA=${INCLUDE_SHERPA:-true}
         # On GPU builds, include Whisper backends by default so UI switching works out of the box.
@@ -49,8 +55,9 @@ services:
         - INCLUDE_MELOTTS=${INCLUDE_MELOTTS:-false}
         - INCLUDE_SILERO=${INCLUDE_SILERO:-false}
         - INCLUDE_LLAMA=${INCLUDE_LLAMA:-true}
-        # Optional semicolon-separated CMake CUDA architecture list (for
-        # example, 70 for Tesla V100). Unset preserves the portable build.
+        # Optional semicolon-separated CMake CUDA architecture list (for example
+        # 120 for Blackwell, 89 for Ada, 75 for a T4; 70 for Tesla V100 needs the
+        # CUDA 12 base). Unset preserves the portable build.
         - LLAMA_CUDA_ARCHITECTURES=${LLAMA_CUDA_ARCHITECTURES:-}
         - INCLUDE_KROKO_EMBEDDED=${INCLUDE_KROKO_EMBEDDED:-false}
         # When INCLUDE_KROKO_EMBEDDED=true, you must also set KROKO_SERVER_SHA256 in .env
