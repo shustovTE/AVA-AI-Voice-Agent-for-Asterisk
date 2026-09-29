@@ -640,6 +640,9 @@ class Engine:
         self._outbound_scheduler_task: Optional[asyncio.Task] = None
         self._vicidial_action_retry_task: Optional[asyncio.Task] = None
         self._retention_cleanup_task: Optional[asyncio.Task] = None
+        self._session_reconcile_task: Optional[asyncio.Task] = None
+        self._orphan_first_seen: Dict[str, float] = {}
+        self._destroyed_channel_ts: Dict[str, float] = {}
         # Warm/probe task for a local default provider (breaks the readiness
         # deadlock: LocalProvider opens its WS lazily on the first call, so
         # without this /ready -> is_connected() would never flip True until a
@@ -1506,6 +1509,12 @@ class Engine:
                 self._retention_cleanup_task = asyncio.create_task(self._retention_cleanup_loop())
         except Exception:
             logger.debug("Failed to start retention cleanup task", exc_info=True)
+        # Session reconciliation: drop sessions whose channel is gone from Asterisk.
+        try:
+            if not self._session_reconcile_task:
+                self._session_reconcile_task = asyncio.create_task(self._session_reconcile_loop())
+        except Exception:
+            logger.debug("Failed to start session reconciliation task", exc_info=True)
         # Local default-provider warm/probe: connect proactively so /ready can
         # become true without a prior call (no-op for non-local defaults).
         try:
@@ -4163,6 +4172,7 @@ class Engine:
             "_local_warm_task",
             "_pipeline_readiness_task",
             "_retention_cleanup_task",
+            "_session_reconcile_task",
             "_vicidial_action_retry_task",
         ):
             try:
@@ -6249,6 +6259,22 @@ class Engine:
                        channel_id=caller_channel_id, 
                        bridge_id=bridge_id)
             self.bridges[caller_channel_id] = bridge_id
+
+            if self._call_setup_aborted(caller_channel_id):
+                # The caller hung up while the bridge was being built: its cleanup
+                # found no session and will not run again, so a session created now
+                # would never be removed.
+                logger.info(
+                    "🎯 HYBRID ARI - Call ended during setup; not creating a session",
+                    channel_id=caller_channel_id,
+                    bridge_id=bridge_id,
+                )
+                try:
+                    await self.ari_client.destroy_bridge(bridge_id)
+                except Exception:
+                    logger.debug("Bridge teardown after aborted setup failed", bridge_id=bridge_id, exc_info=True)
+                self.bridges.pop(caller_channel_id, None)
+                return
             
             # Create CallSession and store in SessionStore
             session = CallSession(
@@ -6629,6 +6655,16 @@ class Engine:
                 )
             except Exception:
                 logger.debug("Failed to emit RCA_CALL_START", call_id=caller_channel_id, exc_info=True)
+
+            if self._call_setup_aborted(caller_channel_id):
+                # Cleanup is already tearing this call down (the caller hung up during
+                # setup); a media leg originated now would attach to nothing and its
+                # late session writes would resurrect the session after cleanup.
+                logger.info(
+                    "🎯 HYBRID ARI - Call ended during setup; not creating media legs",
+                    channel_id=caller_channel_id,
+                )
+                return
             
             # Step 5: Create ExternalMedia channel or originate Local channel
             if self.config.audio_transport == "externalmedia":
@@ -6839,6 +6875,15 @@ class Engine:
             await self._stop_connection_audio(
                 session,
                 reason="audiosocket-bridge-missing",
+            )
+            await self.ari_client.hangup_channel(audiosocket_channel_id)
+            return
+
+        if self._call_setup_aborted(caller_channel_id):
+            logger.info(
+                "🎯 HYBRID ARI - Call ended before the AudioSocket leg attached; hanging it up",
+                audiosocket_channel_id=audiosocket_channel_id,
+                caller_channel_id=caller_channel_id,
             )
             await self.ari_client.hangup_channel(audiosocket_channel_id)
             return
@@ -9871,6 +9916,12 @@ class Engine:
                 caller_channel_id=caller_channel_id,
             )
             raise RuntimeError("AudioSocket configuration missing")
+        if self._call_setup_aborted(caller_channel_id):
+            logger.info(
+                "🎯 HYBRID ARI - Call ended before the AudioSocket leg was originated; skipping",
+                caller_channel_id=caller_channel_id,
+            )
+            return
 
         audio_uuid = str(uuid.uuid4())
         bind_host = self.config.audiosocket.host or "127.0.0.1"
@@ -9958,6 +10009,209 @@ class Engine:
         except Exception as exc:
             logger.error("Error handling StasisEnd", error=str(exc), exc_info=True)
 
+    # ----------------------------------------------------------------------------
+    # Ghost-session defences. The StasisStart handler runs as its own task; when the
+    # caller hangs up in the first few hundred milliseconds, ChannelDestroyed and
+    # its cleanup race the setup steps that are still building the bridge and the
+    # media legs. Setup must stop as soon as cleanup has begun, and a session whose
+    # channel is gone must never outlive it.
+    # ----------------------------------------------------------------------------
+    _DESTROYED_CHANNEL_MEMORY_SECONDS = 900.0
+    _DESTROYED_CHANNEL_MAX_ENTRIES = 5000
+
+    def _note_channel_destroyed(self, channel_id: str) -> None:
+        """Remember a destroyed channel id for a while so a StasisStart handler that
+        is still running for it can see the call is over."""
+        import time as _time
+
+        store = getattr(self, "_destroyed_channel_ts", None)
+        if store is None:
+            store = self._destroyed_channel_ts = {}
+        now = _time.time()
+        store[channel_id] = now
+        if len(store) > self._DESTROYED_CHANNEL_MAX_ENTRIES:
+            cutoff = now - self._DESTROYED_CHANNEL_MEMORY_SECONDS
+            for cid in [c for c, ts in store.items() if ts < cutoff]:
+                store.pop(cid, None)
+            overflow = len(store) - self._DESTROYED_CHANNEL_MAX_ENTRIES
+            if overflow > 0:
+                for cid, _ts in sorted(store.items(), key=lambda kv: kv[1])[:overflow]:
+                    store.pop(cid, None)
+
+    def _call_setup_aborted(self, call_id: str) -> bool:
+        """True once the call is over from the engine's point of view: its channel was
+        destroyed, or cleanup for it has started or finished. Call setup checks this
+        after each await and stops building media legs for a dead channel; the late
+        writes of those steps are what resurrected sessions after cleanup."""
+        if not call_id:
+            return False
+        if call_id in _cleanup_in_progress or call_id in _cleanup_completed_at:
+            return True
+        destroyed = getattr(self, "_destroyed_channel_ts", None) or {}
+        if call_id in destroyed:
+            return True
+        store = getattr(self, "session_store", None)
+        checker = getattr(store, "is_tombstoned", None)
+        return bool(checker and checker(call_id))
+
+    @staticmethod
+    def _session_reconcile_settings() -> tuple:
+        """(interval, grace, force_after) in seconds from the environment."""
+
+        def _read(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        return (
+            _read("AAVA_SESSION_RECONCILE_INTERVAL_SECONDS", 60.0),
+            _read("AAVA_SESSION_ORPHAN_GRACE_SECONDS", 30.0),
+            _read("AAVA_SESSION_ORPHAN_FORCE_SECONDS", 600.0),
+        )
+
+    async def _session_reconcile_loop(self) -> None:
+        """Periodically drop call sessions whose caller channel no longer exists in
+        Asterisk. Sessions live only in this process and are removed by the end
+        events of their channel; an event lost across an ARI reconnect, a cleanup
+        that hangs on a provider, or a late write that resurrects a removed session
+        otherwise leaves a call the dashboard shows as active forever, and that
+        blocks the engine restart button. Disabled with
+        AAVA_SESSION_RECONCILE_INTERVAL_SECONDS<=0."""
+        try:
+            interval, _grace, _force = self._session_reconcile_settings()
+            if interval <= 0:
+                logger.info("Session reconciliation disabled (AAVA_SESSION_RECONCILE_INTERVAL_SECONDS<=0)")
+                return
+            await asyncio.sleep(min(interval, 60.0))
+            while True:
+                try:
+                    await self._session_reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("Session reconciliation pass failed", exc_info=True)
+                interval, _grace, _force = self._session_reconcile_settings()
+                await asyncio.sleep(max(5.0, interval))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Session reconciliation loop exited", exc_info=True)
+
+    async def _session_reconcile_once(self) -> int:
+        """One reconciliation pass; returns the number of sessions removed.
+
+        A session older than the grace period whose caller channel answers 404 for
+        a whole grace period is an orphan. What happens next depends on how it got
+        there: a session that never saw cleanup (its end event was lost) gets the
+        normal cleanup, history and post-call work included; a session that already
+        went through cleanup and came back (a late write resurrected it) is removed
+        outright, because its cleanup work already happened once; a session whose
+        cleanup is still running is left alone until AAVA_SESSION_ORPHAN_FORCE_SECONDS
+        have passed, then removed so the dashboard stops counting it.
+        """
+        import time as _time
+
+        ari = getattr(self, "ari_client", None)
+        if not ari or not getattr(ari, "running", False):
+            return 0
+        _interval, grace, force_after = self._session_reconcile_settings()
+        seen = getattr(self, "_orphan_first_seen", None)
+        if seen is None:
+            seen = self._orphan_first_seen = {}
+        now = _time.time()
+        removed = 0
+        sessions = await self.session_store.get_all_sessions()
+        live_ids = {s.call_id for s in sessions}
+        for cid in [c for c in seen if c not in live_ids]:
+            seen.pop(cid, None)
+        for session in sessions:
+            call_id = session.call_id
+            created_at = float(getattr(session, "created_at", 0.0) or 0.0)
+            if created_at and (now - created_at) < grace:
+                continue
+            channel_id = getattr(session, "caller_channel_id", None) or call_id
+            try:
+                resp = await ari.send_command("GET", f"channels/{channel_id}", tolerate_statuses=[404])
+            except Exception:
+                logger.debug("Session reconciliation: channel lookup failed", call_id=call_id, exc_info=True)
+                continue
+            status = resp.get("status") if isinstance(resp, dict) else None
+            if status != 404:
+                # The channel exists (a channel document comes back without "status")
+                # or ARI failed transiently: neither is evidence of an orphan.
+                seen.pop(call_id, None)
+                continue
+            first_seen = seen.setdefault(call_id, now)
+            if (now - first_seen) < grace:
+                continue
+            if await self._reap_orphaned_session(
+                session,
+                reason="caller channel is gone from Asterisk",
+                orphaned_for=now - first_seen,
+                force_after=force_after,
+            ):
+                removed += 1
+                seen.pop(call_id, None)
+        return removed
+
+    async def _reap_orphaned_session(
+        self,
+        session: "CallSession",
+        *,
+        reason: str,
+        orphaned_for: float = 0.0,
+        force_after: Optional[float] = None,
+        force: bool = False,
+    ) -> bool:
+        """Remove one orphaned session the right way for how it got orphaned (see
+        ``_session_reconcile_once``). Returns True when the session is gone."""
+        import time as _time
+
+        call_id = session.call_id
+        created_at = float(getattr(session, "created_at", 0.0) or 0.0)
+        age = round(_time.time() - created_at, 1) if created_at else None
+        cleanup_running = call_id in _cleanup_in_progress
+        went_through_cleanup = bool(getattr(session, "cleanup_in_progress", False))
+        details = dict(
+            call_id=call_id,
+            caller_channel_id=getattr(session, "caller_channel_id", None),
+            status=getattr(session, "status", None),
+            conversation_state=getattr(session, "conversation_state", None),
+            provider=getattr(session, "provider_name", None),
+            pipeline=getattr(session, "pipeline_name", None),
+            is_outbound=bool(getattr(session, "is_outbound", False)),
+            age_seconds=age,
+            orphaned_for_seconds=round(orphaned_for, 1),
+            reason=reason,
+        )
+        if cleanup_running:
+            if force or (force_after is not None and orphaned_for >= force_after):
+                logger.error("Orphaned call session: cleanup has been running too long, removing the session", **details)
+                await self.session_store.remove_call(call_id, tombstone=True)
+                return True
+            logger.warning("Orphaned call session: cleanup still running, leaving it for now", **details)
+            return False
+        if went_through_cleanup:
+            # Cleanup already ran to its end for this object (history, emails, post-call
+            # tools) and something wrote the session back afterwards. Do not run all
+            # of that twice: just drop it.
+            logger.error("Orphaned call session was resurrected after its cleanup; removing it", **details)
+            await self.session_store.remove_call(call_id, tombstone=True)
+            return True
+        logger.warning("Orphaned call session never saw cleanup; running cleanup now", **details)
+        try:
+            await self._cleanup_call(call_id, ignore_ttl_guard=True)
+        except Exception:
+            logger.debug("Orphaned call session: cleanup failed", call_id=call_id, exc_info=True)
+        if await self.session_store.get_by_call_id(call_id) is None:
+            return True
+        if call_id in _cleanup_in_progress and not force:
+            return False
+        logger.error("Orphaned call session survived cleanup; removing it", **details)
+        await self.session_store.remove_call(call_id, tombstone=True)
+        return True
+
     async def _handle_channel_destroyed(self, event: dict):
         """Clean up when a channel is destroyed."""
         try:
@@ -9967,6 +10221,7 @@ class Engine:
                 return
             # Remove from pre-stasis tracking if present
             self._pre_stasis_channels.discard(channel_id)
+            self._note_channel_destroyed(channel_id)
             # An originated AudioSocket leg can fail before StasisStart attaches
             # it to the session. At that point the pending map is the only link
             # back to the caller, so consume it here and end setup ringback.
@@ -10370,9 +10625,17 @@ class Engine:
             logger.debug("ChannelTalkingFinished handler failed", ari_event=event, exc_info=True)
 
     async def _cleanup_call(
-        self, channel_or_call_id: str, *, force_caller_hangup: bool = False
+        self,
+        channel_or_call_id: str,
+        *,
+        force_caller_hangup: bool = False,
+        ignore_ttl_guard: bool = False,
     ) -> None:
-        """Shared cleanup for StasisEnd/ChannelDestroyed paths."""
+        """Shared cleanup for StasisEnd/ChannelDestroyed paths.
+
+        ``ignore_ttl_guard`` lets the session reconciler and the operator endpoint
+        clean a call whose earlier cleanup is still within the dedupe window.
+        """
         resolved_call_id = None  # Track for finally block cleanup
         cleanup_owned = False
         try:
@@ -10454,7 +10717,7 @@ class Engine:
                 now = _time.time()
                 ttl = float(os.getenv("AAVA_CLEANUP_COMPLETED_TTL_SECONDS", "900") or "900")
                 last_done = _cleanup_completed_at.get(call_id)
-                if last_done and (now - float(last_done)) < ttl:
+                if last_done and (now - float(last_done)) < ttl and not ignore_ttl_guard:
                     logger.debug("Cleanup already completed (ttl guard)", call_id=call_id)
                     return
                 # Prune old entries opportunistically.
@@ -10985,8 +11248,12 @@ class Engine:
                 logger.debug("Final call history transcript sync failed", call_id=call_id, exc_info=True)
             getattr(self, "_call_history_persisted", set()).discard(call_id)
 
-            # Finally remove the session.
-            await self.session_store.remove_call(call_id)
+            # Finally remove the session. The tombstone makes the store refuse a late
+            # upsert of this object: a pipeline task, a coordinator timer or an
+            # AudioSocket bind finishing after this point would otherwise put the
+            # session back with no channel behind it, and nothing would ever remove
+            # it again (Asterisk sends no further events for a destroyed channel).
+            await self.session_store.remove_call(call_id, tombstone=True)
 
             # Best-effort cleanup of attended transfer agent channel mappings for this call.
             try:
@@ -22563,6 +22830,7 @@ class Engine:
             # (similar to /mcp/status) and should not include secrets or PII.
             app.router.add_get('/tools/definitions', self._tools_definitions_handler)
             app.router.add_get('/sessions/stats', self._sessions_stats_handler)
+            app.router.add_post('/sessions/{call_id}/cleanup', self._session_cleanup_handler)
             app.router.add_get('/config/state', self._config_state_handler)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -22672,6 +22940,42 @@ class Engine:
         except Exception as exc:
             logger.debug("Sessions stats handler failed", error=str(exc), exc_info=True)
             return web.json_response({"active_calls": 0, "error": "internal_error"}, status=500)
+
+    async def _session_cleanup_handler(self, request):
+        """POST /sessions/{call_id}/cleanup: end one call session by hand.
+
+        For an operator who sees a call on the dashboard that no longer exists in
+        Asterisk. Runs the same path as the reconciler: normal cleanup for a session
+        that never saw it, plain removal for one that was resurrected after its
+        cleanup; ``?force=1`` also removes a session whose cleanup is still running.
+        SECURITY: Requires localhost or HEALTH_API_TOKEN.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"ok": False, "error": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        call_id = str(request.match_info.get("call_id") or "").strip()
+        if not call_id:
+            return web.json_response({"ok": False, "error": "call_id required"}, status=400)
+        force = str(request.query.get("force", "")).strip().lower() in ("1", "true", "yes")
+        try:
+            session = await self.session_store.get_by_call_id(call_id)
+            if session is None:
+                return web.json_response({"ok": False, "error": "no such session", "call_id": call_id}, status=404)
+            removed = await self._reap_orphaned_session(session, reason="operator request", force=force)
+            return web.json_response(
+                {
+                    "ok": removed,
+                    "call_id": call_id,
+                    "removed": removed,
+                    "cleanup_running": call_id in _cleanup_in_progress,
+                },
+                status=200 if removed else 409,
+            )
+        except Exception as exc:
+            logger.error("Session cleanup handler failed", call_id=call_id, error=str(exc), exc_info=True)
+            return web.json_response({"ok": False, "error": "internal_error", "call_id": call_id}, status=500)
 
     async def _mcp_status_handler(self, request):
         """Return MCP server/tool status for Admin UI (sanitized)."""

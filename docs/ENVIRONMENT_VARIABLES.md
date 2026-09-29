@@ -77,6 +77,15 @@ If you’re not sure, start without these; use `agent check` and `docs/Transport
 - `HEALTH_CHECK_AI_ENGINE_URL`: optional authoritative Admin UI probe target for Tier-3 / non-host-network deployments. When set, discovery fallbacks are not attempted.
 - `HEALTH_CHECK_LOCAL_AI_URL`: optional authoritative Admin UI Local AI Server probe target. When set, discovery fallbacks are not attempted.
 
+### Call session reconciliation (ai_engine)
+
+Call sessions live in the engine's memory and end with the Asterisk events of their channel. A session can outlive its channel when an end event is lost across an ARI reconnect, when cleanup hangs on a provider, or when a late write puts a cleaned-up session back; the dashboard then shows a call that no longer exists and refuses to restart the engine. The engine now reconciles sessions against Asterisk:
+
+- `AAVA_SESSION_RECONCILE_INTERVAL_SECONDS` (default `60`, `0` disables): how often every session older than the grace period is checked against ARI `GET /channels/{id}`.
+- `AAVA_SESSION_ORPHAN_GRACE_SECONDS` (default `30`): a session is left alone while younger than this, and its channel must answer 404 for this long before the session counts as an orphan. An orphan that never saw cleanup gets the normal cleanup (history, post-call tools); one that was resurrected after its cleanup is removed outright.
+- `AAVA_SESSION_ORPHAN_FORCE_SECONDS` (default `600`): an orphan whose cleanup is still running is removed anyway after this long.
+- `POST /sessions/{call_id}/cleanup` on the health server (localhost or `HEALTH_API_TOKEN`) ends one session by hand the same way; `?force=1` also removes a session whose cleanup is still running. `GET /sessions/stats` now reports each session's `age_seconds`, `caller_channel_id`, `is_outbound` and `cleanup_in_progress`.
+
 ### Live-status dashboard
 
 - `LIVE_STATUS_PUSH_TOKEN`: bearer token `ai_engine` / `local_ai_server` supply when pushing component updates to `POST /api/live-status/publish`. Falls back to `HEALTH_API_TOKEN` if unset; if neither is set the publish endpoint returns `503`.

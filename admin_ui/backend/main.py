@@ -150,7 +150,7 @@ Most endpoints require JWT authentication. Obtain a token via `POST /api/auth/lo
 
 | Service | Endpoints |
 |---------|-----------|
-| **AI Engine Health Server** (port 15000) | `/health`, `/metrics`, `/live`, `/ready`, `/reload` |
+| **AI Engine Health Server** (port 15000) | `/health`, `/metrics`, `/live`, `/ready`, `/reload`, `/sessions/stats`, `/sessions/{call_id}/cleanup` |
 """,
     version="7.5.5",
     docs_url="/docs" if _enable_api_docs else None,
