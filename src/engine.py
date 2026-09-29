@@ -3640,6 +3640,12 @@ class Engine:
         previous_channel_id = str(meta.get("channel_id") or "")
         meta = dict(meta)
         meta["channel_id"] = channel_id
+        # The answer is the start of what the callee heard: a drop after it is
+        # recorded in call history with a duration measured from here.
+        if not meta.get("answered_at_ts"):
+            import time as _time
+
+            meta["answered_at_ts"] = _time.time()
         self._outbound_attempt_meta_by_attempt_id[attempt_id] = meta
         if previous_channel_id and previous_channel_id != channel_id:
             self._outbound_attempt_meta_by_channel_id.pop(
@@ -4012,7 +4018,26 @@ class Engine:
                 outcome = "no_answer"
 
             hangup_cause = str(event.get("cause_txt") or cause_txt or cause or "") or None
+
+            # The callee answered and the line dropped before the agent session
+            # existed (the operator's side hangs up right after AMD): the call
+            # deserves the same history row an answered call gets, with the lead's
+            # number and name, the campaign and the hangup cause, not the empty
+            # "abandoned" stub of the no-session cleanup path. Written before the
+            # attempt is finished so the attempt links to it, as an answered call's does.
+            history_record_id: Optional[str] = None
+            if amd or (isinstance(meta, dict) and meta.get("answered_at_ts")):
+                history_record_id = await self._persist_outbound_attempt_history(
+                    meta,
+                    channel_id=channel_id,
+                    attempt_outcome=outcome,
+                    hangup_cause=hangup_cause,
+                    amd=amd,
+                )
             if attempt_id:
+                finish_kwargs: Dict[str, Any] = {}
+                if history_record_id:
+                    finish_kwargs["call_history_call_id"] = history_record_id
                 await self.outbound_store.finish_attempt(
                     attempt_id,
                     outcome=outcome,
@@ -4023,6 +4048,7 @@ class Engine:
                     context=str((meta or {}).get("context") or "") or None,
                     provider=str((meta or {}).get("provider") or "") or None,
                     error_message=hangup_cause,
+                    **finish_kwargs,
                 )
             if lead_id:
                 try:
@@ -4042,6 +4068,103 @@ class Engine:
             )
         except Exception:
             logger.debug("Outbound ChannelDestroyed handler failed", exc_info=True)
+
+    async def _persist_outbound_attempt_history(
+        self,
+        meta: Optional[Dict[str, Any]],
+        *,
+        channel_id: str,
+        attempt_outcome: str,
+        hangup_cause: Optional[str],
+        amd: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Write the call-history row for an outbound attempt that was answered but
+        never reached a CallSession; returns the row id for the attempt to link to.
+
+        Mirrors what ``_persist_call_history`` writes for a call that hung up
+        during the greeting: outcome ``abandoned``, the lead's number on both
+        sides, the lead's name or ``Outbound <number>``, the campaign context,
+        a duration measured from the answer. The attempt's own outcome, the
+        hangup cause and the AMD verdict go to ``external_metadata`` so the
+        row explains itself without being reported as an error.
+        """
+        try:
+            from src.core.call_history import CallRecord, get_call_history_store
+
+            store = get_call_history_store()
+            if store is None or not getattr(store, "_enabled", False):
+                return None
+            meta = dict(meta or {})
+            now = datetime.now(timezone.utc)
+            answered_ts = meta.get("answered_at_ts")
+            started_ts = answered_ts or meta.get("originated_at_ts") or meta.get("created_at_ts")
+            start_time = now
+            if started_ts:
+                try:
+                    start_time = datetime.fromtimestamp(float(started_ts), tz=timezone.utc)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    start_time = now
+            duration = max(0.0, (now - start_time).total_seconds()) if answered_ts else 0.0
+            phone = str(meta.get("phone_number") or "").strip() or None
+            lead_name = str(meta.get("lead_name") or "").strip()
+            context_name = str(meta.get("context") or "").strip() or None
+            provider = str(meta.get("provider") or "").strip() or str(
+                getattr(self.config, "default_provider", "") or ""
+            ) or "unknown"
+            external_metadata: Dict[str, Any] = {
+                "call_direction": "outbound",
+                "attempt_id": str(meta.get("attempt_id") or "") or None,
+                "campaign_id": str(meta.get("campaign_id") or "") or None,
+                "lead_id": str(meta.get("lead_id") or "") or None,
+                "attempt_outcome": attempt_outcome,
+                "hangup_cause": hangup_cause,
+                "ended_before_session": True,
+            }
+            if amd:
+                external_metadata["amd_status"] = (amd or {}).get("amd_status")
+                external_metadata["amd_cause"] = (amd or {}).get("amd_cause")
+            record = CallRecord(
+                call_id=channel_id,
+                caller_number=phone,
+                caller_name=lead_name or (f"Outbound {phone}" if phone else "Outbound"),
+                called_number=phone,
+                start_time=start_time,
+                end_time=now,
+                duration_seconds=round(duration, 3),
+                provider_name=provider,
+                context_name=context_name,
+                routing_method=str(meta.get("routing_method") or "") or None,
+                outcome="abandoned",
+                external_direction="outbound",
+                external_metadata={k: v for k, v in external_metadata.items() if v is not None},
+            )
+            saved = await store.save(record)
+            if not saved:
+                return None
+            logger.info(
+                "Persisted call record for an outbound attempt that ended before the agent session",
+                call_id=channel_id,
+                attempt_id=external_metadata.get("attempt_id"),
+                caller_number=phone,
+                duration_seconds=record.duration_seconds,
+                hangup_cause=hangup_cause,
+            )
+            # save() is dedupe-by-call_id: a row that already existed keeps its own id.
+            record_id = str(getattr(record, "id", "") or "") or None
+            try:
+                persisted = await store.get_by_call_id(channel_id)
+                if persisted is not None and getattr(persisted, "id", None):
+                    record_id = str(getattr(persisted, "id"))
+            except Exception:
+                pass
+            return record_id
+        except Exception:
+            logger.debug(
+                "Failed to persist call history for the outbound attempt",
+                channel_id=channel_id,
+                exc_info=True,
+            )
+            return None
 
     async def _outbound_post_call_tools_for_attempt(
         self,
@@ -6229,7 +6352,19 @@ class Engine:
         if existing_session:
             logger.warning("🎯 HYBRID ARI - Caller already in progress", channel_id=caller_channel_id)
             return
-        
+
+        if self._call_setup_aborted(caller_channel_id):
+            # ChannelDestroyed already came through for this channel (the far end
+            # dropped right after answering): every ARI call below would fail with
+            # "Channel not found" and the bridge created on the way would leak.
+            logger.info(
+                "🎯 HYBRID ARI - Channel is already gone; skipping call setup",
+                channel_id=caller_channel_id,
+            )
+            return
+
+        bridge_id: Optional[str] = None
+        session_registered = False
         try:
             # Answer the caller (inbound) or skip (outbound already answered)
             if not is_outbound:
@@ -6303,6 +6438,7 @@ class Engine:
                     vad_mode=getattr(self, "_vad_mode", "auto"),
                 )
             await self._save_session(session, new=True)
+            session_registered = True
 
             # Read called_number: cache (from ChannelVarSet events) > GET request > "unknown"
             # The cache is populated from DIALED_NUMBER and __FROM_DID ChannelVarSet events
@@ -6731,6 +6867,19 @@ class Engine:
                         caller_channel_id=caller_channel_id, 
                         error=str(e), exc_info=True)
             await self._cleanup_call(caller_channel_id, force_caller_hangup=True)
+            # Before the session exists cleanup knows nothing of the bridge created
+            # above (a session's cleanup destroys its own bridge).
+            if bridge_id and not session_registered:
+                try:
+                    await self.ari_client.destroy_bridge(bridge_id)
+                    logger.info(
+                        "🎯 HYBRID ARI - Bridge of the failed setup destroyed",
+                        channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                    )
+                except Exception:
+                    logger.debug("Bridge teardown after failed setup failed", bridge_id=bridge_id, exc_info=True)
+                self.bridges.pop(caller_channel_id, None)
 
     async def _handle_local_stasis_start_hybrid(self, local_channel_id: str, channel: dict):
         """Handle Local channel entering Stasis - Hybrid ARI approach."""
@@ -10681,8 +10830,15 @@ class Engine:
                 # them so we don't write a duplicate "abandoned" row. The genuine inbound
                 # pre-session abandoned case (HIGH-1a) falls through below.
                 seen_outbound = getattr(self, "_seen_outbound_channels", None)
-                if seen_outbound is not None and channel_or_call_id in seen_outbound:
-                    seen_outbound.discard(channel_or_call_id)
+                # StasisEnd reaches this path before ChannelDestroyed marks the channel
+                # as an outbound dial; the attempt metadata still keyed by channel says
+                # the same thing, and its finalizer writes the history row itself.
+                outbound_meta = getattr(self, "_outbound_attempt_meta_by_channel_id", None) or {}
+                if (seen_outbound is not None and channel_or_call_id in seen_outbound) or (
+                    channel_or_call_id in outbound_meta
+                ):
+                    if seen_outbound is not None:
+                        seen_outbound.discard(channel_or_call_id)
                     seen_caller_stasis = getattr(self, "_seen_caller_stasis_channels", None)
                     if seen_caller_stasis is not None:
                         seen_caller_stasis.discard(channel_or_call_id)
