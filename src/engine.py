@@ -2144,6 +2144,85 @@ class Engine:
         if isinstance(custom_vars, dict) and custom_vars:
             session.outbound_custom_vars = custom_vars
 
+    def _outbound_attempt_meta_for_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """The in-memory attempt metadata of an outbound channel, if the engine still holds it."""
+        if not channel_id:
+            return None
+        by_channel = getattr(self, "_outbound_attempt_meta_by_channel_id", None) or {}
+        meta = by_channel.get(channel_id)
+        return meta if isinstance(meta, dict) else None
+
+    def _seed_outbound_session_from_attempt(self, session: CallSession, meta: Dict[str, Any]) -> bool:
+        """Give a new outbound session its identity from the attempt metadata in memory.
+
+        The attempt, campaign and lead ids, the lead's number and name, the
+        custom_vars, the campaign's Agent and routing are known to the engine
+        since the originate; reading them back from channel variables costs a
+        round trip per variable to the PBX and returns nothing once the far end
+        has dropped the channel, which left the session anonymous exactly when
+        cleanup raced setup. Returns True when the attempt id was applied.
+        """
+        session.is_outbound = True
+        attempt_id = str(meta.get("attempt_id") or "").strip()
+        if attempt_id:
+            session.outbound_attempt_id = attempt_id
+        campaign_id = str(meta.get("campaign_id") or "").strip()
+        if campaign_id:
+            session.outbound_campaign_id = campaign_id
+        lead_id = str(meta.get("lead_id") or "").strip()
+        if lead_id:
+            session.outbound_lead_id = lead_id
+        phone = str(meta.get("phone_number") or "").strip()
+        if phone:
+            session.caller_number = phone
+            session.called_number = phone
+        lead_name = str(meta.get("lead_name") or "").strip()
+        current_name = str(session.caller_name or "").strip()
+        if lead_name:
+            session.caller_name = lead_name
+        elif phone and current_name in ("", str(getattr(self, "_outbound_extension_identity", "") or "")):
+            session.caller_name = f"Outbound {phone}"
+        custom_vars = meta.get("custom_vars")
+        if isinstance(custom_vars, dict) and custom_vars:
+            session.outbound_custom_vars = dict(custom_vars)
+        context = str(meta.get("context") or "").strip()
+        if context:
+            session.context_name = context
+            session.routing_method = str(meta.get("routing_method") or "ai_context")
+        return bool(attempt_id)
+
+    def _preassign_context_pipeline(self, session: CallSession) -> Optional[str]:
+        """Name the pipeline of the session's Agent before the session is first saved.
+
+        The pipeline is assigned for real in the last setup step; until then the
+        session carried the configured default full-agent provider, which is
+        what call history and the post-call tools reported for a call that
+        ended during setup. Returns the pipeline name when the Agent has one.
+        """
+        context_name = str(getattr(session, "context_name", "") or "").strip()
+        if not context_name:
+            return None
+        try:
+            orchestrator = getattr(self, "transport_orchestrator", None)
+            resolver = getattr(orchestrator, "get_context_config", None)
+            if not callable(resolver):
+                return None
+            ctx_config = resolver(context_name, getattr(session, "routing_method", None))
+            pipeline = str(getattr(ctx_config, "pipeline", "") or "").strip() if ctx_config else ""
+            if not pipeline:
+                return None
+            session.pipeline_name = pipeline
+            self._assign_session_provider(session, "pipeline")
+            return pipeline
+        except Exception:
+            logger.debug(
+                "Could not pre-assign the Agent's pipeline",
+                call_id=getattr(session, "call_id", None),
+                context=context_name,
+                exc_info=True,
+            )
+            return None
+
     async def _reject_outbound_answered_attempt(
         self,
         channel_id: str,
@@ -6347,6 +6426,12 @@ class Engine:
         except Exception:
             is_outbound = False
         
+        outbound_meta = self._outbound_attempt_meta_for_channel(caller_channel_id)
+        if outbound_meta and not is_outbound:
+            # The channel variable could not be read (the far end may already have
+            # dropped the channel); the attempt metadata in memory is authoritative.
+            is_outbound = True
+
         # Check if call is already in progress
         existing_session = await self.session_store.get_by_call_id(caller_channel_id)
         if existing_session:
@@ -6427,6 +6512,20 @@ class Engine:
             session.tool_runtime_generation = getattr(self, "_tool_generation", None)
             self._resolve_session_tool_runtime(session)
             session.is_outbound = bool(is_outbound)
+            seeded_attempt = False
+            if outbound_meta:
+                seeded_attempt = self._seed_outbound_session_from_attempt(session, outbound_meta)
+                seeded_pipeline = self._preassign_context_pipeline(session)
+                logger.info(
+                    "Outbound session seeded from attempt metadata",
+                    call_id=caller_channel_id,
+                    attempt_id=session.outbound_attempt_id,
+                    campaign_id=session.outbound_campaign_id,
+                    lead_id=session.outbound_lead_id,
+                    context=session.context_name,
+                    pipeline=seeded_pipeline,
+                    custom_vars=len(session.outbound_custom_vars or {}),
+                )
             # Per-provider VAD decision: local VAD active only when appropriate for this provider
             use_local = self._should_use_local_vad(session.provider_name)
             session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
@@ -6444,7 +6543,11 @@ class Engine:
             # The cache is populated from DIALED_NUMBER and __FROM_DID ChannelVarSet events
             # which fire early in dialplan, before StasisStart. GET requests may fail due to timing.
             called_number = self._called_number_cache.pop(caller_channel_id, None)
-            if called_number:
+            known_called_number = str(getattr(session, "called_number", "") or "").strip()
+            if known_called_number:
+                # An outbound call dialed the lead's number; nothing to read back.
+                called_number = known_called_number
+            elif called_number:
                 logger.debug("Called number resolved from cache",
                             call_id=caller_channel_id,
                             called_number=called_number)
@@ -6475,8 +6578,9 @@ class Engine:
                        call_id=caller_channel_id,
                        called_number=session.called_number)
 
-            # If outbound, pull outbound metadata from channel vars (set during origination).
-            if is_outbound:
+            # If outbound and the attempt metadata was not in memory (engine restarted
+            # during the call), pull outbound metadata from channel vars (set during origination).
+            if is_outbound and not seeded_attempt:
                 try:
                     # If we can resolve outbound attempt meta, set context_name immediately so
                     # downstream prompt/greeting resolution does not depend on channel vars.
@@ -20122,6 +20226,36 @@ class Engine:
 
         return canonical, sample_rate, reported
 
+    def _resolve_context_from_channel_vars(
+        self, session: CallSession, channel_vars: Dict[str, str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The Agent of a call and how it was chosen: (context_name, routing_method).
+
+        AI_AGENT (new) takes precedence over the legacy AI_CONTEXT variable. An
+        outbound session seeded from its attempt metadata keeps the campaign's
+        Agent when neither variable can be read: the channel may already be
+        gone, and the default Agent would be the wrong one for the lead. With
+        nothing else, the agents.db default agent slug applies (None when no
+        agents.db — preserves the existing YAML/headless behavior).
+        """
+        if channel_vars.get('AI_AGENT'):
+            return channel_vars['AI_AGENT'], 'ai_agent'
+        if channel_vars.get('AI_CONTEXT'):
+            if not getattr(self, "_legacy_context_warning_emitted", False):
+                self._legacy_context_warning_emitted = True
+                logger.warning(
+                    "AI_CONTEXT is deprecated; use AI_AGENT with the Agent slug",
+                    compatibility="display-name-first Agent lookup remains available in v7.4",
+                )
+            return channel_vars['AI_CONTEXT'], 'ai_context'
+        seeded = str(getattr(session, "context_name", "") or "").strip()
+        if getattr(session, "is_outbound", False) and getattr(session, "outbound_attempt_id", None) and seeded:
+            return seeded, getattr(session, "routing_method", None) or 'ai_context'
+        default_slug = self.transport_orchestrator.agent_store.default_slug()
+        if default_slug:
+            return default_slug, 'default'   # neither var set; used agents.db default agent
+        return None, None                    # no DB default + no vars (headless/YAML edge)
+
     async def _resolve_audio_profile(self, session: CallSession, channel_id: str) -> None:
         """
         P1: Resolve audio profile using TransportOrchestrator.
@@ -20177,26 +20311,10 @@ class Engine:
         # AI_AGENT (new) takes precedence over the legacy AI_CONTEXT variable.
         # When neither is set, fall back to the agents.db default agent slug
         # (None when no agents.db — preserves the existing YAML/headless behavior).
-        resolved_context = (
-            channel_vars.get('AI_AGENT')
-            or channel_vars.get('AI_CONTEXT')
-            or self.transport_orchestrator.agent_store.default_slug()
-        )
+        # Called through the class so a partial engine stand-in (tests) resolves the same way.
+        resolved_context, routing_method = Engine._resolve_context_from_channel_vars(self, session, channel_vars)
         session.context_name = resolved_context
-        if channel_vars.get('AI_AGENT'):
-            session.routing_method = 'ai_agent'
-        elif channel_vars.get('AI_CONTEXT'):
-            session.routing_method = 'ai_context'
-            if not getattr(self, "_legacy_context_warning_emitted", False):
-                self._legacy_context_warning_emitted = True
-                logger.warning(
-                    "AI_CONTEXT is deprecated; use AI_AGENT with the Agent slug",
-                    compatibility="display-name-first Agent lookup remains available in v7.4",
-                )
-        elif resolved_context:
-            session.routing_method = 'default'   # neither var set; used agents.db default agent
-        else:
-            session.routing_method = None        # no DB default + no vars (headless/YAML edge)
+        session.routing_method = routing_method
         await self._save_session(session)
         logger.debug(
             "Stored context_name in session",

@@ -106,6 +106,12 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
   `custom_vars`. The value is sent to the configured AI provider as prompt
   context, and the **Call Scheduling** leads table shows it in the
   **Variables** column.
+- The call's session is seeded from the attempt metadata the engine keeps in
+  memory since the originate (attempt, campaign and lead ids, the lead's number
+  as `called_number`, `custom_vars`, the campaign's Agent and its pipeline)
+  before the session is first saved, so a call the far end drops during setup
+  is still recorded and reported with the lead's data. Channel variables are
+  read only when that metadata is not in memory.
 - If an engine restart clears in-memory state while a call is still ringing,
   AAVA reloads the unfinished attempt and lead from SQLite. An answered call is
   rejected (fail closed, outcome `error`, lead `failed`, no AI session) if that
