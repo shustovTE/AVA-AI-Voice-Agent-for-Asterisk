@@ -13457,7 +13457,13 @@ class Engine:
     async def _retry_deferred_silero_barge_in(
         self, session: CallSession, tracker: SileroCallerTracker, *, source: str, since: float
     ) -> None:
-        """The caller started inside the protection window and is still talking: interrupt once it has passed."""
+        """The caller started inside the protection window and is still talking: interrupt once it has passed.
+
+        The window never outlasts the reply: when the reply ends on its own
+        first (``barge_in.protection_ends_with_reply``), the caller's speech
+        is their turn from its first frame and the utterance is sent whole,
+        without counting as a barge-in since nothing was cut.
+        """
         call_id = session.call_id
         listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
             getattr(session, "tts_playing", False)
@@ -13465,6 +13471,20 @@ class Engine:
         if listening:
             # The reply ended, or something else cut it: nothing left to interrupt.
             self._silero_deferred_barge_in.pop(call_id, None)
+            cfg = getattr(self.config, "barge_in", None)
+            if cfg is not None and not getattr(cfg, "protection_ends_with_reply", True):
+                return
+            cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+            if cutter is not None:
+                cutter.note_reply_ended_over_speech()
+            spoke_for_ms = int((time.monotonic() - float(since)) * 1000)
+            logger.info(
+                "Protection window ended with the reply; the caller's speech over its tail is kept",
+                call_id=call_id,
+                source=source,
+                spoke_for_ms=spoke_for_ms,
+                utterance_kept_whole=cutter is not None,
+            )
             return
         outcome = await self._silero_barge_in(session, tracker, source=source, deferred_since=since)
         if outcome != "protected":

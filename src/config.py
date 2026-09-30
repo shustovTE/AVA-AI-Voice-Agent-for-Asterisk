@@ -948,6 +948,12 @@ class BargeInConfig(BaseModel):
     # Minimum TTS elapsed time (ms) before TalkDetect barge-in is honoured.
     # Higher than initial_protection_ms to reject phone-echo triggering TALK_DETECT.
     talk_detect_initial_protection_ms: int = Field(default=1500)
+    # The window above never outlasts the reply: when the reply ends on its own
+    # while the caller is talking inside it, the window ends with the reply and
+    # what they said over its tail is theirs (Silero cuts the utterance whole,
+    # unmuted). False keeps the window running to its configured end, as
+    # before, for lines whose echo of a short reply outlasts the reply.
+    protection_ends_with_reply: bool = Field(default=True)
     # New: short guard window after TTS ends to avoid self-echo re-capture
     post_tts_end_protection_ms: int = Field(default=250)
     # Extra protection during the first greeting turn

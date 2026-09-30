@@ -119,6 +119,10 @@ class UtteranceCutter:
         # Absolute sample position at which the caller's speech cut the agent
         # off; the utterance around it is returned whole.
         self._barge_in_at: Optional[int] = None
+        # Absolute sample position at which a reply ended on its own over the
+        # caller's speech; the utterance around it is returned whole too, but
+        # it did not interrupt anything.
+        self._whole_at: Optional[int] = None
 
     # ── feeding ──────────────────────────────────────────────────────────────
     def append(self, pcm16: bytes, *, muted: bool = False) -> None:
@@ -142,6 +146,15 @@ class UtteranceCutter:
     def note_barge_in(self) -> None:
         """The caller's speech just cut the agent off: the utterance around now is sent whole."""
         self._barge_in_at = self.position
+
+    def note_reply_ended_over_speech(self) -> None:
+        """The reply ended on its own while the caller was talking: their utterance is sent whole.
+
+        The frames muted while the agent was still audible are read back as
+        what the caller said, like after a barge-in, but the utterance is not
+        marked as having interrupted the agent: the reply completed.
+        """
+        self._whole_at = self.position
 
     def _trim(self) -> None:
         floor = self.position - self._keep_samples
@@ -181,6 +194,8 @@ class UtteranceCutter:
             # A barge-in no utterance carried (the detector fired on something
             # Silero never confirmed): it does not belong to this one.
             self._barge_in_at = None
+        if self._whole_at is not None and self._whole_at < start:
+            self._whole_at = None
         self._open = _OpenSegment(start=start)
 
     def speech_stopped(self, *, reason: str = "stop") -> Optional[SttUtterance]:
@@ -214,8 +229,9 @@ class UtteranceCutter:
         # frame: what they said while the agent was still audible goes to the
         # recognizer as audio, not as the silence other utterances carry there.
         interrupted = self._barge_in_at is not None and start <= self._barge_in_at <= end
-        pcm = self.read(start, end, unmute=interrupted)
-        signal = (end - start) if interrupted else self._signal_samples_between(start, end)
+        whole = interrupted or (self._whole_at is not None and start <= self._whole_at <= end)
+        pcm = self.read(start, end, unmute=whole)
+        signal = (end - start) if whole else self._signal_samples_between(start, end)
         now = time.monotonic()
         self.utterances += 1
         utterance = SttUtterance(
@@ -230,6 +246,8 @@ class UtteranceCutter:
         )
         if interrupted:
             self._barge_in_at = None
+        if whole:
+            self._whole_at = None
         if close:
             self._open = None
         else:
