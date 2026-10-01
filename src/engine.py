@@ -565,6 +565,26 @@ def _ts_msg(role: str, content, **extra) -> dict:
 _LLM_MSG_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id"}
 
 
+def _ms_since(started_at: float) -> int:
+    """Whole milliseconds elapsed since a ``time.monotonic()`` reading."""
+    return max(0, int(round((time.monotonic() - started_at) * 1000.0)))
+
+
+def _latency_extra(timing: Optional[Dict[str, int]]) -> Dict[str, Any]:
+    """The ``latency`` field of a history entry, when its turn measured anything.
+
+    A pipeline turn keeps its stage latencies on its assistant entry: ``asr_ms``
+    (the recognizer's time for the caller's last phrase), ``llm_first_token_ms``
+    and ``llm_ms`` (the model's time to its first token and to the text the TTS
+    started on), ``tts_ms`` (the TTS's time to its first audio) and ``turn_ms``
+    (the caller's final transcript to the reply's first audio). The dict is kept
+    by reference, so a stage that completes after the entry was appended (the
+    serial path records the reply before its TTS starts) still lands on it.
+    ``_sanitize_for_llm`` strips the field before a model sees the history.
+    """
+    return {"latency": timing} if timing else {}
+
+
 def _sanitize_for_llm(history: list) -> list:
     """Strip non-standard keys (e.g. timestamp) before sending to LLM adapters."""
     sanitized = []
@@ -847,6 +867,9 @@ class Engine:
         # for a result that is on its way before releasing the turn.
         self._pipeline_stt_final_expected_at: Dict[str, float] = {}
         self._pipeline_last_final_at: Dict[str, float] = {}
+        # The recognizer's latency for the last result of each call, taken by
+        # the turn that result starts and recorded on the turn's history entry.
+        self._pipeline_pending_asr_ms: Dict[str, int] = {}
         # Silero VAD: the shared model (loaded in start()) and one tracker per
         # pipeline call, plus resample state for wire rates it does not take.
         self._silero_model: Optional[SileroVadModel] = None
@@ -9222,8 +9245,11 @@ class Engine:
         text: str,
         *,
         playback_type: str = "pipeline-tts",
+        timing: Optional[Dict[str, int]] = None,
     ) -> Optional[str]:
         """Synthesize one pipeline response onto the call-owned media stream.
+
+        ``timing`` takes the TTS's time to its first audio as ``tts_ms``.
 
         Tool-result continuations historically bypassed this path and handed
         PCM16/16 kHz bytes to the file player as if they were μ-law/8 kHz. Keep
@@ -9250,10 +9276,13 @@ class Engine:
             source_sample_rate=source_rate,
         )
         try:
+            tts_started = time.monotonic()
             async for chunk in pipeline.tts_adapter.synthesize(
                 call_id, text, pipeline.tts_options
             ):
                 if chunk:
+                    if timing is not None:
+                        timing.setdefault("tts_ms", _ms_since(tts_started))
                     await self._put_pipeline_stream_chunk(
                         call_id, stream_id, stream_queue, chunk
                     )
@@ -11321,6 +11350,7 @@ class Engine:
             self._pipeline_turn_source.pop(call_id, None)
             self._pipeline_stt_final_expected_at.pop(call_id, None)
             self._pipeline_last_final_at.pop(call_id, None)
+            self._pipeline_pending_asr_ms.pop(call_id, None)
             self._silero_trackers.pop(call_id, None)
             self._silero_deferred_barge_in.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
@@ -13626,15 +13656,30 @@ class Engine:
             expected[call_id] = time.monotonic()
         return True
 
-    def _note_pipeline_final_arrived(self, call_id: str) -> None:
-        """A recognizer result reached the dialog queue: nothing is outstanding."""
+    def _note_pipeline_final_arrived(self, call_id: str, *, asr_ms: Optional[float] = None) -> None:
+        """A recognizer result reached the dialog queue: nothing is outstanding.
+
+        The recognizer's latency for it is kept for the turn it starts: as
+        measured by the caller (a chunked adapter's transcribe call), else from
+        the moment the caller's utterance was queued for the recognizer.
+        """
+        now = time.monotonic()
         arrived = getattr(self, "_pipeline_last_final_at", None)
         if arrived is None:
             arrived = self._pipeline_last_final_at = {}
-        arrived[call_id] = time.monotonic()
+        arrived[call_id] = now
         expected = getattr(self, "_pipeline_stt_final_expected_at", None)
-        if expected:
-            expected.pop(call_id, None)
+        sent_at = expected.pop(call_id, None) if expected else None
+        if asr_ms is None and sent_at is not None:
+            try:
+                asr_ms = (now - float(sent_at)) * 1000.0
+            except (TypeError, ValueError):
+                asr_ms = None
+        if asr_ms is not None:
+            pending = getattr(self, "_pipeline_pending_asr_ms", None)
+            if pending is None:
+                pending = self._pipeline_pending_asr_ms = {}
+            pending[call_id] = max(0, int(round(float(asr_ms))))
 
     # ------------------------------------------------------------------
     # Smart Turn: is the caller done, or only pausing?
@@ -17879,9 +17924,11 @@ class Engine:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
                             any_audio = False
                             greeting_cut: Optional[str] = None
+                            greeting_timing: Dict[str, int] = {}
                             heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
                             if heard_rec is not None:
                                 heard_rec.open_segment(greeting)
+                            tts_started = time.monotonic()
 
                             async def _stream_greeting() -> None:
                                 nonlocal any_audio
@@ -17899,6 +17946,7 @@ class Engine:
                                     if not chunk:
                                         continue
                                     if not any_audio:
+                                        greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
                                         await self._stop_connection_audio(
                                             session, reason="first-pipeline-greeting-audio"
                                         )
@@ -17949,9 +17997,9 @@ class Engine:
                                 try:
                                     if spoken:
                                         session.conversation_history.append(
-                                            _ts_msg("assistant", spoken, interrupted=True)
+                                            _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(greeting_timing))
                                             if greeting_cut is not None
-                                            else _ts_msg("assistant", greeting)
+                                            else _ts_msg("assistant", greeting, **_latency_extra(greeting_timing))
                                         )
                                     if heard_rec is not None:
                                         heard_rec.persisted_text = spoken
@@ -17965,8 +18013,11 @@ class Engine:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
                         else:
                             tts_bytes = bytearray()
+                            greeting_timing: Dict[str, int] = {}
+                            tts_started = time.monotonic()
                             async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
                                 if chunk:
+                                    greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
                                     tts_bytes.extend(chunk)
                             if not tts_bytes:
                                 logger.warning(
@@ -17982,7 +18033,9 @@ class Engine:
                                 
                                 # AAVA-85: Persist greeting to session history so it appears in email summary
                                 try:
-                                    session.conversation_history.append(_ts_msg("assistant", greeting))
+                                    session.conversation_history.append(
+                                        _ts_msg("assistant", greeting, **_latency_extra(greeting_timing))
+                                    )
                                     await self.session_store.upsert_call(session)
                                     logger.info("Persisted initial greeting to session history", call_id=call_id)
                                 except Exception as e:
@@ -18122,6 +18175,7 @@ class Engine:
 
                 async def process_audio(audio_chunk: bytes) -> None:
                     transcript = ""
+                    asr_started = time.monotonic()
                     try:
                         transcript = await pipeline.stt_adapter.transcribe(
                             call_id,
@@ -18132,13 +18186,14 @@ class Engine:
                     except Exception:
                         logger.debug("STT transcribe failed", call_id=call_id, exc_info=True)
                         return
+                    asr_ms = (time.monotonic() - asr_started) * 1000.0
                     transcript = (transcript or "").strip()
                     if not transcript:
                         return
                     # Record time when a final transcript is obtained
                     try:
                         self._last_transcript_ts[call_id] = time.time()
-                        self._note_pipeline_final_arrived(call_id)
+                        self._note_pipeline_final_arrived(call_id, asr_ms=asr_ms)
                     except Exception:
                         pass
                     try:
@@ -18351,6 +18406,14 @@ class Engine:
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
                     turn_start_time = time.time()  # Track turn latency for call history
+                    # The turn's stage latencies, recorded on its assistant entry
+                    # (see _latency_extra). The recognizer's time for the caller's
+                    # last phrase is taken here so it never leaks into a later turn;
+                    # a continuation of a cut-off reply has no caller phrase.
+                    turn_timing: Dict[str, int] = {}
+                    pending_asr = (getattr(self, "_pipeline_pending_asr_ms", None) or {}).pop(call_id, None)
+                    if pending_asr is not None and transcript_text != self._continue_reply_prompt():
+                        turn_timing["asr_ms"] = int(pending_asr)
                     
                     pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
                     provider_label = getattr(session, 'provider_name', None) or 'unknown'
@@ -18510,12 +18573,16 @@ class Engine:
                                 raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
                             heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
 
+                            llm_started = time.monotonic()
+                            tts_started: Optional[float] = None
                             async for token in pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
                             ):
                                 if self._pipeline_reply_superseded(call_id):
                                     # The caller went on before any of this was heard.
                                     raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
+                                if "llm_first_token_ms" not in turn_timing:
+                                    turn_timing["llm_first_token_ms"] = _ms_since(llm_started)
                                 sentence_buffer += token
                                 full_response_text += token
 
@@ -18526,8 +18593,13 @@ class Engine:
                                     sentence_buffer = sentence_buffer[split_pos:]
 
                                     if to_speak:
+                                        # The model's share of the turn ends where the
+                                        # text the TTS starts on is complete.
+                                        turn_timing.setdefault("llm_ms", _ms_since(llm_started))
                                         if heard_rec:
                                             heard_rec.open_segment(to_speak)
+                                        if tts_started is None:
+                                            tts_started = time.monotonic()
                                         async for tts_chunk in self._tts_chunks_while_wanted(
                                             call_id,
                                             stream_id,
@@ -18540,6 +18612,8 @@ class Engine:
                                                     first_tts_ts = time.time()
                                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                     session.turn_latencies_ms.append(turn_latency_ms)
+                                                    turn_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                                    turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
                                                     try:
                                                         if t_start is not None:
                                                             _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
@@ -18557,8 +18631,11 @@ class Engine:
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
                             if remainder:
+                                turn_timing.setdefault("llm_ms", _ms_since(llm_started))
                                 if heard_rec:
                                     heard_rec.open_segment(remainder)
+                                if tts_started is None:
+                                    tts_started = time.monotonic()
                                 async for tts_chunk in self._tts_chunks_while_wanted(
                                     call_id,
                                     stream_id,
@@ -18571,6 +18648,8 @@ class Engine:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
+                                            turn_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                            turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
                                         await self._put_pipeline_stream_chunk(
                                             call_id, stream_id, stream_q, tts_chunk
                                         )
@@ -18626,7 +18705,9 @@ class Engine:
                             conversation_history.append(_ts_msg("user", transcript_text))
                             if spoken:
                                 conversation_history.append(
-                                    _ts_msg("assistant", spoken, interrupted=True) if heard_known else _ts_msg("assistant", spoken)
+                                    _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(turn_timing))
+                                    if heard_known
+                                    else _ts_msg("assistant", spoken, **_latency_extra(turn_timing))
                                 )
                             if heard_rec is not None:
                                 heard_rec.persisted_text = spoken
@@ -18667,10 +18748,14 @@ class Engine:
                                 # The caller cut the reply after its last chunk was queued.
                                 heard = str(heard_rec.heard_text or "").strip()
                                 if heard:
-                                    conversation_history.append(_ts_msg("assistant", heard, interrupted=True))
+                                    conversation_history.append(
+                                        _ts_msg("assistant", heard, interrupted=True, **_latency_extra(turn_timing))
+                                    )
                                 heard_rec.persisted_text = heard
                             else:
-                                conversation_history.append(_ts_msg("assistant", response_text))
+                                conversation_history.append(
+                                    _ts_msg("assistant", response_text, **_latency_extra(turn_timing))
+                                )
                                 if heard_rec is not None:
                                     heard_rec.persisted_text = response_text
                             session.conversation_history = list(conversation_history)
@@ -18732,6 +18817,7 @@ class Engine:
 
                     # ── Serial path (original) ──
                     # Skip if streaming path already set tool_calls
+                    llm_started = time.monotonic()
                     if not tool_calls:
                         try:
                             llm_result = await self._generate_unless_resumed(
@@ -18747,6 +18833,7 @@ class Engine:
                         except Exception:
                             logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
                             return
+                        turn_timing["llm_ms"] = _ms_since(llm_started)
                         if llm_result is _REPLY_SUPERSEDED:
                             return "superseded"
 
@@ -18874,6 +18961,7 @@ class Engine:
                                     context_for_llm,
                                     llm_options_no_tools,
                                 )
+                                turn_timing["llm_ms"] = _ms_since(llm_started)
                                 if not self._pipeline_output_allowed(
                                     call_id, session, stage="post-llm-retry"
                                 ):
@@ -18913,7 +19001,10 @@ class Engine:
                     if not _streaming_handled:
                         conversation_history.append(_ts_msg("user", transcript_text))
                         if response_text:
-                            conversation_history.append(_ts_msg("assistant", response_text))
+                            # The TTS stages land on the same dict once the reply's first audio arrives.
+                            conversation_history.append(
+                                _ts_msg("assistant", response_text, **_latency_extra(turn_timing))
+                            )
 
                         # AAVA-85: Persist session history so tools (email) can access it
                         session.conversation_history = list(conversation_history)
@@ -18977,6 +19068,7 @@ class Engine:
                                     heard_rec.open_segment(response_text)
                                     heard_rec.persisted_text = response_text
 
+                                tts_started = time.monotonic()
                                 async for tts_chunk in self._tts_chunks_while_wanted(
                                     call_id,
                                     stream_id,
@@ -18990,6 +19082,8 @@ class Engine:
                                         first_tts_ts = time.time()
                                         turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                         session.turn_latencies_ms.append(turn_latency_ms)
+                                        turn_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                        turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
                                         try:
                                             if t_start is not None:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19072,12 +19166,15 @@ class Engine:
                                 try:
                                     tts_bytes = bytearray()
                                     first_tts_ts = None
+                                    tts_started = time.monotonic()
                                     async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
                                         if tts_chunk:
                                             if first_tts_ts is None:
                                                 first_tts_ts = time.time()
                                                 turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                 session.turn_latencies_ms.append(turn_latency_ms)
+                                                turn_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                                turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
                                                 try:
                                                     if t_start is not None:
                                                         _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19105,6 +19202,7 @@ class Engine:
                             # downstream_mode=file: keep existing pipeline file playback behavior
                             tts_bytes = bytearray()
                             first_tts_ts: Optional[float] = None
+                            tts_started = time.monotonic()
                             try:
                                 async for tts_chunk in pipeline.tts_adapter.synthesize(
                                     call_id,
@@ -19117,6 +19215,8 @@ class Engine:
                                             # Track turn latency for call history (Milestone 21)
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
+                                            turn_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                            turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
                                             try:
                                                 if t_start is not None:
                                                     _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19390,18 +19490,23 @@ class Engine:
                                             # the turn's own options (the agent's prompt, the tool
                                             # allowlist, the pipeline's settings), not the raw
                                             # pipeline block those were resolved from.
+                                            continuation_timing: Dict[str, int] = {}
+                                            continuation_llm_started = time.monotonic()
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
                                                 context_for_llm,
                                                 llm_options,
                                             )
+                                            continuation_timing["llm_ms"] = _ms_since(continuation_llm_started)
                                             if llm_response:
                                                 # Handle text response if present
                                                 if getattr(llm_response, 'text', None):
                                                     response_text = llm_response.text.strip()
                                                     if response_text:
-                                                        conversation_history.append(_ts_msg("assistant", response_text))
+                                                        conversation_history.append(
+                                                            _ts_msg("assistant", response_text, **_latency_extra(continuation_timing))
+                                                        )
                                                         session.conversation_history = list(conversation_history)
                                                         await self.session_store.upsert_call(session)
                                                         logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
@@ -19420,6 +19525,7 @@ class Engine:
                                                                     session,
                                                                     pipeline,
                                                                     response_text,
+                                                                    timing=continuation_timing,
                                                                 )
                                                             except _PipelinePlaybackInterrupted:
                                                                 logger.info(
@@ -19431,12 +19537,16 @@ class Engine:
                                                             # File-mode adapters are required to emit
                                                             # the file player's μ-law/8 kHz contract.
                                                             tts_bytes = bytearray()
+                                                            continuation_tts_started = time.monotonic()
                                                             async for chunk in pipeline.tts_adapter.synthesize(
                                                                 call_id,
                                                                 response_text,
                                                                 pipeline.tts_options,
                                                             ):
                                                                 if chunk:
+                                                                    continuation_timing.setdefault(
+                                                                        "tts_ms", _ms_since(continuation_tts_started)
+                                                                    )
                                                                     tts_bytes.extend(chunk)
                                                             if tts_bytes:
                                                                 pid = await self.playback_manager.play_audio(

@@ -44,9 +44,62 @@ interface CallRecordSummary {
     external_disposition?: string | null;
 }
 
+/** The stage latencies a pipeline turn measured, in whole milliseconds. */
+interface TurnLatency {
+    asr_ms?: number;
+    llm_first_token_ms?: number;
+    llm_ms?: number;
+    tts_ms?: number;
+    turn_ms?: number;
+}
+
+interface TranscriptEntry {
+    role: string;
+    content: string;
+    timestamp?: number | string;
+    interrupted?: boolean;
+    latency?: TurnLatency;
+}
+
+const LATENCY_STAGES: Array<{ key: keyof TurnLatency; label: string; title: string }> = [
+    { key: 'asr_ms', label: 'ASR', title: "Recognizer: the caller's last phrase, from its hand-off to the final transcript" },
+    { key: 'llm_ms', label: 'LLM', title: 'Model: from the request to the text the TTS started on (the first sentence with streaming overlap)' },
+    { key: 'tts_ms', label: 'TTS', title: 'Speech: from the first synthesis request to its first audio' },
+    { key: 'turn_ms', label: 'Turn', title: 'From the final transcript to the first audio of the reply' },
+];
+
+function formatLatencyMs(ms: number): string {
+    return ms >= 10000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
+
+/** Per-stage latency badges under a reply; nothing when the turn measured nothing. */
+function TurnLatencyBadges({ latency }: { latency?: TurnLatency }) {
+    if (!latency) return null;
+    const stages = LATENCY_STAGES.filter((stage) => typeof latency[stage.key] === 'number');
+    if (stages.length === 0) return null;
+    const firstToken = typeof latency.llm_first_token_ms === 'number' ? latency.llm_first_token_ms : null;
+    return (
+        <div className="mt-1 flex flex-wrap gap-1">
+            {stages.map((stage) => {
+                const withFirstToken = stage.key === 'llm_ms' && firstToken !== null;
+                return (
+                    <span
+                        key={stage.key}
+                        title={withFirstToken ? `${stage.title}; first token after ${formatLatencyMs(firstToken)}` : stage.title}
+                        className="rounded border border-border bg-background/60 px-1.5 py-0.5 font-mono text-[10px] leading-none text-muted-foreground"
+                    >
+                        {stage.label} {formatLatencyMs(latency[stage.key] as number)}
+                        {withFirstToken ? ` (first token ${formatLatencyMs(firstToken)})` : ''}
+                    </span>
+                );
+            })}
+        </div>
+    );
+}
+
 interface CallRecordDetail extends CallRecordSummary {
     pipeline_components: Record<string, string>;
-    conversation_history: Array<{ role: string; content: string; timestamp?: number | string }>;
+    conversation_history: TranscriptEntry[];
     transfer_destination: string | null;
     tool_calls: InCallToolCall[];
     pre_call_tool_calls: PhaseToolCall[];
@@ -1326,6 +1379,7 @@ const CallHistoryPage = () => {
                                                     }`}>
                                                         <div className="text-xs text-muted-foreground mb-1 capitalize">{msg.role}</div>
                                                         <div className="text-sm">{msg.content}</div>
+                                                        <TurnLatencyBadges latency={msg.latency} />
                                                         {msg.timestamp && (
                                                             <div className="text-xs text-muted-foreground mt-1">
                                                                 {(() => {

@@ -66,7 +66,7 @@ The **Caller Inactivity** card controls the engine-level no-input watchdog. v7.3
 
 Per-call debugging and analytics:
 - Searchable list of all calls with timestamps, duration, and provider
-- Full conversation transcripts
+- Full conversation transcripts, with the stage latencies of each pipeline reply under it: **ASR** (the caller's last phrase, from its hand-off to the recognizer to the final transcript), **LLM** (to the text the speech synthesis started on; hover for the first token), **TTS** (to its first audio) and **Turn** (the final transcript to the reply's first audio). A greeting shows its TTS time only; a reply whose stage was not measured (a recognizer that segments the stream itself gives no ASR figure) shows the others
 - Tool call history with parameters and results
 - Call quality metrics
 - A distinct **No input timeout** outcome for calls ended by the inactivity policy
