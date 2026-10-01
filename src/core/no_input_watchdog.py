@@ -457,11 +457,13 @@ class NoInputWatchdog:
         hold music and noise are what this timer is for. Agent output pauses it
         so a long utterance is never cut; a caller turn being processed does
         not, since accepting the turn already restarted it and a reply that
-        never comes is a stall too.
+        never comes is a stall too. Nor does it wait for ``ready``: it counts
+        from registration, so a call whose setup never completes (a greeting
+        that never finishes) is a stall as well, and the greeting playing
+        pauses it like any agent output.
         """
         return bool(
             state.policy.stall_timeout_sec > 0
-            and state.ready
             and not state.output_active
             and not state.suspended
             and not state.terminal

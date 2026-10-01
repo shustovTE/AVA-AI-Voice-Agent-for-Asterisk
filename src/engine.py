@@ -171,6 +171,10 @@ _REPLY_SUPERSEDED = object()
 # Modular STT uses one canonical, headerless audio bus. Transport-specific
 # audio is converted to this format before it enters the pipeline queue.
 PIPELINE_STT_SAMPLE_RATE_HZ = 16000
+# A pipeline greeting is synthesized before the recognizer path and the
+# inactivity watchdog start for the call; nothing on the way may hold them
+# longer than this, whatever the TTS endpoint does.
+PIPELINE_GREETING_TIMEOUT_SEC = 120.0
 PIPELINE_STT_STREAM_FORMAT = "pcm16_16k"
 PIPELINE_STT_ENCODING = "linear16"
 PIPELINE_STT_CHANNELS = 1
@@ -17874,19 +17878,60 @@ class Engine:
                             if not stream_id:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
                             any_audio = False
-                            async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
-                                if not chunk:
-                                    continue
-                                if not any_audio:
-                                    await self._stop_connection_audio(
-                                        session, reason="first-pipeline-greeting-audio"
-                                    )
-                                any_audio = True
-                                await q.put(chunk)
+                            greeting_cut: Optional[str] = None
+                            heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
+                            if heard_rec is not None:
+                                heard_rec.open_segment(greeting)
+
+                            async def _stream_greeting() -> None:
+                                nonlocal any_audio
+                                # Each frame is put with the stream's liveness checked and
+                                # the synthesis is given up the moment the stream is cut (a
+                                # barge-in into the greeting): a bare put on a stream nobody
+                                # drains any more blocked here, with the recognizer path and
+                                # the inactivity watchdog still waiting behind it, for the
+                                # rest of the call.
+                                async for chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options),
+                                ):
+                                    if not chunk:
+                                        continue
+                                    if not any_audio:
+                                        await self._stop_connection_audio(
+                                            session, reason="first-pipeline-greeting-audio"
+                                        )
+                                    any_audio = True
+                                    if heard_rec is not None:
+                                        heard_rec.add_audio_bytes(len(chunk))
+                                    await self._put_pipeline_stream_chunk(call_id, stream_id, q, chunk)
+
                             try:
-                                q.put_nowait(None)
-                            except asyncio.QueueFull:
-                                asyncio.create_task(q.put(None))
+                                await asyncio.wait_for(_stream_greeting(), timeout=PIPELINE_GREETING_TIMEOUT_SEC)
+                            except _PipelinePlaybackInterrupted as exc:
+                                greeting_cut = str(exc)
+                            except asyncio.TimeoutError:
+                                greeting_cut = f"synthesis exceeded {int(PIPELINE_GREETING_TIMEOUT_SEC)} s"
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                            if heard_rec is not None:
+                                heard_rec.close_segment()
+                                heard_rec.completed = greeting_cut is None
+                            if greeting_cut is None:
+                                try:
+                                    q.put_nowait(None)
+                                except asyncio.QueueFull:
+                                    asyncio.create_task(q.put(None))
+                            else:
+                                logger.info(
+                                    "Pipeline greeting cut short; the rest of it is not synthesized",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                    reason=greeting_cut,
+                                )
                             if not any_audio:
                                 logger.warning(
                                     "Pipeline greeting produced no audio",
@@ -17894,11 +17939,28 @@ class Engine:
                                     attempt=attempt,
                                 )
                             else:
-                                # AAVA-85: Persist greeting to session history so it appears in email summary
+                                # AAVA-85: Persist greeting to session history so it appears in email summary.
+                                # A greeting the caller cut is recorded as what they heard of it when
+                                # the barge-in handler measured that, as interrupted either way.
+                                heard_known = bool(
+                                    heard_rec is not None and heard_rec.interrupted and heard_rec.heard_text is not None
+                                )
+                                spoken = (heard_rec.heard_text or "").strip() if heard_known else greeting
                                 try:
-                                    session.conversation_history.append(_ts_msg("assistant", greeting))
+                                    if spoken:
+                                        session.conversation_history.append(
+                                            _ts_msg("assistant", spoken, interrupted=True)
+                                            if greeting_cut is not None
+                                            else _ts_msg("assistant", greeting)
+                                        )
+                                    if heard_rec is not None:
+                                        heard_rec.persisted_text = spoken
                                     await self.session_store.upsert_call(session)
-                                    logger.info("Persisted initial greeting to session history", call_id=call_id)
+                                    logger.info(
+                                        "Persisted initial greeting to session history",
+                                        call_id=call_id,
+                                        interrupted=greeting_cut is not None,
+                                    )
                                 except Exception as e:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
                         else:
