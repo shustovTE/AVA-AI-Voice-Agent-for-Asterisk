@@ -156,6 +156,10 @@ class _CallState:
     terminal: bool = False
     phase: str = "waiting"
     check_ins: int = 0
+    # Caller turns handed to the model, which is what keeps a stalled call
+    # alive through its final message: an utterance of the agent's own, the
+    # final message included, is an exchange for the timer but not a turn.
+    caller_turns: int = 0
     deadline: Optional[float] = None
     output_pause_remaining: Optional[float] = None
     last_activity_at: float = field(default_factory=time.monotonic)
@@ -332,6 +336,7 @@ class NoInputWatchdog:
         state.processing = bool(active)
         if active:
             # A caller turn reached the model: an exchange.
+            state.caller_turns += 1
             self._note_exchange(state, "caller_turn")
             state.deadline = None
         elif state.ready and not state.output_active and not state.suspended:
@@ -634,8 +639,17 @@ class NoInputWatchdog:
             _NO_INPUT_EVENTS.labels("watchdog_error").inc()
 
     async def _finish_for_stall(self, state: _CallState) -> None:
-        """Speak the final message, then hang up a call in which nothing has been exchanged for the stall timeout."""
+        """Speak the final message, then hang up a call in which nothing has been exchanged for the stall timeout.
+
+        Only a caller turn that reaches the model while the final message
+        plays keeps the call alive. The message's own end reaches the timer
+        as an agent utterance (the engine reports every agent output), so the
+        exchange clock cannot be the test: it moved with the message, and the
+        hangup was skipped, each stall timeout again until the duration cap.
+        """
         exchange_before = state.last_exchange_at
+        source_before = state.last_exchange_source
+        turns_before = state.caller_turns
         if state.policy.final_message:
             state.phase = "stall_announcement"
             state.deadline = None
@@ -666,9 +680,9 @@ class NoInputWatchdog:
             finally:
                 state.self_announcement = False
 
-            # A caller turn handed to the model during the announcement is an
-            # exchange: the conversation moved after all, so the call goes on.
-            if state.last_exchange_at > exchange_before:
+            # A caller turn handed to the model during the announcement: the
+            # conversation moved after all, so the call goes on.
+            if state.caller_turns > turns_before:
                 state.phase = "waiting"
                 state.output_active = False
                 self._reset_initial_deadline(state)
@@ -683,8 +697,8 @@ class NoInputWatchdog:
             "Conversation stalled; hanging up",
             call_id=state.call_id,
             stall_timeout_sec=state.policy.stall_timeout_sec,
-            since_exchange_sec=round(self._clock() - state.last_exchange_at, 1),
-            last_exchange_source=state.last_exchange_source,
+            since_exchange_sec=round(self._clock() - exchange_before, 1),
+            last_exchange_source=source_before,
             caller_sound_active=state.input_active,
             last_activity_source=state.last_activity_source,
         )

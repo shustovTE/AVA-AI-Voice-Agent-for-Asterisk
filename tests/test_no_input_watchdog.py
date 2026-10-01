@@ -940,6 +940,40 @@ async def test_a_caller_turn_during_the_stall_final_message_keeps_the_call_alive
 
 
 @pytest.mark.asyncio
+async def test_the_stall_final_message_is_not_a_caller_turn_and_the_call_is_hung_up():
+    """Reproduces call 1790858144.17985 of 2026-10-01: nine final messages, no hangup, 600 s."""
+    announcements = []
+    hangups = []
+
+    async def announce(call_id, text, kind):
+        announcements.append(kind)
+        # The engine reports the announcement like any agent output: its end
+        # is an utterance the agent finished, which restarts the stall timer.
+        await watchdog.note_agent_output_start(call_id)
+        await asyncio.sleep(0.01)
+        await watchdog.note_agent_output_end(call_id)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    policy = NoInputPolicy(initial_timeout_sec=10, grace_timeout_sec=10, stall_timeout_sec=0.06)
+    await watchdog.register("dead-line", policy, is_outbound=True)
+    try:
+        await watchdog.mark_ready("dead-line")
+        await _wait_until(lambda: hangups == ["dead-line"])
+        assert announcements == ["final"]
+        assert watchdog.snapshot("dead-line")["phase"] == "stall_hangup"
+        # No second round: the message was spoken once and the call ended.
+        await asyncio.sleep(0.1)
+        assert announcements == ["final"]
+        assert hangups == ["dead-line"]
+    finally:
+        await watchdog.stop("dead-line")
+
+
+@pytest.mark.asyncio
 async def test_stall_timer_runs_for_outbound_calls_without_check_ins():
     announcements = []
     hangups = []
