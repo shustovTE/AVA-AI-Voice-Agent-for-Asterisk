@@ -194,8 +194,12 @@ async def test_streaming_overlap_turn_records_every_stage(monkeypatch):
         await engine._cleanup_call(CALL_ID)
 
     latency = _reply_entry(history)["latency"]
-    assert set(latency) == {"asr_ms", "llm_first_token_ms", "llm_ms", "tts_ms", "turn_ms"}
+    assert set(latency) == {"asr_ms", "wait_ms", "llm_first_token_ms", "llm_ms", "tts_ms", "turn_ms", "response_ms"}
     assert all(isinstance(v, int) for v in latency.values())
+    # The end of the turn: the worker held the result for the end-of-turn window.
+    assert latency["wait_ms"] >= 80
+    # What the caller waited from their last word to the reply's first sound.
+    assert latency["response_ms"] == latency["wait_ms"] + latency["turn_ms"]
     # The recognizer's time: from the utterance's hand-off to its result.
     assert latency["asr_ms"] >= ASR_WAIT * 1000 * 0.8
     # The model's: to its first token, and to the first sentence the TTS started on.
@@ -223,7 +227,8 @@ async def test_serial_turn_records_the_whole_generation_and_its_tts(monkeypatch)
     assert entry["content"] == REPLY
     latency = entry["latency"]
     # No token stream in the serial path: no first-token figure.
-    assert set(latency) == {"asr_ms", "llm_ms", "tts_ms", "turn_ms"}
+    assert set(latency) == {"asr_ms", "wait_ms", "llm_ms", "tts_ms", "turn_ms", "response_ms"}
+    assert latency["response_ms"] == latency["wait_ms"] + latency["turn_ms"]
     assert latency["llm_ms"] >= FIRST_TOKEN_DELAY * 1000 * 0.8
     # The entry is recorded before the TTS starts; the TTS stages still land on it.
     assert latency["tts_ms"] >= FIRST_AUDIO_DELAY * 1000 * 0.8

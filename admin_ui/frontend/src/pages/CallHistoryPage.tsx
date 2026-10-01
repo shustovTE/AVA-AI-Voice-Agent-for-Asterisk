@@ -47,10 +47,12 @@ interface CallRecordSummary {
 /** The stage latencies a pipeline turn measured, in whole milliseconds. */
 interface TurnLatency {
     asr_ms?: number;
+    wait_ms?: number;
     llm_first_token_ms?: number;
     llm_ms?: number;
     tts_ms?: number;
     turn_ms?: number;
+    response_ms?: number;
 }
 
 interface TranscriptEntry {
@@ -63,9 +65,11 @@ interface TranscriptEntry {
 
 const LATENCY_STAGES: Array<{ key: keyof TurnLatency; label: string; title: string }> = [
     { key: 'asr_ms', label: 'ASR', title: "Recognizer: the caller's last phrase, from its hand-off to the final transcript" },
+    { key: 'wait_ms', label: 'Wait', title: "End of turn: from the caller's last word (as the VAD heard it) to their words being handed to the model: the stop window, the grace pause and a recognizer result still on its way" },
     { key: 'llm_ms', label: 'LLM', title: 'Model: from the request to the text the TTS started on (the first sentence with streaming overlap)' },
     { key: 'tts_ms', label: 'TTS', title: 'Speech: from the first synthesis request to its first audio' },
-    { key: 'turn_ms', label: 'Turn', title: 'From the final transcript to the first audio of the reply' },
+    { key: 'turn_ms', label: 'Turn', title: "From the caller's words being handed to the model to the first audio of the reply: LLM and TTS together, the figure the call's average and maximum are made of" },
+    { key: 'response_ms', label: 'Response', title: "From the caller's last word to the first audio of the reply: Wait plus Turn" },
 ];
 
 function formatLatencyMs(ms: number): string {

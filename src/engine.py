@@ -574,15 +574,30 @@ def _latency_extra(timing: Optional[Dict[str, int]]) -> Dict[str, Any]:
     """The ``latency`` field of a history entry, when its turn measured anything.
 
     A pipeline turn keeps its stage latencies on its assistant entry: ``asr_ms``
-    (the recognizer's time for the caller's last phrase), ``llm_first_token_ms``
-    and ``llm_ms`` (the model's time to its first token and to the text the TTS
-    started on), ``tts_ms`` (the TTS's time to its first audio) and ``turn_ms``
-    (the caller's final transcript to the reply's first audio). The dict is kept
+    (the recognizer's time for the caller's last phrase), ``wait_ms`` (the end
+    of the turn: the caller's last word, as the VAD saw it, to their words being
+    handed to the model), ``llm_first_token_ms`` and ``llm_ms`` (the model's time
+    to its first token and to the text the TTS started on), ``tts_ms`` (the
+    TTS's time to its first audio), ``turn_ms`` (the words being handed to the
+    model to the reply's first audio: LLM and TTS together, the figure the call's
+    average and maximum are made of) and ``response_ms`` (the caller's last word
+    to the reply's first audio: ``wait_ms`` plus ``turn_ms``). The dict is kept
     by reference, so a stage that completes after the entry was appended (the
     serial path records the reply before its TTS starts) still lands on it.
     ``_sanitize_for_llm`` strips the field before a model sees the history.
     """
     return {"latency": timing} if timing else {}
+
+
+def _note_first_audio(timing: Dict[str, int], tts_started: Optional[float], turn_latency_ms: float) -> None:
+    """The reply's first audio: the TTS's share, the turn, and the caller's whole wait."""
+    if tts_started is not None:
+        timing.setdefault("tts_ms", _ms_since(tts_started))
+    turn_ms = max(0, int(round(float(turn_latency_ms))))
+    timing.setdefault("turn_ms", turn_ms)
+    wait_ms = timing.get("wait_ms")
+    if wait_ms is not None:
+        timing.setdefault("response_ms", int(wait_ms) + turn_ms)
 
 
 def _sanitize_for_llm(history: list) -> list:
@@ -870,6 +885,9 @@ class Engine:
         # The recognizer's latency for the last result of each call, taken by
         # the turn that result starts and recorded on the turn's history entry.
         self._pipeline_pending_asr_ms: Dict[str, int] = {}
+        # When the caller's last word of a turn was heard (monotonic), set as
+        # the turn is dispatched and taken by the turn for its wait figure.
+        self._pipeline_turn_speech_ended_at: Dict[str, float] = {}
         # Silero VAD: the shared model (loaded in start()) and one tracker per
         # pipeline call, plus resample state for wire rates it does not take.
         self._silero_model: Optional[SileroVadModel] = None
@@ -11371,6 +11389,7 @@ class Engine:
             self._pipeline_stt_final_expected_at.pop(call_id, None)
             self._pipeline_last_final_at.pop(call_id, None)
             self._pipeline_pending_asr_ms.pop(call_id, None)
+            self._pipeline_turn_speech_ended_at.pop(call_id, None)
             self._silero_trackers.pop(call_id, None)
             self._silero_deferred_barge_in.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
@@ -18434,6 +18453,10 @@ class Engine:
                     pending_asr = (getattr(self, "_pipeline_pending_asr_ms", None) or {}).pop(call_id, None)
                     if pending_asr is not None and transcript_text != self._continue_reply_prompt():
                         turn_timing["asr_ms"] = int(pending_asr)
+                    speech_ended_at = (getattr(self, "_pipeline_turn_speech_ended_at", None) or {}).pop(call_id, None)
+                    if speech_ended_at is not None and transcript_text != self._continue_reply_prompt():
+                        # The end of the turn: the caller's last word to this moment.
+                        turn_timing["wait_ms"] = _ms_since(speech_ended_at)
                     
                     pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
                     provider_label = getattr(session, 'provider_name', None) or 'unknown'
@@ -18632,8 +18655,7 @@ class Engine:
                                                     first_tts_ts = time.time()
                                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                     session.turn_latencies_ms.append(turn_latency_ms)
-                                                    turn_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                                    turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
+                                                    _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                                     try:
                                                         if t_start is not None:
                                                             _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
@@ -18668,8 +18690,7 @@ class Engine:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
-                                            turn_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                            turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
+                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                         await self._put_pipeline_stream_chunk(
                                             call_id, stream_id, stream_q, tts_chunk
                                         )
@@ -19102,8 +19123,7 @@ class Engine:
                                         first_tts_ts = time.time()
                                         turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                         session.turn_latencies_ms.append(turn_latency_ms)
-                                        turn_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                        turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
+                                        _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                         try:
                                             if t_start is not None:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19193,8 +19213,7 @@ class Engine:
                                                 first_tts_ts = time.time()
                                                 turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                 session.turn_latencies_ms.append(turn_latency_ms)
-                                                turn_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                                turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
+                                                _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                                 try:
                                                     if t_start is not None:
                                                         _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19235,8 +19254,7 @@ class Engine:
                                             # Track turn latency for call history (Milestone 21)
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
-                                            turn_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                            turn_timing.setdefault("turn_ms", max(0, int(round(turn_latency_ms))))
+                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                             try:
                                                 if t_start is not None:
                                                     _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -19961,6 +19979,25 @@ class Engine:
                     resumed = self._pipeline_caller_resumed.get(call_id)
                     if resumed is not None:
                         resumed.clear()
+                    # When the caller's last word was heard, for the turn's wait and
+                    # response figures: the VAD's last speech frame, else the detector's
+                    # quiet report, else the last recognizer result.
+                    tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+                    last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+                    speech_ended_at = None
+                    for candidate in (last_speech, quiet_since):
+                        # A detector's mark from long before the last result is
+                        # not this turn's last word (the detector missed it).
+                        if candidate is not None and (last_final is None or candidate >= last_final - 10.0):
+                            speech_ended_at = candidate
+                            break
+                    if speech_ended_at is None:
+                        speech_ended_at = last_final
+                    if speech_ended_at is not None:
+                        ended = getattr(self, "_pipeline_turn_speech_ended_at", None)
+                        if ended is None:
+                            ended = self._pipeline_turn_speech_ended_at = {}
+                        ended[call_id] = float(speech_ended_at)
                     try:
                         outcome = await run_turn(aggregated)
                     except asyncio.CancelledError:
