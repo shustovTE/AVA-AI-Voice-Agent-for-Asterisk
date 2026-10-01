@@ -785,10 +785,12 @@ Existing webhook definitions that enable summaries but omit `summary_provider` k
 | `{lead_id}` | string | Outbound lead ID |
 | `{attempt_id}` | string | Outbound dial attempt ID (the attempt shown in Call Scheduling); empty for inbound calls |
 | `{custom_vars_json}` | JSON | The outbound lead's `custom_vars` object; each key is also its own `{placeholder}` |
+| `{caller_id}` | string | The identity an outbound call was placed from, what became `CALLERID(num)`: the lead's Caller ID override or the global outbound extension; empty for inbound calls |
+| `{caller_id_source}` | string | `lead` when `{caller_id}` is the lead's override, `global` when it is the configured extension; empty for inbound calls |
 
 **Note**: `{transcript_json}` is inserted as raw JSON (not quoted), so place it directly in the template without quotes.
 
-`{call_id}`, `{caller_number}`, `{called_number}`, `{caller_name}`, `{context_name}`, `{provider}`, `{call_direction}`, `{campaign_id}`, `{lead_id}` and `{attempt_id}` are also substituted in the URL and in header values.
+`{call_id}`, `{caller_number}`, `{called_number}`, `{caller_name}`, `{context_name}`, `{provider}`, `{call_direction}`, `{campaign_id}`, `{lead_id}`, `{attempt_id}`, `{caller_id}` and `{caller_id_source}` are also substituted in the URL and in header values.
 
 ### Outbound Dials That Never Became a Call
 
@@ -809,6 +811,7 @@ Post-call tools used to run only from a call's cleanup, which needs a call sessi
 | `{summary}`, `{summary_json}` | Empty; `generate_summary` is skipped on an empty transcript |
 | `{campaign_id}`, `{lead_id}`, `{custom_vars_json}` and each custom variable | The lead's, as for an answered call |
 | `{context_name}`, `{provider}` | The lead's Agent and its provider (or the default provider) |
+| `{caller_id}`, `{caller_id_source}` | The identity the dial was placed from, as for an answered call |
 
 Branch on `{call_outcome}` in the receiving automation (an n8n Switch node, for example) where unanswered dials need different handling from conversations. A webhook that must only see conversations opts out:
 

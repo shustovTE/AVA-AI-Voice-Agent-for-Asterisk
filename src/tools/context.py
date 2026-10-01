@@ -299,6 +299,11 @@ class PostCallContext:
     campaign_id: Optional[str] = None
     lead_id: Optional[str] = None
     custom_vars: Dict[str, Any] = field(default_factory=dict)  # Outbound lead custom_vars
+    # The identity an outbound call was placed from: the lead's Caller ID
+    # override or the global outbound extension (what became CALLERID(num)),
+    # and which of the two it was ("lead" or "global"). Empty for inbound calls.
+    caller_id: Optional[str] = None
+    caller_id_source: Optional[str] = None
     # The dial attempt the call belongs to. An outbound attempt that never
     # became a call (rejected originate, ring-out, busy, answering machine,
     # consent declined) is still reported to the post-call tools that opt in:
@@ -343,6 +348,8 @@ class PostCallContext:
             "lead_id": self.lead_id or "",
             "attempt_id": self.attempt_id or "",
             "custom_vars_json": json.dumps(self.custom_vars),
+            "caller_id": self.caller_id or "",
+            "caller_id_source": self.caller_id_source or "",
         }
         # Flatten pre-call enrichment variables into individual placeholders
         # (e.g. {customer_name}) so post-call webhook bodies can reference them

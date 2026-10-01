@@ -1730,6 +1730,7 @@ class OutboundStore:
                             l.phone_number,
                             l.name AS lead_name,
                             l.custom_vars_json,
+                            l.caller_id_override,
                             l.agent_routing_method
                         FROM outbound_attempts a
                         JOIN outbound_leads l ON l.id = a.lead_id

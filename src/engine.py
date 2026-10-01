@@ -2212,6 +2212,10 @@ class Engine:
         custom_vars = meta.get("custom_vars")
         if isinstance(custom_vars, dict) and custom_vars:
             session.outbound_custom_vars = dict(custom_vars)
+        caller_id = str(meta.get("caller_id") or "").strip()
+        if caller_id:
+            session.outbound_caller_id = caller_id
+            session.outbound_caller_id_source = str(meta.get("caller_id_source") or "").strip() or None
         context = str(meta.get("context") or "").strip()
         if context:
             session.context_name = context
@@ -3272,6 +3276,7 @@ class Engine:
                                 context=context_name,
                                 provider=resolved_context_provider,
                             )
+                            caller_id, caller_id_source = self._outbound_caller_identity(lead)
                             self._outbound_attempt_meta_by_attempt_id[attempt_id] = {
                                 "attempt_id": attempt_id,
                                 "campaign_id": campaign_id,
@@ -3282,6 +3287,9 @@ class Engine:
                                 "provider": resolved_context_provider,
                                 "lead_name": str(lead.get("name") or "").strip() or None,
                                 "custom_vars": lead.get("custom_vars") or {},
+                                # What the call is placed from, for the post-call tools.
+                                "caller_id": caller_id,
+                                "caller_id_source": caller_id_source,
                                 "created_at_ts": time.time(),
                             }
 
@@ -3391,6 +3399,12 @@ class Engine:
         consent_media_uri = str(campaign.get("consent_media_uri") or "").strip()
 
         caller_id_num, caller_identity_source = self._outbound_caller_identity(lead)
+        # The post-call tools report the identity the call was placed from,
+        # whether or not the originate succeeds.
+        attempt_meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+        if isinstance(attempt_meta, dict):
+            attempt_meta["caller_id"] = caller_id_num
+            attempt_meta["caller_id_source"] = caller_identity_source
         caller_id_name = str(os.getenv("AAVA_OUTBOUND_CALLERID_NAME", "Asterisk AI")).strip() or "Asterisk AI"
         caller_id_header = f"{caller_id_name} <{caller_id_num}>"
 
@@ -3725,6 +3739,10 @@ class Engine:
                     campaign_id=str(meta.get("campaign_id") or ""),
                     lead_id=str(meta.get("lead_id") or ""),
                 )
+                if "caller_id_override" in meta and not str(meta.get("caller_id") or "").strip():
+                    # The durable row carries the lead's override: the identity
+                    # the call was placed from is the same function of it as at originate.
+                    meta["caller_id"], meta["caller_id_source"] = self._outbound_caller_identity(meta)
         if not meta:
             await self._reject_outbound_answered_attempt(
                 channel_id,
@@ -4363,6 +4381,8 @@ class Engine:
                 campaign_id=str(meta.get("campaign_id") or "") or None,
                 lead_id=str(meta.get("lead_id") or "") or None,
                 custom_vars=dict(custom_vars) if isinstance(custom_vars, dict) else {},
+                caller_id=str(meta.get("caller_id") or "").strip() or None,
+                caller_id_source=str(meta.get("caller_id_source") or "").strip() or None,
                 attempt_id=attempt_id,
                 error_message=error_text or None,
                 config=self._tool_config_for_session(None),
@@ -24416,6 +24436,8 @@ class Engine:
                 campaign_id=getattr(session, 'outbound_campaign_id', None),
                 lead_id=getattr(session, 'outbound_lead_id', None),
                 custom_vars=dict(getattr(session, 'outbound_custom_vars', {}) or {}),
+                caller_id=str(getattr(session, 'outbound_caller_id', None) or '') or None,
+                caller_id_source=str(getattr(session, 'outbound_caller_id_source', None) or '') or None,
                 attempt_id=str(getattr(session, 'outbound_attempt_id', None) or '') or None,
                 error_message=str(session_error) if session_error else None,
                 config=self._tool_config_for_session(session),

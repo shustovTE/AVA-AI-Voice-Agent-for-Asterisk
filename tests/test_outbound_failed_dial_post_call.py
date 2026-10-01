@@ -185,6 +185,9 @@ async def test_a_rejected_originate_is_reported_with_the_attempts_fields():
     assert context.campaign_id == "campaign-1"
     assert context.lead_id == "lead-1"
     assert context.custom_vars == {"amo_lead_id": "4242"}
+    # The identity the dial was placed from, stamped before the originate was refused.
+    assert (context.caller_id, context.caller_id_source) == ("6789", "global")
+    assert context.to_payload_dict()["caller_id"] == "6789"
     assert context.context_name == "sales"
     assert context.provider == "openai_realtime"
     assert context.call_duration_seconds == 0

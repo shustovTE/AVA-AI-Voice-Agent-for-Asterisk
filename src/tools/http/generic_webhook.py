@@ -547,6 +547,8 @@ class GenericWebhookTool(PostCallTool):
             "{campaign_id}": context.campaign_id or "",
             "{lead_id}": context.lead_id or "",
             "{attempt_id}": getattr(context, "attempt_id", None) or "",
+            "{caller_id}": getattr(context, "caller_id", None) or "",
+            "{caller_id_source}": getattr(context, "caller_id_source", None) or "",
         }
         
         for placeholder, value in replacements.items():

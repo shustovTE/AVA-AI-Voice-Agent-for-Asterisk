@@ -209,6 +209,10 @@ class CallSession:
     outbound_lead_id: Optional[str] = None
     outbound_attempt_id: Optional[str] = None
     outbound_custom_vars: Dict[str, Any] = field(default_factory=dict)
+    # The identity the call was placed from (the lead's Caller ID override or
+    # the global outbound extension) and which of the two it was: "lead" or "global".
+    outbound_caller_id: Optional[str] = None
+    outbound_caller_id_source: Optional[str] = None
 
     # External dialer ownership (VICIdial Remote Agent integration).
     # These are call-local snapshots so an operator edit cannot change the

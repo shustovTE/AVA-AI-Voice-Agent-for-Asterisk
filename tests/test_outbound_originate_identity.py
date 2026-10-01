@@ -64,6 +64,17 @@ def test_the_lead_override_wins_and_a_blank_one_keeps_the_global_identity():
 
 
 @pytest.mark.asyncio
+async def test_the_identity_dialed_with_is_kept_on_the_attempt_for_the_post_call_tools():
+    for lead, expected in ((_lead(caller_id_override="101"), ("101", "lead")), (_lead(), ("6789", "global"))):
+        engine = _originating_engine()
+        engine._outbound_attempt_meta_by_attempt_id["attempt-1"] = {"attempt_id": "attempt-1"}
+        await _originate(engine, lead)
+        meta = engine._outbound_attempt_meta_by_attempt_id["attempt-1"]
+        assert (meta["caller_id"], meta["caller_id_source"]) == expected
+        assert engine._outbound_attempt_meta_by_channel_id["chan-1"] is meta
+
+
+@pytest.mark.asyncio
 async def test_a_lead_with_an_override_is_dialed_as_that_extension_on_freepbx():
     engine = _originating_engine()
 

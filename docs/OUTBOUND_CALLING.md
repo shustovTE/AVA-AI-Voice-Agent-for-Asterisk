@@ -95,7 +95,9 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
 - Post-call webhooks can reference the same keys: each `custom_vars` key is a
   `{placeholder}` in the webhook `payload_template` (plus `{custom_vars_json}`
   for the raw object), so a correlation id such as `{amo_lead_id}` travels
-  back to the automation that scheduled the call.
+  back to the automation that scheduled the call. `{caller_id}` is the
+  extension the call was placed from (the lead's Caller ID override or the
+  global identity) and `{caller_id_source}` says which (`lead` or `global`).
 - Nonempty values are additionally delivered to the selected Agent as a
   read-only `## Lead Context` JSON block (untruncated). The Agent editor's
   **Lead Context block** toggle turns this off per Agent — e.g. when the prompt

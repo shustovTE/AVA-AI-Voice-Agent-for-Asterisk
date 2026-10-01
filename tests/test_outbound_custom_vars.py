@@ -118,6 +118,24 @@ async def test_answered_call_recovers_metadata_after_in_memory_state_loss():
 
 
 @pytest.mark.asyncio
+async def test_recovered_metadata_names_the_identity_the_call_was_placed_from():
+    engine = _engine(custom_vars={"task": "confirm appointment"})
+    engine._outbound_extension_identity = "6789"
+    recovered = dict(engine._outbound_attempt_meta_by_attempt_id["attempt-1"])
+    recovered.pop("caller_id", None)
+    recovered.pop("caller_id_source", None)
+    recovered["caller_id_override"] = "101"  # what the durable lead row carries
+    engine._outbound_attempt_meta_by_attempt_id.clear()
+    engine._outbound_attempt_meta_by_channel_id.clear()
+    engine.outbound_store.get_active_attempt_runtime_context.return_value = recovered
+
+    await engine._handle_outbound_answered("channel-1", {"id": "channel-1"}, ["outbound", "attempt-1"])
+
+    meta = engine._outbound_attempt_meta_by_attempt_id["attempt-1"]
+    assert (meta["caller_id"], meta["caller_id_source"]) == ("101", "lead")
+
+
+@pytest.mark.asyncio
 async def test_answered_call_fails_closed_when_attempt_metadata_is_unrecoverable():
     engine = _engine()
     engine._outbound_attempt_meta_by_attempt_id.clear()

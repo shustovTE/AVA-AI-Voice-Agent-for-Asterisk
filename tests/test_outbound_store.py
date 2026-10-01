@@ -112,6 +112,7 @@ async def test_outbound_store_recovers_active_attempt_lead_context(tmp_path, mon
         "lead_name": "Alice",
         "custom_vars_valid": True,
         "custom_vars": {"task": "confirm"},
+        "caller_id_override": None,  # the lead's own Caller ID, for the identity the call is placed from
         "routing_method": "ai_agent",
     }
 

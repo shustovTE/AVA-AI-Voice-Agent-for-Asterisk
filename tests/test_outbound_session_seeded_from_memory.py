@@ -76,6 +76,8 @@ def _meta(**overrides):
         "provider": None,
         "lead_name": "Иван",
         "custom_vars": {"amo_lead_id": "4242", "client_name": "Иван"},
+        "caller_id": "101",
+        "caller_id_source": "lead",
         "channel_id": CHANNEL,
     }
     meta.update(overrides)
@@ -167,6 +169,7 @@ async def test_the_first_save_carries_the_attempt_the_lead_the_agent_and_the_pip
         "attempt-1", "campaign-1", "lead-1")
     assert (session.caller_number, session.called_number, session.caller_name) == (PHONE, PHONE, "Иван")
     assert session.outbound_custom_vars == {"amo_lead_id": "4242", "client_name": "Иван"}
+    assert (session.outbound_caller_id, session.outbound_caller_id_source) == ("101", "lead")
     assert (session.context_name, session.routing_method) == ("receptionist", "ai_agent")
     assert (session.provider_name, session.pipeline_name) == ("pipeline", PIPELINE)
     # The channel was already gone: AAVA_OUTBOUND could not be read, the attempt in
