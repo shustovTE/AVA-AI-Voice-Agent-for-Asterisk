@@ -1987,6 +1987,17 @@ class Engine:
                 silence_ms = 0
                 if not speaking and speech_ms >= 120:
                     speaking = True
+                    state["sound_started_at"] = time.monotonic()
+                    # The detector is silent otherwise, and a line that beeps
+                    # or hums reads in the log as a watchdog that never fires.
+                    logger.info(
+                        "Caller sound reported to the inactivity watchdog",
+                        call_id=session.call_id,
+                        source=source,
+                        energy=energy,
+                        threshold=int(threshold),
+                        webrtc_vad=webrtc_positive,
+                    )
                     await watchdog.note_input_state(
                         session.call_id,
                         True,
@@ -1997,6 +2008,13 @@ class Engine:
                 speech_ms = 0
                 if speaking and silence_ms >= 300:
                     speaking = False
+                    started = state.get("sound_started_at")
+                    logger.info(
+                        "Caller sound ended",
+                        call_id=session.call_id,
+                        source=source,
+                        duration_ms=int((time.monotonic() - float(started)) * 1000) if started else None,
+                    )
                     await watchdog.note_input_state(
                         session.call_id,
                         False,

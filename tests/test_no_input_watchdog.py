@@ -974,6 +974,106 @@ async def test_the_stall_final_message_is_not_a_caller_turn_and_the_call_is_hung
 
 
 @pytest.mark.asyncio
+async def test_a_periodic_sound_on_the_line_does_not_restart_the_check_ins():
+    """Reproduces call 1790942541.19976 of 2026-10-02: nine check-ins, attempt 1 each, never the final message."""
+    announcements = []
+    hangups = []
+
+    async def announce(call_id, text, kind):
+        announcements.append((kind, watchdog.snapshot(call_id)["check_ins"]))
+        await watchdog.note_agent_output_start(call_id)
+        await asyncio.sleep(0.02)
+        await watchdog.note_agent_output_end(call_id)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    policy = NoInputPolicy(initial_timeout_sec=0.05, grace_timeout_sec=0.12, max_check_ins=1)
+    await watchdog.register("beeping", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("beeping")
+
+        async def beep():
+            # A tone the energy detector reports as caller sound; the recognizer never hears words.
+            while watchdog.has_call("beeping"):
+                await watchdog.note_input_state("beeping", True, "audio_vad:audiosocket")
+                await asyncio.sleep(0.01)
+                await watchdog.note_input_state("beeping", False, "audio_vad:audiosocket")
+                await asyncio.sleep(0.14)
+
+        task = asyncio.create_task(beep())
+        try:
+            await _wait_until(lambda: hangups == ["beeping"])
+        finally:
+            task.cancel()
+        assert announcements == [("check_in", 1), ("final", 1)]
+        assert watchdog.snapshot("beeping")["phase"] == "hangup"
+    finally:
+        await watchdog.stop("beeping")
+
+
+@pytest.mark.asyncio
+async def test_a_check_in_does_not_restart_the_stall_timer():
+    announcements = []
+    hangups = []
+
+    async def announce(call_id, text, kind):
+        announcements.append(kind)
+        await watchdog.note_agent_output_start(call_id)
+        await asyncio.sleep(0.01)
+        await watchdog.note_agent_output_end(call_id)
+        return True
+
+    async def hangup(call_id):
+        hangups.append(call_id)
+
+    watchdog = NoInputWatchdog(announce, hangup)
+    # The check-in flow alone would take 0.03 + 0.5 s; the stall timer ends the call first.
+    policy = NoInputPolicy(initial_timeout_sec=0.03, grace_timeout_sec=0.5, max_check_ins=1, stall_timeout_sec=0.12)
+    await watchdog.register("stalled", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("stalled")
+        await _wait_until(lambda: hangups == ["stalled"])
+        assert announcements == ["check_in", "final"]
+        snapshot = watchdog.snapshot("stalled")
+        assert snapshot["phase"] == "stall_hangup"
+        assert snapshot["last_exchange_source"] == "ready"  # neither announcement counted
+    finally:
+        await watchdog.stop("stalled")
+
+
+@pytest.mark.asyncio
+async def test_sound_holds_the_clock_but_only_a_turn_restarts_the_check_ins():
+    watchdog = NoInputWatchdog(AsyncMock(return_value=True), AsyncMock(), clock=lambda: 1000.0)
+    policy = NoInputPolicy(initial_timeout_sec=30.0, grace_timeout_sec=15.0, max_check_ins=1)
+    await watchdog.register("grace", policy, is_outbound=False)
+    try:
+        state = watchdog._states["grace"]
+        state.ready = True
+        state.phase = "grace"
+        state.check_ins = 1
+        state.deadline = 1015.0
+
+        await watchdog.note_input_state("grace", True, "engine:silero_vad")
+        snapshot = watchdog.snapshot("grace")
+        assert (snapshot["phase"], snapshot["check_ins"], snapshot["deadline"], snapshot["input_active"]) == ("grace", 1, None, True)
+        assert snapshot["last_sound_source"] == "engine:silero_vad"
+        assert snapshot["last_activity_source"] == "call_start"  # sound is not activity
+
+        await watchdog.note_input_state("grace", False, "engine:silero_vad")
+        snapshot = watchdog.snapshot("grace")
+        assert (snapshot["phase"], snapshot["check_ins"], snapshot["deadline"]) == ("grace", 1, 1030.0)
+
+        await watchdog.note_activity("grace", "pipeline:transcript")
+        snapshot = watchdog.snapshot("grace")
+        assert (snapshot["phase"], snapshot["check_ins"]) == ("waiting", 0)
+    finally:
+        await watchdog.stop("grace")
+
+
+@pytest.mark.asyncio
 async def test_stall_timer_runs_for_outbound_calls_without_check_ins():
     announcements = []
     hangups = []

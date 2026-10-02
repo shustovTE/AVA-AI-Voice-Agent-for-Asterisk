@@ -164,6 +164,10 @@ class _CallState:
     output_pause_remaining: Optional[float] = None
     last_activity_at: float = field(default_factory=time.monotonic)
     last_activity_source: str = "call_start"
+    # The last caller sound a detector reported. Sound holds the clock while it
+    # lasts and nothing more: it is not a turn and not an exchange.
+    last_sound_at: Optional[float] = None
+    last_sound_source: Optional[str] = None
     # Whether the check-in/final-message machinery runs for this call (the
     # direction gates); the stall timer runs whenever the policy sets it.
     inactivity_enabled: bool = True
@@ -215,6 +219,8 @@ class NoInputWatchdog:
             "deadline": state.deadline,
             "last_activity_at": state.last_activity_at,
             "last_activity_source": state.last_activity_source,
+            "last_sound_at": state.last_sound_at,
+            "last_sound_source": state.last_sound_source,
             "inactivity_enabled": state.inactivity_enabled,
             "stall_timeout_sec": state.policy.stall_timeout_sec,
             "last_exchange_at": state.last_exchange_at,
@@ -344,7 +350,17 @@ class NoInputWatchdog:
         self._wake(state)
 
     async def note_input_state(self, call_id: str, active: bool, source: str) -> None:
-        """Pause timing for sustained caller speech and restart after it ends."""
+        """Pause timing while a detector reports caller sound; resume after it ends.
+
+        Sound is not an answer. A detector (Silero VAD, TALK_DETECT, the
+        engine's energy detector) also reports a tone, hold music, noise and
+        a cough the recognizer returns nothing for, and counting any of it as
+        the caller being back restarted the check-ins: a dead line that beeped
+        every half minute got a fresh "are you still there?" after every beep
+        and never the final message. The check-in count and the activity clock
+        move only on a caller turn (``note_activity``); sound holds the clock
+        while it lasts, and the window starts over when it ends.
+        """
         state = self._states.get(call_id)
         if not state or state.terminal:
             return
@@ -356,12 +372,10 @@ class NoInputWatchdog:
             return
         state.input_active = bool(active)
         if active:
-            state.last_activity_at = self._clock()
-            state.last_activity_source = source
-            state.check_ins = 0
-            state.phase = "waiting"
+            state.last_sound_at = self._clock()
+            state.last_sound_source = source
             state.deadline = None
-            _NO_INPUT_EVENTS.labels("caller_activity").inc()
+            _NO_INPUT_EVENTS.labels("caller_sound").inc()
         elif state.ready and not state.output_active and not state.processing and not state.suspended:
             self._reset_initial_deadline(state)
         self._wake(state)
@@ -395,11 +409,12 @@ class NoInputWatchdog:
             return
         state.output_active = False
         state.processing = False
-        if reset_timer:
-            # The agent finished an utterance (a reply, a greeting or one of the
-            # watchdog's own announcements): an exchange. A hosted agent's reply
-            # to its own silence pseudo-turn (reset_timer=False) is not one, so
-            # it cannot keep a stalled call open either.
+        if reset_timer and not state.self_announcement:
+            # The agent finished an utterance (a reply or the greeting): an
+            # exchange. A hosted agent's reply to its own silence pseudo-turn
+            # (reset_timer=False) is not one, and neither are the watchdog's
+            # own check-ins and final message: a line that never answers must
+            # not keep itself open with them.
             self._note_exchange(state, "agent_output")
         if preserve_policy_state:
             state.output_pause_remaining = None
