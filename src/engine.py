@@ -564,6 +564,11 @@ def _ts_msg(role: str, content, **extra) -> dict:
 # Keys that LLM chat-completion APIs accept in message objects.
 _LLM_MSG_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id"}
 
+# How long a watchdog announcement waits, once it has played, for the caller's
+# speech over it to end and its recognizer result to reach the dialog, so the
+# watchdog's decision right after it counts that answer.
+NO_INPUT_ANSWER_WAIT_SEC = 6.0
+
 
 def _ms_since(started_at: float) -> int:
     """Whole milliseconds elapsed since a ``time.monotonic()`` reading."""
@@ -906,6 +911,9 @@ class Engine:
         self._utterance_cutters: Dict[str, UtteranceCutter] = {}
         self._resample_state_utterance16k: Dict[str, Optional[tuple]] = {}
         self._pipeline_utterance_starts: Dict[str, deque] = {}
+        # The calls whose caller is speaking over a watchdog announcement right
+        # now: their utterance is kept whole (logged once per utterance).
+        self._pipeline_speech_over_announcement: Set[str] = set()
         self._pipeline_utterance_fallback_warned: Set[str] = set()
         # The reply a pipeline turn is producing right now, so the caller
         # going on before its first sound can discard it, and the event that
@@ -8756,6 +8764,8 @@ class Engine:
             return False
         starts = self._pipeline_utterance_starts.setdefault(call_id, deque(maxlen=16))
         starts.append((float(utterance.started_at), bool(utterance.interrupted_agent)))
+        over_announcement = call_id in (getattr(self, "_pipeline_speech_over_announcement", None) or set())
+        (getattr(self, "_pipeline_speech_over_announcement", None) or set()).discard(call_id)
         logger.info(
             "Caller utterance sent to the recognizer",
             call_id=call_id,
@@ -8763,6 +8773,7 @@ class Engine:
             duration_ms=int(utterance.duration_ms),
             signal_ms=int(utterance.signal_ms),
             interrupted_agent=bool(utterance.interrupted_agent),
+            over_announcement=over_announcement,
             reason=utterance.reason,
         )
         if expect_result:
@@ -11415,6 +11426,7 @@ class Engine:
             self._utterance_cutters.pop(call_id, None)
             self._resample_state_utterance16k.pop(call_id, None)
             self._pipeline_utterance_starts.pop(call_id, None)
+            self._pipeline_speech_over_announcement.discard(call_id)
             self._pipeline_utterance_fallback_warned.discard(call_id)
             self._pipeline_reply_inflight.pop(call_id, None)
             self._pipeline_caller_resumed.pop(call_id, None)
@@ -13417,12 +13429,15 @@ class Engine:
             if event == "start":
                 if cutter is not None:
                     cutter.speech_started()
+                    self._keep_answer_over_announcement_whole(session, cutter)
                 await self._on_silero_speech_started(session, tracker, source=source)
             elif event == "stop":
                 utterance = cutter.speech_stopped() if cutter is not None else None
                 await self._on_silero_speech_finished(
                     session, tracker, source=source, utterance=utterance
                 )
+        if cutter is not None and tracker.talking:
+            self._keep_answer_over_announcement_whole(session, cutter)
         deferred_since = (getattr(self, "_silero_deferred_barge_in", None) or {}).get(call_id)
         if deferred_since is not None:
             if tracker.talking:
@@ -13437,6 +13452,80 @@ class Engine:
             piece = cutter.split_overflow()
             if piece is not None:
                 self._send_pipeline_utterance(call_id, piece, expect_result=True)
+
+    @staticmethod
+    def _no_input_announcement_active(session: Optional[CallSession]) -> bool:
+        """Whether the inactivity watchdog's check-in or final message is being spoken right now."""
+        state = getattr(session, "no_input_state", None) if session is not None else None
+        return bool(isinstance(state, dict) and state.get("announcement_active"))
+
+    def _keep_answer_over_announcement_whole(self, session: CallSession, cutter: UtteranceCutter) -> None:
+        """The caller is talking over the watchdog's own announcement: what they say is their answer.
+
+        The protection window still keeps the check-in or final message from
+        being cut by its own echo, but the caller's words over it are not
+        something to hold back: the utterance goes to the recognizer whole,
+        the frames muted while the announcement was audible included, so a
+        short "yes" said over "are you still there?" is heard instead of being
+        dropped as silence. Whatever the recognizer returns is taken as said.
+        """
+        if not self._no_input_announcement_active(session):
+            return
+        marks = getattr(self, "_pipeline_speech_over_announcement", None)
+        if marks is None:
+            marks = self._pipeline_speech_over_announcement = set()
+        call_id = session.call_id
+        if call_id not in marks:
+            logger.info(
+                "Caller speaking over an inactivity announcement; the utterance is kept whole",
+                call_id=call_id,
+                kind=(getattr(session, "no_input_state", None) or {}).get("announcement_kind"),
+            )
+            marks.add(call_id)
+        cutter.keep_whole()
+
+    async def _await_answer_over_announcement(self, call_id: str, *, kind: str) -> None:
+        """Let the caller's words over a watchdog announcement reach the dialog before the watchdog decides.
+
+        Right after its check-in or final message the watchdog decides whether
+        the caller answered: by a turn having reached the model. Words spoken
+        over the end of the announcement are still with Silero or the
+        recognizer at that moment, so the announcement waits, at most
+        ``NO_INPUT_ANSWER_WAIT_SEC``, until the caller is quiet and the result
+        has arrived; an answer over "goodbye" keeps the call. Only Silero's
+        speech and a recent pending result hold it, never raw line sound, so a
+        tone or a ringback never does.
+        """
+        if not self._pipeline_utterance_mode(call_id):
+            return
+
+        def outstanding() -> Optional[str]:
+            tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+            if tracker is not None and bool(getattr(tracker, "talking", False)):
+                return "caller talking"
+            expected_at = (getattr(self, "_pipeline_stt_final_expected_at", None) or {}).get(call_id)
+            if expected_at is not None and time.monotonic() - float(expected_at) <= 5.0:
+                return "result pending"
+            return None
+
+        reason = outstanding()
+        if reason is None:
+            return
+        started = time.monotonic()
+        deadline = started + NO_INPUT_ANSWER_WAIT_SEC
+        while outstanding() is not None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        # Let the dialog worker take the result off its queue and note the turn.
+        await asyncio.sleep(0.05)
+        logger.info(
+            "Waited for the caller's answer over an inactivity announcement",
+            call_id=call_id,
+            kind=kind,
+            reason=reason,
+            settled=outstanding() is None,
+            waited_ms=int((time.monotonic() - started) * 1000),
+            limit_ms=int(NO_INPUT_ANSWER_WAIT_SEC * 1000),
+        )
 
     async def _on_silero_speech_started(
         self, session: CallSession, tracker: SileroCallerTracker, *, source: str
@@ -13664,6 +13753,7 @@ class Engine:
             if utterance is not None:
                 expect_result = self._send_pipeline_utterance(call_id, utterance, expect_result=True)
                 finalize_requested = expect_result
+            (getattr(self, "_pipeline_speech_over_announcement", None) or set()).discard(call_id)
         elif bool(getattr(session, "audio_capture_enabled", True)):
             last_final = (getattr(self, "_pipeline_last_final_at", None) or {}).get(call_id)
             last_speech = tracker.last_speech_at
@@ -17275,6 +17365,7 @@ class Engine:
                         })
                         await self._save_session(session)
                     await asyncio.sleep(0.25)
+                    await self._await_answer_over_announcement(call_id, kind=kind)
                     delivery_complete = True
                     return True
                 audio = bytearray()
@@ -17310,6 +17401,7 @@ class Engine:
                 )
                 if delivery_complete:
                     await asyncio.sleep(0.25)
+                    await self._await_answer_over_announcement(call_id, kind=kind)
                 return delivery_complete
 
             provider = self._call_providers.get(call_id)

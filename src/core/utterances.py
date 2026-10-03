@@ -154,6 +154,17 @@ class UtteranceCutter:
         what the caller said, like after a barge-in, but the utterance is not
         marked as having interrupted the agent: the reply completed.
         """
+        self.keep_whole()
+
+    def keep_whole(self) -> None:
+        """The utterance around now is sent whole, without counting as an interruption.
+
+        The frames muted while the agent was audible are read back as what the
+        caller said. Used when what the caller says over the agent is their
+        answer to it rather than something the protection window holds back:
+        a reply that ended on its own, or the inactivity watchdog's own
+        check-in or final message.
+        """
         self._whole_at = self.position
 
     def _trim(self) -> None:
