@@ -11949,6 +11949,53 @@ class Engine:
             logger.error("Error binding AudioSocket UUID", conn_id=conn_id, uuid=uuid_str, error=str(exc), exc_info=True)
             return False
 
+    def _probe_audiosocket_first_frame(
+        self, session: CallSession, frame: AudioSocketAudioFrame, call_id: str
+    ) -> None:
+        """Log the format and level of a call's first inbound AudioSocket frame.
+
+        AudioSocket carries signed-linear audio little-endian, at the rate its
+        message type names, so the frame is taken as it comes. The probe used
+        to guess the byte order from this one frame's energy, and the guess
+        was backwards: byte-swapping a quiet, correctly ordered frame makes it
+        loud, so a 16 kHz call whose first frame was line noise or a breath
+        would have had every frame swapped into noise. The rule never ran only
+        because the probe raised first: the audio handler's own later
+        ``import audioop`` leaves the name unbound above it, which is why the
+        probe lives in a method of its own. ``rms_swapped`` stays in the log
+        for a client that does send big-endian audio.
+        """
+        vad_state = getattr(session, "vad_state", None)
+        if not isinstance(vad_state, dict):
+            vad_state = session.vad_state = {}
+        if vad_state.get("format_probe_done"):
+            return
+        vad_state["format_probe_done"] = True
+        vad_state["pcm16_inbound_swap"] = False
+        audio = frame.payload
+        try:
+            if str(frame.encoding).startswith("slin"):
+                logger.info(
+                    "AudioSocket frame probe",
+                    call_id=call_id,
+                    audiosocket_format=frame.encoding,
+                    sample_rate=frame.sample_rate,
+                    message_type=f"0x{frame.message_type:02x}",
+                    frame_bytes=len(audio),
+                    rms_native=audioop.rms(audio, 2),
+                    rms_swapped=audioop.rms(audioop.byteswap(audio, 2), 2),
+                )
+            else:
+                logger.info(
+                    "AudioSocket frame probe",
+                    call_id=call_id,
+                    audiosocket_format=frame.encoding,
+                    frame_bytes=len(audio),
+                    rms_pcm8k=audioop.rms(audioop.ulaw2lin(audio, 2), 2),
+                )
+        except Exception:
+            logger.debug("AudioSocket frame probe failed", call_id=call_id, exc_info=True)
+
     async def _audiosocket_handle_audio(
         self,
         conn_id: str,
@@ -12028,68 +12075,8 @@ class Engine:
             except Exception:
                 pass
 
-            # First-frame diagnostics probe (no mutation): log RMS for format verification
-            try:
-                vad_state = session.vad_state
-            except Exception:
-                vad_state = session.vad_state = {}
-            if not vad_state.get('format_probe_done'):
-                try:
-                    as_fmt = frame_format
-                    if as_fmt.startswith('slin'):
-                        rms_native = audioop.rms(audio_bytes, 2)
-                        try:
-                            swapped = audioop.byteswap(audio_bytes, 2)
-                            rms_swapped = audioop.rms(swapped, 2)
-                        except Exception:
-                            rms_swapped = 0
-                        logger.info(
-                            "AudioSocket frame probe",
-                            call_id=caller_channel_id,
-                            audiosocket_format=as_fmt,
-                            sample_rate=frame_rate,
-                            message_type=f"0x{frame.message_type:02x}",
-                            frame_bytes=len(audio_bytes),
-                            rms_native=rms_native,
-                            rms_swapped=rms_swapped,
-                        )
-                        # Determine if inbound PCM16 appears byte-swapped (big-endian on wire)
-                        try:
-                            frame_bytes = len(audio_bytes)
-                            # Conservative rule: only flag swap when swapped energy is clearly higher
-                            swap_flag = (
-                                frame_bytes >= 640 and  # 20ms @ 16k PCM
-                                rms_swapped >= 2048 and
-                                rms_swapped >= 16 * max(1, rms_native)
-                            )
-                            vad_state['pcm16_inbound_swap'] = bool(swap_flag)
-                            if swap_flag:
-                                logger.warning(
-                                    "Inbound slin16 appears byte-swapped; will normalize to PCM16-LE for processing",
-                                    call_id=caller_channel_id,
-                                    rms_native=rms_native,
-                                    rms_swapped=rms_swapped,
-                                )
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            pcm = audioop.ulaw2lin(audio_bytes, 2)
-                            rms_pcm = audioop.rms(pcm, 2)
-                        except Exception:
-                            rms_pcm = 0
-                        logger.info(
-                            "AudioSocket frame probe",
-                            call_id=caller_channel_id,
-                            audiosocket_format=as_fmt,
-                            frame_bytes=len(audio_bytes),
-                            rms_pcm8k=rms_pcm,
-                        )
-                        # μ-law path: no PCM16 swap needed
-                        vad_state['pcm16_inbound_swap'] = False
-                    vad_state['format_probe_done'] = True
-                except Exception:
-                    pass
+            # First-frame diagnostics probe: logs the format and level, never alters the audio.
+            self._probe_audiosocket_first_frame(session, frame, caller_channel_id)
 
             try:
                 swap_needed_flag = bool(session.vad_state.get('pcm16_inbound_swap', False))
