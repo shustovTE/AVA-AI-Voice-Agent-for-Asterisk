@@ -7,7 +7,7 @@ import { Save, Activity, AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { YamlErrorBanner, YamlErrorInfo } from '../../components/ui/YamlErrorBanner';
 import { ConfigSection } from '../../components/ui/ConfigSection';
 import { ConfigCard } from '../../components/ui/ConfigCard';
-import { FormInput, FormSwitch } from '../../components/ui/FormComponents';
+import { FormInput, FormSelect, FormSwitch } from '../../components/ui/FormComponents';
 import { sanitizeConfigForSave } from '../../utils/configSanitizers';
 import { getCachedConfig, loadConfigYaml } from '../../utils/configCache';
 import { useRestartRequired } from '../../hooks/useRestartRequired';
@@ -382,6 +382,24 @@ const VADPage = () => {
                                 value={vadConfig.silero_stop_ms ?? 300}
                                 onChange={(e) => updateVADConfig('silero_stop_ms', parseInt(e.target.value))}
                                 tooltip="Silence after the caller's last speech before they count as quiet. This is the pause a caller may take mid-sentence; the answer follows it by the pipeline's grace plus the recognizer's finalization. 300 ms is snappy, 600–800 ms tolerates thinking aloud."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormSelect
+                                label="Scoring Rate"
+                                value={vadConfig.silero_sample_rate ? String(vadConfig.silero_sample_rate) : ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updateVADConfig('silero_sample_rate', raw === '' ? undefined : parseInt(raw));
+                                }}
+                                options={[
+                                    { value: '', label: "The line's own rate" },
+                                    { value: '16000', label: '16 kHz (upsample 8 kHz lines)' },
+                                    { value: '8000', label: '8 kHz' },
+                                ]}
+                                tooltip="The rate Silero scores the caller at. On 8 kHz telephone lines 16 kHz catches short answers after a silent line ('yes', 'hello') that the 8 kHz model leaves at the threshold; it costs about twice the CPU per chunk (still under half a millisecond) and makes barge-in as sensitive. Only Silero gets the converted audio; the recognizer, Smart Turn and the energy checks keep the line's own."
                                 disabled={!vadConfig.silero_enabled}
                             />
                         </div>

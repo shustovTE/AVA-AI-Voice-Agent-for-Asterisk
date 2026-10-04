@@ -1071,6 +1071,14 @@ class VADConfig(BaseModel):
     silero_start_ms: int = Field(default=96, ge=0)
     # Silence after the last speech before the caller counts as quiet.
     silero_stop_ms: int = Field(default=300, ge=0)
+    # The rate Silero scores the caller's audio at. Unset, the line's own rate
+    # (8 or 16 kHz; any other rate is converted to 16 kHz). 16000 scores 8 kHz
+    # telephone audio at 16 kHz, upsampled first: after a silent line Silero's
+    # 8 kHz model put short answers ("да", "алло") right at the threshold,
+    # its 16 kHz model well above it. 8000 scores wideband audio at 8 kHz.
+    # Only Silero gets the converted audio; the recognizer, Smart Turn and the
+    # energy checks keep the line's own.
+    silero_sample_rate: Optional[Literal[8000, 16000]] = Field(default=None)
     # Silence fed to the recognizer once the caller is quiet so it finalizes at
     # once instead of waiting out its own gate (T-one holds 600 ms); 0 disables.
     silero_stt_finalize_ms: int = Field(default=900, ge=0)

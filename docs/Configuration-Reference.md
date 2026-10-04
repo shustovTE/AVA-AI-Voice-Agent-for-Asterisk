@@ -692,6 +692,27 @@ providers are not affected.
   mid-sentence; the answer follows it by the pipeline's grace plus the
   recognizer's finalization, so 300 ms is snappy and 600–800 ms tolerates a
   caller who thinks aloud.
+- `vad.silero_sample_rate`: the rate Silero scores the caller's audio at,
+  `8000` or `16000` (default unset: the line's own rate, 8 or 16 kHz; any
+  other rate is converted to 16 kHz as before). `16000` upsamples 8 kHz
+  telephone audio for Silero (linearly, per 20 ms frame). After a silent line
+  (operators that suppress silence send digital near-zero between phrases)
+  Silero's 8 kHz model can score a short answer such as «да», «тут» or
+  «алло» right at the threshold, so whether it opens an utterance depends on
+  where its 32 ms chunk grid falls, while its 16 kHz model scores the same
+  audio well above it: on a recorded outbound call whose last four answers
+  never reached the recognizer, scoring at 16 kHz caught all four at every
+  grid offset (2.4 on average at 8 kHz) and 23.2 of the call's 26 caller
+  phrases on average (21.1 at 8 kHz), with no extra cuts on the line's
+  background. `8000` scores
+  wideband audio at 8 kHz (alias-safe downsampling). Only Silero gets the
+  converted audio: the recognizer, Smart Turn and the energy checks keep the
+  line's own, and Silero keeps its 32 ms cadence. The cost is about twice
+  the CPU per chunk (about 0.4 ms instead of 0.2 ms, on the event loop), and
+  since Silero also drives barge-in, barge-in becomes as sensitive. The
+  per-call log line `Silero VAD tracking caller speech` carries the
+  `sample_rate` in use (`line` when unset). VAD page → *Silero VAD* →
+  *Scoring Rate*.
 - `vad.silero_stt_finalize_ms`: silence fed to the recognizer the moment the
   caller is quiet (default `900`, `0` disables). A streaming recognizer only
   closes a phrase after its own silence gate (T-one: 600 ms, at 300 ms chunk

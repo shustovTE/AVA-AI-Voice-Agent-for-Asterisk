@@ -901,6 +901,8 @@ class Engine:
         # window: when it ends and they are still talking, they interrupt.
         self._silero_deferred_barge_in: Dict[str, float] = {}
         self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
+        # Per-call state of the conversion to vad.silero_sample_rate.
+        self._resample_state_silero_vad: Dict[str, Optional[tuple]] = {}
         self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
         # Silero cuts the caller's utterances for the recognizer
         # (vad.silero_stt_utterances): one cutter per pipeline call, its
@@ -11422,6 +11424,7 @@ class Engine:
             self._silero_trackers.pop(call_id, None)
             self._silero_deferred_barge_in.pop(call_id, None)
             self._resample_state_silero16k.pop(call_id, None)
+            self._resample_state_silero_vad.pop(call_id, None)
             self._turn_audio.pop(call_id, None)
             self._utterance_cutters.pop(call_id, None)
             self._resample_state_utterance16k.pop(call_id, None)
@@ -13285,6 +13288,7 @@ class Engine:
             return default if value is None else value
 
         stop_threshold = _get("silero_stop_threshold", None)
+        sample_rate = _get("silero_sample_rate", None)
         return {
             "enabled": bool(_get("silero_enabled", False)),
             "model_path": str(_get("silero_model_path", SILERO_DEFAULT_MODEL_PATH) or SILERO_DEFAULT_MODEL_PATH),
@@ -13293,6 +13297,8 @@ class Engine:
             "stop_threshold": float(stop_threshold) if stop_threshold is not None else None,
             "start_ms": int(_get("silero_start_ms", 96)),
             "stop_ms": int(_get("silero_stop_ms", 300)),
+            # None: the line's own rate.
+            "sample_rate": int(sample_rate) if sample_rate else None,
             "stt_finalize_ms": int(_get("silero_stt_finalize_ms", 900)),
             "barge_in": bool(_get("silero_barge_in", True)),
             "stt_utterances": bool(_get("silero_stt_utterances", False)),
@@ -13342,6 +13348,7 @@ class Engine:
             stop_threshold=settings["stop_threshold"],
             start_ms=settings["start_ms"],
             stop_ms=settings["stop_ms"],
+            sample_rate=settings["sample_rate"] or "line",
             stt_finalize_ms=settings["stt_finalize_ms"],
             barge_in=settings["barge_in"],
         )
@@ -13403,8 +13410,11 @@ class Engine:
         cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
         if cutter is not None:
             self._feed_utterance_cutter(session, cutter, pcm16, rate)
+        scored = self._silero_scoring_audio(call_id, pcm16, rate)
+        if scored is None:
+            return
         try:
-            events = tracker.feed(pcm16, rate)
+            events = tracker.feed(*scored)
         except Exception:
             logger.debug("Silero VAD inference failed", call_id=call_id, source=source, exc_info=True)
             return
@@ -13439,6 +13449,33 @@ class Engine:
             piece = cutter.split_overflow()
             if piece is not None:
                 self._send_pipeline_utterance(call_id, piece, expect_result=True)
+
+    def _silero_scoring_audio(self, call_id: str, pcm16: bytes, rate: int) -> Optional[Tuple[bytes, int]]:
+        """The caller's frame at the rate Silero scores it at (``vad.silero_sample_rate``).
+
+        Only Silero gets the converted frame. Upsampling is linear, as for any
+        other line rate: on the recorded 8 kHz call that motivated the setting
+        it let Silero score short answers more surely than an alias-free
+        upsampler did. Downsampling is alias-safe. None when the frame cannot
+        be converted, so Silero skips it rather than restart at the line rate.
+        """
+        target = self._silero_config().get("sample_rate")
+        if not target or target == rate:
+            return pcm16, rate
+        states = getattr(self, "_resample_state_silero_vad", None)
+        if states is None:
+            states = self._resample_state_silero_vad = {}
+        try:
+            converted, states[call_id] = resample_audio(
+                pcm16,
+                rate,
+                target,
+                state=states.get(call_id),
+                mode="linear" if target > rate else "fir",
+            )
+        except (TypeError, ValueError, IndexError, ZeroDivisionError):
+            return None
+        return converted, target
 
     @staticmethod
     def _no_input_announcement_active(session: Optional[CallSession]) -> bool:
@@ -17563,6 +17600,7 @@ class Engine:
                     call_id=call_id,
                     stop_ms=self._silero_config()["stop_ms"],
                     stt_finalize_ms=self._silero_config()["stt_finalize_ms"],
+                    sample_rate=self._silero_config()["sample_rate"] or "line",
                 )
                 if self._silero_config()["stt_utterances"]:
                     self._utterance_cutters[call_id] = UtteranceCutter(
