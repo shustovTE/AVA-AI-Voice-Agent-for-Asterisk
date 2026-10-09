@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import time
 import uuid
@@ -1463,8 +1464,11 @@ class OpenAITTSAdapter(TTSComponent):
         )
 
         if streaming:
-            async for frame in self._stream_frames(call_id, url, headers, payload, merged):
-                yield frame
+            async with contextlib.aclosing(
+                self._stream_frames(call_id, url, headers, payload, merged)
+            ) as frames:
+                async for frame in frames:
+                    yield frame
             return
 
         async def _post_tts(req_payload: Dict[str, Any]) -> tuple[int, bytes, str]:

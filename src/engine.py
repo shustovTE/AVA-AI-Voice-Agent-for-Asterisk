@@ -8395,31 +8395,57 @@ class Engine:
         farewell_mode, _timeout = self._resolve_local_farewell_settings(local_config)
         return farewell_mode != "asterisk"
 
-    async def _tts_chunks_while_wanted(
-        self, call_id: str, stream_id: Optional[str], chunks: Any
-    ) -> AsyncIterator[bytes]:
-        """Yield the chunks of a reply's synthesis while the reply is still wanted.
+    def _raise_if_pipeline_stream_unwanted(self, call_id: str, stream_id: Optional[str]) -> None:
+        """Reject stale output before asking either provider for another chunk."""
+        if self._pipeline_reply_superseded(call_id):
+            raise _PipelinePlaybackInterrupted("reply superseded before its next output")
+        if stream_id:
+            manager = self.streaming_playback_manager
+            info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+            stopping = info.get("stream_id") == stream_id and (
+                info.get("stop_requested") or info.get("end_reason") == "barge-in"
+            )
+            if stopping or not manager.is_stream_active(call_id, stream_id):
+                raise _PipelinePlaybackInterrupted(f"pipeline stream {stream_id} is no longer active")
 
-        The wait for the next chunk ends the moment the caller goes on: a reply
-        superseded before its first sound, or a stream a barge-in stopped, is
-        given up at once instead of at the next chunk, so a synthesis that has
-        stalled cannot hold the turn. The synthesis generator is closed on the
-        way out, which cancels its HTTP request.
+    async def _pipeline_chunks_while_wanted(
+        self, call_id: str, stream_id: Optional[str], chunks: Any
+    ) -> AsyncIterator[Any]:
+        """Read LLM tokens or TTS audio only while their reply still owns playback.
+
+        Caller activity wakes a blocked read; supersession or a stopped stream
+        cancels it. Mere speech inside the protection window is not a stop.
+        Consumers must use ``aclosing`` so a failure while handling a yielded
+        chunk also closes the provider request, without waiting for GC.
         """
         event = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
         iterator = chunks.__aiter__()
         next_task: Optional[asyncio.Task] = None
+
+        async def read_next() -> Any:
+            # Barge-in can run after this task is scheduled but before it starts.
+            self._raise_if_pipeline_stream_unwanted(call_id, stream_id)
+            return await iterator.__anext__()
+
         try:
             while True:
+                self._raise_if_pipeline_stream_unwanted(call_id, stream_id)
                 if next_task is None:
-                    next_task = asyncio.ensure_future(iterator.__anext__())
+                    next_task = asyncio.create_task(read_next())
                 waiters = {next_task}
                 wake_task = asyncio.ensure_future(event.wait()) if event is not None else None
                 if wake_task is not None:
                     waiters.add(wake_task)
-                done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-                if wake_task is not None and wake_task not in done:
-                    wake_task.cancel()
+                try:
+                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    if wake_task is not None:
+                        wake_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await wake_task
+                # Interruption wins even if a token/chunk or EOF arrived in the
+                # same event-loop tick. In particular, do not flush stale text.
+                self._raise_if_pipeline_stream_unwanted(call_id, stream_id)
                 if next_task in done:
                     task, next_task = next_task, None
                     try:
@@ -8428,22 +8454,44 @@ class Engine:
                         return
                     yield chunk
                     continue
-                # The caller spoke while the next chunk was awaited.
-                if self._pipeline_reply_superseded(call_id):
-                    raise _PipelinePlaybackInterrupted("reply superseded while its audio was awaited")
-                if stream_id and not self.streaming_playback_manager.is_stream_active(call_id, stream_id):
-                    raise _PipelinePlaybackInterrupted(f"pipeline stream {stream_id} is no longer active")
                 if event is not None:
                     event.clear()
         finally:
-            if next_task is not None and not next_task.done():
-                next_task.cancel()
+            if next_task is not None:
+                if not next_task.done():
+                    next_task.cancel()
+                # Retrieve even a completed read's exception if interruption won.
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await next_task
-            aclose = getattr(chunks, "aclose", None)
+            aclose = getattr(iterator, "aclose", None)
             if callable(aclose):
                 with contextlib.suppress(Exception):
                     await aclose()
+
+    async def _llm_tokens_while_wanted(
+        self, pipeline: Any, call_id: str, stream_id: str,
+        transcript: str, context: Dict[str, Any], options: Dict[str, Any],
+    ) -> AsyncIterator[str]:
+        """Close an interrupted LLM stream, including while TTS holds the consumer."""
+        completed = False
+        try:
+            async with contextlib.aclosing(self._pipeline_chunks_while_wanted(
+                call_id, stream_id,
+                pipeline.llm_adapter.generate_stream(call_id, transcript, context, options),
+            )) as tokens:
+                async for token in tokens:
+                    yield token
+            completed = True
+        finally:
+            if not completed:
+                # HTTP adapters stop on generator close. Persistent transports
+                # (Local AI WebSocket) additionally need an explicit cancel.
+                cancel = getattr(pipeline.llm_adapter, "cancel_generation", None)
+                if callable(cancel):
+                    try:
+                        await cancel(call_id)
+                    except Exception:
+                        logger.debug("Streaming LLM cancellation failed", call_id=call_id, exc_info=True)
 
     async def _put_pipeline_stream_chunk(
         self,
@@ -18242,23 +18290,26 @@ class Engine:
                                 # drains any more blocked here, with the recognizer path and
                                 # the inactivity watchdog still waiting behind it, for the
                                 # rest of the call.
-                                async for chunk in self._tts_chunks_while_wanted(
-                                    call_id,
-                                    stream_id,
-                                    pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options),
-                                ):
-                                    if not chunk:
-                                        continue
-                                    if not any_audio:
-                                        greeting_timestamp = time.time()
-                                        greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
-                                        await self._stop_connection_audio(
-                                            session, reason="first-pipeline-greeting-audio"
-                                        )
-                                    any_audio = True
-                                    if heard_rec is not None:
-                                        heard_rec.add_audio_bytes(len(chunk))
-                                    await self._put_pipeline_stream_chunk(call_id, stream_id, q, chunk)
+                                async with contextlib.aclosing(
+                                    self._pipeline_chunks_while_wanted(
+                                        call_id,
+                                        stream_id,
+                                        pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options),
+                                    )
+                                ) as tts_chunks:
+                                    async for chunk in tts_chunks:
+                                        if not chunk:
+                                            continue
+                                        if not any_audio:
+                                            greeting_timestamp = time.time()
+                                            greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                            await self._stop_connection_audio(
+                                                session, reason="first-pipeline-greeting-audio"
+                                            )
+                                        any_audio = True
+                                        if heard_rec is not None:
+                                            heard_rec.add_audio_bytes(len(chunk))
+                                        await self._put_pipeline_stream_chunk(call_id, stream_id, q, chunk)
 
                             try:
                                 await asyncio.wait_for(_stream_greeting(), timeout=PIPELINE_GREETING_TIMEOUT_SEC)
@@ -18954,57 +19005,64 @@ class Engine:
 
                             llm_started = time.monotonic()
                             tts_started: Optional[float] = None
-                            async for token in pipeline.llm_adapter.generate_stream(
-                                call_id, transcript_text, context_for_llm, llm_options,
-                            ):
-                                if self._pipeline_reply_superseded(call_id):
-                                    # The caller went on before any of this was heard.
-                                    raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
-                                if "llm_first_token_ms" not in turn_timing:
-                                    turn_timing["llm_first_token_ms"] = _ms_since(llm_started)
-                                sentence_buffer += token
-                                full_response_text += token
+                            async with contextlib.aclosing(
+                                self._llm_tokens_while_wanted(
+                                    pipeline, call_id, stream_id,
+                                    transcript_text, context_for_llm, llm_options,
+                                )
+                            ) as llm_tokens:
+                                async for token in llm_tokens:
+                                    if self._pipeline_reply_superseded(call_id):
+                                        # The caller went on before any of this was heard.
+                                        raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
+                                    if "llm_first_token_ms" not in turn_timing:
+                                        turn_timing["llm_first_token_ms"] = _ms_since(llm_started)
+                                    sentence_buffer += token
+                                    full_response_text += token
 
-                                match = _SENTENCE_RE.search(sentence_buffer)
-                                if match:
-                                    split_pos = match.end()
-                                    to_speak = sentence_buffer[:split_pos].strip()
-                                    sentence_buffer = sentence_buffer[split_pos:]
+                                    match = _SENTENCE_RE.search(sentence_buffer)
+                                    if match:
+                                        split_pos = match.end()
+                                        to_speak = sentence_buffer[:split_pos].strip()
+                                        sentence_buffer = sentence_buffer[split_pos:]
 
-                                    if to_speak:
-                                        # The model's share of the turn ends where the
-                                        # text the TTS starts on is complete.
-                                        turn_timing.setdefault("llm_ms", _ms_since(llm_started))
-                                        if heard_rec:
-                                            heard_rec.open_segment(to_speak)
-                                        if tts_started is None:
-                                            tts_started = time.monotonic()
-                                        async for tts_chunk in self._tts_chunks_while_wanted(
-                                            call_id,
-                                            stream_id,
-                                            pipeline.tts_adapter.synthesize(call_id, to_speak, pipeline.tts_options),
-                                        ):
-                                            if tts_chunk:
-                                                if heard_rec:
-                                                    heard_rec.add_audio_bytes(len(tts_chunk))
-                                                if first_tts_ts is None:
-                                                    first_tts_ts = time.time()
-                                                    turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                                    session.turn_latencies_ms.append(turn_latency_ms)
-                                                    _note_first_audio(turn_timing, tts_started, turn_latency_ms)
-                                                    try:
-                                                        if t_start is not None:
-                                                            _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
-                                                                max(0.0, first_tts_ts - t_start)
-                                                            )
-                                                    except Exception:
-                                                        pass
-                                                await self._put_pipeline_stream_chunk(
-                                                    call_id, stream_id, stream_q, tts_chunk
+                                        if to_speak:
+                                            # The model's share of the turn ends where the
+                                            # text the TTS starts on is complete.
+                                            turn_timing.setdefault("llm_ms", _ms_since(llm_started))
+                                            if heard_rec:
+                                                heard_rec.open_segment(to_speak)
+                                            if tts_started is None:
+                                                tts_started = time.monotonic()
+                                            async with contextlib.aclosing(
+                                                self._pipeline_chunks_while_wanted(
+                                                    call_id,
+                                                    stream_id,
+                                                    pipeline.tts_adapter.synthesize(call_id, to_speak, pipeline.tts_options),
                                                 )
-                                        if heard_rec:
-                                            heard_rec.close_segment()
-                                        spoken_text += to_speak + " "
+                                            ) as tts_chunks:
+                                                async for tts_chunk in tts_chunks:
+                                                    if tts_chunk:
+                                                        if heard_rec:
+                                                            heard_rec.add_audio_bytes(len(tts_chunk))
+                                                        if first_tts_ts is None:
+                                                            first_tts_ts = time.time()
+                                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                                            session.turn_latencies_ms.append(turn_latency_ms)
+                                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
+                                                            try:
+                                                                if t_start is not None:
+                                                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
+                                                                        max(0.0, first_tts_ts - t_start)
+                                                                    )
+                                                            except Exception:
+                                                                pass
+                                                        await self._put_pipeline_stream_chunk(
+                                                            call_id, stream_id, stream_q, tts_chunk
+                                                        )
+                                            if heard_rec:
+                                                heard_rec.close_segment()
+                                            spoken_text += to_speak + " "
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
@@ -19014,22 +19072,25 @@ class Engine:
                                     heard_rec.open_segment(remainder)
                                 if tts_started is None:
                                     tts_started = time.monotonic()
-                                async for tts_chunk in self._tts_chunks_while_wanted(
-                                    call_id,
-                                    stream_id,
-                                    pipeline.tts_adapter.synthesize(call_id, remainder, pipeline.tts_options),
-                                ):
-                                    if tts_chunk:
-                                        if heard_rec:
-                                            heard_rec.add_audio_bytes(len(tts_chunk))
-                                        if first_tts_ts is None:
-                                            first_tts_ts = time.time()
-                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                            session.turn_latencies_ms.append(turn_latency_ms)
-                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
-                                        await self._put_pipeline_stream_chunk(
-                                            call_id, stream_id, stream_q, tts_chunk
-                                        )
+                                async with contextlib.aclosing(
+                                    self._pipeline_chunks_while_wanted(
+                                        call_id,
+                                        stream_id,
+                                        pipeline.tts_adapter.synthesize(call_id, remainder, pipeline.tts_options),
+                                    )
+                                ) as tts_chunks:
+                                    async for tts_chunk in tts_chunks:
+                                        if tts_chunk:
+                                            if heard_rec:
+                                                heard_rec.add_audio_bytes(len(tts_chunk))
+                                            if first_tts_ts is None:
+                                                first_tts_ts = time.time()
+                                                turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                                session.turn_latencies_ms.append(turn_latency_ms)
+                                                _note_first_audio(turn_timing, tts_started, turn_latency_ms)
+                                            await self._put_pipeline_stream_chunk(
+                                                call_id, stream_id, stream_q, tts_chunk
+                                            )
                                 if heard_rec:
                                     heard_rec.close_segment()
                                 spoken_text += remainder
@@ -19446,28 +19507,31 @@ class Engine:
                                     heard_rec.persisted_text = response_text
 
                                 tts_started = time.monotonic()
-                                async for tts_chunk in self._tts_chunks_while_wanted(
-                                    call_id,
-                                    stream_id,
-                                    pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options),
-                                ):
-                                    if not tts_chunk:
-                                        continue
-                                    if heard_rec:
-                                        heard_rec.add_audio_bytes(len(tts_chunk))
-                                    if first_tts_ts is None:
-                                        first_tts_ts = time.time()
-                                        turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
-                                        session.turn_latencies_ms.append(turn_latency_ms)
-                                        _note_first_audio(turn_timing, tts_started, turn_latency_ms)
-                                        try:
-                                            if t_start is not None:
-                                                _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
-                                        except Exception:
-                                            pass
-                                    await self._put_pipeline_stream_chunk(
-                                        call_id, stream_id, stream_q, tts_chunk
+                                async with contextlib.aclosing(
+                                    self._pipeline_chunks_while_wanted(
+                                        call_id,
+                                        stream_id,
+                                        pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options),
                                     )
+                                ) as tts_chunks:
+                                    async for tts_chunk in tts_chunks:
+                                        if not tts_chunk:
+                                            continue
+                                        if heard_rec:
+                                            heard_rec.add_audio_bytes(len(tts_chunk))
+                                        if first_tts_ts is None:
+                                            first_tts_ts = time.time()
+                                            turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
+                                            session.turn_latencies_ms.append(turn_latency_ms)
+                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
+                                            try:
+                                                if t_start is not None:
+                                                    _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
+                                            except Exception:
+                                                pass
+                                        await self._put_pipeline_stream_chunk(
+                                            call_id, stream_id, stream_q, tts_chunk
+                                        )
 
                                 # End-of-segment sentinel
                                 await self._put_pipeline_stream_chunk(

@@ -4,7 +4,7 @@ import base64
 import json
 import wave
 from io import BytesIO
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -136,6 +136,25 @@ class _FakeStreamingSession(_FakeSession):
     def post(self, url, json=None, data=None, headers=None, timeout=None):
         self.requests.append({"url": url, "json": json, "data": data, "headers": headers, "timeout": timeout})
         return _FakeStreamingResponse(self._content, status=self._status)
+
+
+class _TrackedStreamingResponse(_FakeStreamingResponse):
+    def __init__(self, content):
+        super().__init__(content)
+        self.closed = False
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.closed = True
+        return False
+
+
+class _TrackedStreamingSession(_FakeSession):
+    def __init__(self, content):
+        super().__init__(b"")
+        self.response = _TrackedStreamingResponse(content)
+
+    def post(self, *args, **kwargs):
+        return self.response
 
 
 @pytest.mark.asyncio
@@ -334,9 +353,14 @@ async def test_openai_tts_adapter_synthesizes_chunks():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_orchestrator_registers_openai_adapters():
+async def test_pipeline_orchestrator_registers_openai_adapters(monkeypatch):
     app_config = _build_app_config()
     orchestrator = PipelineOrchestrator(app_config)
+    # Registration is local; startup probes must not contact the real API.
+    monkeypatch.setattr(
+        orchestrator, "_validate_pipeline_connectivity",
+        AsyncMock(return_value={"healthy": True, "failures": []}),
+    )
     await orchestrator.start()
 
     resolution = orchestrator.get_pipeline("call-1")
@@ -464,6 +488,52 @@ async def test_openai_llm_generate_warns_when_the_reply_is_cut_by_max_tokens(mon
 
 
 # --- OpenAI TTS adapter: streamed replies from an OpenAI-compatible endpoint -----
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_close_releases_http_response_while_consumer_is_paused():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    session = _TrackedStreamingSession(_LinesStream([
+        _sse({"choices": [{"delta": {"content": "Первое предложение. "}}]}),
+        _sse({"choices": [{"delta": {"content": "Второе предложение. "}}]}),
+    ]))
+    adapter = OpenAILLMAdapter(
+        "openai_llm", app_config, provider_config, {"use_realtime": False},
+        session_factory=lambda: session,
+    )
+    await adapter.start()
+    stream = adapter.generate_stream("call-1", "hello", {}, {})
+    try:
+        assert await anext(stream) == "Первое предложение. "
+        assert not session.response.closed
+        await stream.aclose()
+        # No sleep/GC: a barge-in during TTS must close the paused LLM request now.
+        assert session.response.closed
+    finally:
+        await stream.aclose()
+        await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_close_releases_http_response_while_audio_is_queued():
+    session = _TrackedStreamingSession(_FakeStreamContent([_tone_pcm16(16000, 0.25)]))
+    adapter = OpenAITTSAdapter(
+        "openai_tts", _build_app_config(), _self_hosted_tts_config(),
+        {"response_format": "pcm", "format": {"encoding": "mulaw", "sample_rate": 8000}},
+        session_factory=lambda: session,
+    )
+    await adapter.start()
+    stream = adapter.synthesize("call-1", "Первое предложение.", {})
+    try:
+        assert await anext(stream)
+        assert not session.response.closed
+        await stream.aclose()
+        # Closing the outer synthesis must also close _stream_frames' HTTP body.
+        assert session.response.closed
+    finally:
+        await stream.aclose()
+        await adapter.stop()
 
 
 class _FakeStreamContent:
