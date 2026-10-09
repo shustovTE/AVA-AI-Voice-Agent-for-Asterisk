@@ -501,7 +501,7 @@ const StreamingPage = () => {
                         />
                         <FormSwitch
                             label="Discard a reply the caller talks over before its first sound"
-                            description="Pipelines with Silero VAD: when the caller goes on talking after their turn was released and before the reply's first sound has reached them, the reply is dropped (the LLM request is cancelled, no TTS is requested, an unplayed stream is stopped) and their words are answered together with what they say next, as one turn. Off: the reply plays and their next words are answered on their own."
+                            description="Pipelines with Silero VAD: when the caller goes on talking after their turn was released and before the reply's first sound has reached them, the reply is dropped (the LLM request is cancelled, no TTS is requested, an unplayed stream is stopped) and their words are answered together with what they say next, as one turn. Off: caller audio is discarded while the reply is generated and until its first sound reaches the transport. These words are not queued for another answer. Once playback starts, the normal barge-in protection applies."
                             checked={streamingConfig.pipeline_discard_unheard_reply ?? true}
                             onChange={(e) => updateStreamingConfig('pipeline_discard_unheard_reply', e.target.checked)}
                             tooltip="A turn released on a pause the caller only took to breathe no longer costs a reply to half a sentence. Counted until the first bytes of the reply reach the transport; after that the reply is the caller's to interrupt (Barge-In page)."

@@ -260,6 +260,15 @@ class SileroCallerTracker:
     def sample_rate(self) -> Optional[int]:
         return self._stream.sample_rate if self._stream is not None else None
 
+    def reset(self) -> None:
+        """Forget speech and partial frames when caller input is discarded."""
+        if self._stream is not None:
+            self._stream.reset()
+        self._segmenter.reset()
+        self.last_probability = 0.0
+        self.last_speech_at = None
+        self.segment_started_at = None
+
     def feed(self, pcm16: bytes, sample_rate: int) -> List[str]:
         """Return the ``start``/``stop`` transitions this audio caused, in order."""
         if sample_rate not in CHUNK_SAMPLES:

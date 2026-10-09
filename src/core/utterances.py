@@ -175,6 +175,13 @@ class UtteranceCutter:
             self._chunks.pop(0)
 
     # ── segment lifecycle ────────────────────────────────────────────────────
+    def discard(self) -> None:
+        """Forget buffered speech, including preroll that a later barge-in could unmute."""
+        self._chunks.clear()
+        self._open = None
+        self._barge_in_at = None
+        self._whole_at = None
+
     @property
     def open(self) -> bool:
         return self._open is not None

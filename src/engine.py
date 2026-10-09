@@ -8718,6 +8718,8 @@ class Engine:
 
     def _pipeline_caller_muted(self, session: CallSession) -> bool:
         """Whether the caller's frames are withheld from the recognizer at this moment."""
+        if self._pipeline_input_blocked_before_reply(session):
+            return True
         if bool(getattr(session, "audio_capture_enabled", True)):
             return False
         if self._pipeline_listens_during_playback():
@@ -8838,6 +8840,25 @@ class Engine:
         cfg = getattr(getattr(self, "config", None), "streaming", None)
         return bool(getattr(cfg, "pipeline_discard_unheard_reply", False)) if cfg else False
 
+    def _pipeline_input_blocked_before_reply(self, session: CallSession) -> bool:
+        """Off means discard input while preparing a reply, rather than queue another turn.
+
+        Keep this separate from TTS tokens: generating is not playback, and
+        only audible playback may be interrupted through the usual protection.
+        A completed producer may still have an unplayed stream on the transport.
+        """
+        if self._discard_unheard_reply_enabled():
+            return False
+        call_id = session.call_id
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            return not self._pipeline_reply_audio_started(call_id)
+        return bool(
+            (getattr(self, "_pipeline_forced", None) or {}).get(call_id)
+            and not bool(getattr(session, "audio_capture_enabled", True))
+            and not self._pipeline_agent_audible(call_id)
+        )
+
     def _begin_pipeline_reply(self, call_id: str) -> Dict[str, Any]:
         record: Dict[str, Any] = {
             "released_at": time.monotonic(),
@@ -8846,6 +8867,26 @@ class Engine:
             "audible": False,
         }
         self._pipeline_reply_inflight[call_id] = record
+        if not self._discard_unheard_reply_enabled():
+            tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+            reset = getattr(tracker, "reset", None)
+            if callable(reset):
+                reset()
+            cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+            if cutter is not None:
+                cutter.discard()
+            buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+            if buffer is not None:
+                buffer.clear()
+            self._silero_deferred_barge_in.pop(call_id, None)
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
+            self._pipeline_stt_final_expected_at.pop(call_id, None)
+            self._note_pipeline_caller_talking(call_id, False, source="vad")
+            for states in (
+                self._resample_state_silero16k, self._resample_state_silero_vad,
+                self._resample_state_utterance16k, self._resample_state_pipeline16k,
+            ):
+                states.pop(call_id, None)
         return record
 
     def _end_pipeline_reply(self, call_id: str) -> None:
@@ -10806,6 +10847,8 @@ class Engine:
             # forever when Asterisk never follows it with ChannelTalkingFinished.
             # The media receive paths already drop audio during this same configured
             # guard window, so keep TALK_DETECT aligned with them.
+            if self._pipeline_input_blocked_before_reply(session):
+                return
             cfg = getattr(self.config, "barge_in", None)
             try:
                 post_guard_ms = int(getattr(cfg, "post_tts_end_protection_ms", 0)) if cfg else 0
@@ -10935,6 +10978,8 @@ class Engine:
             if not session:
                 return
             call_id = session.call_id
+            if self._pipeline_input_blocked_before_reply(session):
+                return
             logger.debug("TalkDetect finished", call_id=call_id, channel_id=channel_id)
             self._note_pipeline_caller_talking(call_id, False)
             await self._no_input_note_input_state(call_id, False, "asterisk:talk_detect")
@@ -10958,7 +11003,7 @@ class Engine:
                                     stt.flush_speech(call_id, pipeline.options_summary().get("stt", {})),
                                     timeout=5,
                                 )
-                                if transcript:
+                                if transcript and not self._pipeline_input_blocked_before_reply(session):
                                     logger.debug("Early STT flush returned transcript", call_id=call_id, transcript_len=len(transcript))
                                     tq = getattr(self, "_pipeline_transcript_queues", {}).get(call_id)
                                     if tq:
@@ -12155,6 +12200,9 @@ class Engine:
                     source="audiosocket",
                 )
                 return
+
+            if self._pipeline_input_blocked_before_reply(session):
+                return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
 
             # Silero VAD sees every caller frame, gated or not, before any
             # routing decision below can drop it.
@@ -13389,6 +13437,8 @@ class Engine:
         millisecond per 32 ms chunk, so it stays inline on the event loop.
         """
         call_id = session.call_id
+        if self._pipeline_input_blocked_before_reply(session):
+            return
         tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
         if tracker is None or not pcm16:
             return
@@ -13556,6 +13606,8 @@ class Engine:
     ) -> None:
         """The caller started talking: hold the turn, wake the watchdog, barge in."""
         call_id = session.call_id
+        if self._pipeline_input_blocked_before_reply(session):
+            return
         self._note_pipeline_caller_talking(call_id, True, source="vad")
         # The caller went on: whatever Smart Turn said about the last stop no
         # longer applies, and the next stop is judged on the whole turn.
@@ -13603,6 +13655,8 @@ class Engine:
         call_id = session.call_id
         if not self._silero_config()["barge_in"]:
             return "skipped"
+        if self._pipeline_input_blocked_before_reply(session):
+            return "protected"
         cfg = getattr(self.config, "barge_in", None)
         if not cfg or not getattr(cfg, "enabled", True):
             return "skipped"
@@ -13613,6 +13667,12 @@ class Engine:
                 tts_elapsed_ms = int((now - float(session.tts_started_ts)) * 1000)
         except Exception:
             tts_elapsed_ms = 0
+        if not self._discard_unheard_reply_enabled():
+            manager = getattr(self, "streaming_playback_manager", None)
+            if manager is not None and manager.is_stream_active(call_id):
+                # A slow LLM/TTS must not spend the protection window before
+                # the caller can hear the reply.
+                tts_elapsed_ms = min(tts_elapsed_ms, int(manager.get_playback_position_ms(call_id)))
         # The same echo protection as Asterisk talk detection, so switching
         # detectors keeps the tuning a deployment already has.
         initial_protect = int(getattr(cfg, "talk_detect_initial_protection_ms", 1500))
@@ -14784,7 +14844,7 @@ class Engine:
                 int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
                 source="externalmedia",
             )
-            if self._silero_vad_active(session.call_id):
+            if self._silero_vad_active(session.call_id) and not self._pipeline_input_blocked_before_reply(session):
                 await self._observe_silero_vad(
                     session,
                     pcm_16k,
@@ -14811,6 +14871,11 @@ class Engine:
                 audio_capture_enabled=session.audio_capture_enabled,
                 has_queue=caller_channel_id in self._pipeline_queues,
             )
+            if self._pipeline_input_blocked_before_reply(session):
+                return self._feed_pipeline_silence(
+                    caller_channel_id, pcm_16k,
+                    int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
+                )
             if pipeline_forced:
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
                 # (unless the deployment keeps listening while the agent speaks).
@@ -18289,12 +18354,26 @@ class Engine:
                 return
 
             buffer_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=200)
+            # Changes when Off commits to an answer. Results from requests
+            # already in flight must not become another turn after it plays.
+            input_generation = 0
+            submitted_utterance_generations: deque = deque()
             # Reuse queue created by _ensure_pipeline_runner, or create if missing
-            transcript_queue: asyncio.Queue[Optional[str]] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
+            # Receiver entries carry (input generation, text); legacy early
+            # flushes may still enqueue text, and None ends the stream.
+            transcript_queue: asyncio.Queue[Any] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
             self._pipeline_transcript_queues[call_id] = transcript_queue
             # Set by Silero's start while a turn is being answered, so the turn
             # notices the caller going on before the reply's first sound.
             self._pipeline_caller_resumed[call_id] = asyncio.Event()
+
+            def remaining_transcript(item: Any) -> str:
+                """Unwrap results for hangup history without resurrecting discarded input."""
+                if isinstance(item, tuple):
+                    generation, item = item
+                    if generation != input_generation:
+                        return ""
+                return str(item or "")
 
             use_streaming = bool(stt_options.get("streaming", True))
             if use_streaming:
@@ -18349,6 +18428,7 @@ class Engine:
 
                 async def process_audio(audio_chunk: bytes) -> None:
                     transcript = ""
+                    generation = input_generation
                     asr_started = time.monotonic()
                     try:
                         transcript = await pipeline.stt_adapter.transcribe(
@@ -18361,6 +18441,8 @@ class Engine:
                         logger.debug("STT transcribe failed", call_id=call_id, exc_info=True)
                         return
                     asr_ms = (time.monotonic() - asr_started) * 1000.0
+                    if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
+                        return
                     transcript = (transcript or "").strip()
                     if not transcript:
                         return
@@ -18371,7 +18453,7 @@ class Engine:
                     except Exception:
                         pass
                     try:
-                        transcript_queue.put_nowait(transcript)
+                        transcript_queue.put_nowait((generation, transcript))
                     except asyncio.QueueFull:
                         try:
                             dropped = transcript_queue.get_nowait()
@@ -18382,13 +18464,17 @@ class Engine:
                             )
                         except asyncio.QueueEmpty:
                             pass
-                        await transcript_queue.put(transcript)
+                        await transcript_queue.put((generation, transcript))
 
                 async def stt_worker() -> None:
                     local_buf = bytearray()
+                    generation = input_generation
                     try:
                         while True:
                             frame = await buffer_queue.get()
+                            if generation != input_generation:
+                                local_buf.clear()
+                                generation = input_generation
                             if frame is None:
                                 if local_buf:
                                     await process_audio(bytes(local_buf))
@@ -18412,9 +18498,13 @@ class Engine:
 
                 async def stt_sender() -> None:
                     local_buf = bytearray()
+                    generation = input_generation
                     try:
                         while True:
                             frame = await buffer_queue.get()
+                            if generation != input_generation:
+                                local_buf.clear()
+                                generation = input_generation
                             if frame is None:
                                 if local_buf:
                                     try:
@@ -18442,6 +18532,7 @@ class Engine:
                                     except Exception:
                                         logger.debug("Streaming STT send failed", call_id=call_id, exc_info=True)
                                     local_buf.clear()
+                                submitted_utterance_generations.append(generation)
                                 await self._send_stt_utterance(pipeline, call_id, frame, stream_format)
                                 continue
                             local_buf.extend(frame)
@@ -18467,11 +18558,17 @@ class Engine:
                 async def stt_receiver() -> None:
                     try:
                         async for final in pipeline.stt_adapter.iter_results(call_id):
+                            generation = (
+                                submitted_utterance_generations.popleft()
+                                if submitted_utterance_generations else input_generation
+                            )
+                            if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
+                                continue
                             try:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
                                 self._note_pipeline_final_arrived(call_id)
-                                transcript_queue.put_nowait(final)
+                                transcript_queue.put_nowait((generation, final))
                                 logger.debug(
                                     "Pipeline STT final enqueued for dialog",
                                     call_id=call_id,
@@ -18483,7 +18580,7 @@ class Engine:
                                     transcript_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     pass
-                                await transcript_queue.put(final)
+                                await transcript_queue.put((generation, final))
                     except asyncio.CancelledError:
                         pass
                     except Exception:
@@ -18541,6 +18638,15 @@ class Engine:
 
                 async def run_turn(transcript_text: str) -> str:
                     """Answer one caller turn; "superseded" when the caller went on before the reply."""
+                    nonlocal input_generation
+                    if not self._discard_unheard_reply_enabled():
+                        input_generation += 1
+                        for queue in (inbound_queue, buffer_queue, transcript_queue):
+                            ended = False
+                            while not queue.empty():
+                                ended = queue.get_nowait() is None or ended
+                            if ended:
+                                queue.put_nowait(None)
                     self._begin_pipeline_reply(call_id)
                     try:
                         outcome = await run_turn_body(transcript_text)
@@ -20288,6 +20394,10 @@ class Engine:
                         if transcript is None:
                             await flush_pending()
                             break
+                        if isinstance(transcript, tuple):
+                            generation, transcript = transcript
+                            if generation != input_generation:
+                                continue
                         # When this result's utterance started: the start the
                         # cutter recorded when it sent it, else Silero's latest.
                         starts = self._pipeline_utterance_starts.get(call_id)
@@ -20359,7 +20469,7 @@ class Engine:
                         if not get_task.done():
                             get_task.cancel()
                         elif not get_task.cancelled() and get_task.exception() is None:
-                            leftovers.append(str(get_task.result() or ""))
+                            leftovers.append(remaining_transcript(get_task.result()))
                     if self._pipeline_turn_wakeup.get(call_id) is wakeup:
                         self._pipeline_turn_wakeup.pop(call_id, None)
                     # Cancelled by the call's cleanup: the results the worker was
@@ -20370,7 +20480,7 @@ class Engine:
                         pending_segments.clear()
                         while True:
                             try:
-                                leftovers.append(str(transcript_queue.get_nowait() or ""))
+                                leftovers.append(remaining_transcript(transcript_queue.get_nowait()))
                             except asyncio.QueueEmpty:
                                 break
                         text = " ".join(part.strip() for part in leftovers if part and part.strip()).strip()

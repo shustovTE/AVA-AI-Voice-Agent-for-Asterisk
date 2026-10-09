@@ -83,6 +83,7 @@ describe('StreamingPage discard of an unheard reply', () => {
         expect(discard).toBeChecked();
         fireEvent.click(discard);
         expect(discard).not.toBeChecked();
+        expect(screen.getByText(/These words are not queued for another answer/)).toBeInTheDocument();
 
         fireEvent.click(screen.getByRole('button', { name: /save/i }));
 

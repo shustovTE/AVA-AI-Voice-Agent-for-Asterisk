@@ -119,12 +119,12 @@ class _PlaybackStub:
         return True
 
 
-async def _start(monkeypatch, *, llm, tts=None, streaming=None):
+async def _start(monkeypatch, *, llm, tts=None, streaming=None, stt=None):
     engine = Engine(_config(streaming))
     engine.pipeline_orchestrator._started = True
     playback = _PlaybackStub()
     monkeypatch.setattr(engine, "streaming_playback_manager", playback)
-    stt = _ResultStreamingStubSTT()
+    stt = stt or _ResultStreamingStubSTT()
     resolution = _StubResolution(
         stt_adapter=stt,
         stt_options={"streaming": True, "chunk_ms": 80},

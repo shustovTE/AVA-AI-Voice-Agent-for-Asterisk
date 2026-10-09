@@ -1222,8 +1222,9 @@ class StreamingConfig(BaseModel):
     # turn was released and before the first sound of the reply has reached
     # them, that reply is discarded (the LLM request is cancelled, no TTS is
     # requested, an unplayed stream is dropped) and their words are kept to be
-    # answered together with what they say next, as one turn. Off: the reply
-    # plays and their next words are answered on their own.
+    # answered together with what they say next, as one turn. Off: discard
+    # caller input during generation and until the first sound, without
+    # queueing another turn. Audible replies retain normal barge-in protection.
     pipeline_discard_unheard_reply: bool = Field(default=True)
     # Pipelines: when the speech that cut a reply off (barge-in) comes back from
     # the recognizer empty (a cough, noise, nothing intelligible), the reply is
