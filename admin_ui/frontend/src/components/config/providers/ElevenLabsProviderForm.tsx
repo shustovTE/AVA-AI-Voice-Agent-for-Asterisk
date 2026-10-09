@@ -410,6 +410,80 @@ const ElevenLabsProviderForm: React.FC<ElevenLabsProviderFormProps> = ({ config,
                 </div>
             </div>
 
+            {mode === 'tts' && (
+                <div className="space-y-4 border-t border-border pt-4">
+                    <div>
+                        <h4 className="text-sm font-medium text-foreground">Network Routing</h4>
+                        <p className="text-xs text-muted-foreground">
+                            Optional. Applies to ElevenLabs requests only, so one remote leg can go out through a tunnel while STT, the LLM and Asterisk stay on the direct path.
+                        </p>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">HTTP Proxy</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>HTTP Proxy</strong> — send ElevenLabs traffic through a proxy instead of out the host's default route. Leave empty to go direct.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Only <code>http://</code> and <code>https://</code> work. HTTPS is tunnelled with CONNECT; SOCKS is not supported.</li>
+                                                <li>Credentials may be written inline as <code>http://user:pass@host:port</code>, and are stored in the config like any other setting. On a private container network an inbound without auth avoids keeping a password here.</li>
+                                                <li>A malformed value fails the call rather than quietly going direct.</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
+                            <input
+                                type="text"
+                                className="w-full p-2 rounded border border-input bg-background font-mono text-sm"
+                                value={config.proxy || ''}
+                                onChange={(e) => handleChange('proxy', e.target.value)}
+                                placeholder="http://xray:8080"
+                            />
+                            <p className="text-xs text-muted-foreground">
+                                Empty means a direct connection.
+                            </p>
+                        </div>
+
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">Keepalive Timeout (sec)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>Keepalive Timeout</strong> — how long an idle connection to ElevenLabs is kept for reuse. Default is aiohttp's 15 seconds.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li>Audio is streamed a sentence at a time, so a dropped connection makes the next sentence pay a fresh TLS handshake.</li>
+                                                <li>Through a proxy that handshake costs several extra round trips, so a window that outlasts a caller's pause (60-180 s) is usually worth it.</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
+                            <input
+                                type="number"
+                                min="0"
+                                step="15"
+                                className="w-full p-2 rounded border border-input bg-background"
+                                value={config.keepalive_timeout_sec ?? ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (!raw) { handleChange('keepalive_timeout_sec', undefined); return; }
+                                    const parsed = parseFloat(raw);
+                                    if (Number.isFinite(parsed)) { handleChange('keepalive_timeout_sec', Math.max(0, parsed)); }
+                                }}
+                                placeholder="15"
+                            />
+                            <p className="text-xs text-muted-foreground">
+                                Empty or 0 keeps the aiohttp default.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             <div className="flex items-center space-x-2">
                 <input
                     type="checkbox"

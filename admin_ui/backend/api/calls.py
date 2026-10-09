@@ -436,8 +436,8 @@ async def get_providers_health():
             if name not in provider_stats:
                 provider_stats[name] = {"total": 0, "succeeded": 0, "failed": 0}
             provider_stats[name]["total"] += 1
-            # no_input_timeout is an expected policy outcome, not a provider failure.
-            # Valid values: completed, transferred, error, abandoned, no_input_timeout.
+            # no_input_timeout and max_duration are expected policy outcomes, not provider failures.
+            # Valid values: completed, transferred, error, abandoned, no_input_timeout, max_duration.
             if r.outcome in ("error", "abandoned"):
                 provider_stats[name]["failed"] += 1
             else:

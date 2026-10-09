@@ -33,6 +33,7 @@ AudioSocketConfig = _parent_config.AudioSocketConfig
 LocalProviderConfig = _parent_config.LocalProviderConfig
 DeepgramProviderConfig = _parent_config.DeepgramProviderConfig
 OpenAIProviderConfig = _parent_config.OpenAIProviderConfig
+split_openai_passthrough_fields = _parent_config.split_openai_passthrough_fields
 TelnyxLLMProviderConfig = _parent_config.TelnyxLLMProviderConfig
 MiniMaxLLMProviderConfig = _parent_config.MiniMaxLLMProviderConfig
 GoogleProviderConfig = _parent_config.GoogleProviderConfig
@@ -55,6 +56,7 @@ LLMConfig = _parent_config.LLMConfig
 VADConfig = _parent_config.VADConfig
 NoInputConfig = _parent_config.NoInputConfig
 StreamingConfig = _parent_config.StreamingConfig
+DEFAULT_CONTINUE_REPLY_PROMPT = _parent_config.DEFAULT_CONTINUE_REPLY_PROMPT
 LoggingConfig = _parent_config.LoggingConfig
 PipelineEntry = _parent_config.PipelineEntry
 AppConfig = _parent_config.AppConfig
@@ -68,6 +70,7 @@ __all__ = [
     'LocalProviderConfig',
     'DeepgramProviderConfig',
     'OpenAIProviderConfig',
+    'split_openai_passthrough_fields',
     'TelnyxLLMProviderConfig',
     'MiniMaxLLMProviderConfig',
     'GoogleProviderConfig',
@@ -90,6 +93,7 @@ __all__ = [
     'VADConfig',
     'NoInputConfig',
     'StreamingConfig',
+    'DEFAULT_CONTINUE_REPLY_PROMPT',
     'LoggingConfig',
     'PipelineEntry',
     'AppConfig',

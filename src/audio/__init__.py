@@ -5,17 +5,21 @@ This package contains audio processing helpers and utilities.
 """
 
 from .resampler import (
+    StreamingResampler,
     mulaw_to_pcm16le,
     pcm16le_to_mulaw,
     resample_audio,
     convert_pcm16le_to_target_format,
     resolve_output_resampler_policy,
+    resolve_stt_input_resampler,
 )
 
 __all__ = [
+    "StreamingResampler",
     "mulaw_to_pcm16le",
     "pcm16le_to_mulaw",
     "resample_audio",
     "convert_pcm16le_to_target_format",
     "resolve_output_resampler_policy",
+    "resolve_stt_input_resampler",
 ]

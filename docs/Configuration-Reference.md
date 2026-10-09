@@ -61,6 +61,151 @@ Admin UI for clarity but are not independently negotiable. Conflicting legacy
 values are normalized at runtime and logged. Audio Profiles continue to control
 wire/full-agent negotiation and do not change the modular STT bus format.
 
+### Pipeline End of Turn (caller turn-taking)
+
+Streaming modular STT returns a result at every phrase boundary, so the number
+of results says nothing about whether the caller has finished a sentence. The
+caller's turn therefore ends on silence: each new result restarts a window, and
+the accumulated text goes to the LLM once the caller has been quiet for it.
+
+- `pipelines.<name>.options.llm.end_of_turn_silence_ms`: silence that ends the
+  caller's turn. Defaults to `700`. Raise it (900-1200) when callers are cut off
+  working through a long sentence; lower it (400-600) for snappier replies. `0`
+  answers every STT result immediately.
+- `pipelines.<name>.options.llm.end_of_turn_max_wait_ms`: optional hard cap
+  measured from the caller's first pending result, so someone who never pauses
+  still gets an answer. Unset or `0` disables the cap, which is the default.
+
+A window measured from the recognizer's result has a blind spot: a streaming
+recognizer emits a result only after its own silence gate (T-one holds 600 ms),
+so a caller who pauses and then goes on can never be bridged — the
+continuation's result arrives only after they pause again. With Asterisk
+`TALK_DETECT` enabled for the pipeline (`barge_in.pipeline_talk_detect_enabled`),
+the same events that trigger barge-in decide the end of the turn instead: the
+turn is held while Asterisk reports the caller talking and released a short
+grace after it reports them quiet, so the silence that ends a turn is measured
+from the caller's last sound. The silence itself is then tuned with
+`barge_in.pipeline_talk_detect_silence_ms` (800-1000 ms suits a caller who
+thinks aloud; every value is also the latency before an answer).
+
+- `pipelines.<name>.options.llm.end_of_turn_source`: `auto` (default; the
+  first detector available in this order: Silero VAD when `vad.silero_enabled`,
+  Asterisk talk detection when it is enabled for the pipeline, the result
+  window otherwise), `vad`, `talk_detect`, or `final` to pin one. A pinned
+  `vad` without the model loaded falls back the same way as `auto`.
+- `pipelines.<name>.options.llm.end_of_turn_talk_detect_grace_ms`: grace after
+  Asterisk reports the caller quiet, or after a result that lands while they
+  already are. Defaults to `250`: long enough for a result that is about to
+  arrive to join the turn, short enough not to be felt.
+- `pipelines.<name>.options.llm.end_of_turn_talk_detect_hold_ms`: how long a
+  pending result is held while Asterisk keeps reporting speech without any
+  newer result. Defaults to `8000`. A `ChannelTalkingFinished` is not
+  guaranteed to arrive, and a caller still talking produces a result every
+  phrase, so a long quiet hold means the end event was lost. With Silero VAD
+  as the turn source the hold runs from the last frame Silero scored as
+  speech instead: its stop cannot be lost, and a VAD-gated recognizer gives
+  no result for as long as a sentence lasts, so the turn stays held while
+  Silero hears the caller and only a detector left "talking" without speech
+  frames (audio no longer flowing) lets the hold expire.
+
+With Silero VAD enabled (see [Silero VAD](#silero-vad-pipelines) below) the
+engine's own neural detector takes that role, and with
+[Smart Turn](#smart-turn-pipelines) on top an incomplete thought holds the
+turn beyond the stop: the turn is held while Silero
+reports the caller talking and released `end_of_turn_talk_detect_grace_ms`
+after it reports them quiet, so the pause a caller may take is
+`vad.silero_stop_ms` plus that grace. Because the detector runs in the engine,
+the recognizer is also told to finalize the moment the caller stops instead of
+waiting out its own gate in real time, and the turn waits for that result:
+
+- `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms`: how long a
+  turn waits for the result the recognizer was told to produce when Silero
+  reported the caller quiet. Defaults to `1000`. The result normally lands
+  well inside this; the bound only matters when it never comes (the caller's
+  sound carried no words). Not applied when a result already arrived after
+  the caller's last speech.
+
+Only the resolved detector drives the turn: with Silero in charge, Asterisk
+talk-detect events still serve barge-in and the inactivity watchdog but no
+longer touch the end of turn, so the two cannot disagree about it.
+
+Two things happen around a released turn with Silero in charge. When the
+caller goes on before the reply's first sound, the reply is discarded and the
+words wait for their next words (`streaming.pipeline_discard_unheard_reply`),
+so a pause the caller only took to breathe costs no reply to half a sentence.
+With that setting off, caller input is discarded until the first sound instead.
+And words spoken into a reply that is already audible, inside the barge-in
+protection or too short to interrupt, are not released while the reply plays:
+the turn waits for the reply to end or for a barge-in to cut it (see the
+Streaming section). Words from before the reply started still cut it at once.
+
+Every `Caller turn ended on silence` line reports which `source` decided it
+(`vad`, `talk_detect` or `final`), and `Pipeline end-of-turn policy resolved`
+at call start reports whether Silero is tracking the call. The line's
+`waited_sec` spans the whole turn from its first result, so read the wait a
+caller actually felt from `quiet_ms` (how long the detector had reported them
+quiet when the turn was released: the stop window plus the grace, plus any
+wait for a result) and `since_result_ms` (the time since the last result).
+
+Which fields apply depends on the resolved source, and the pipeline editor
+greys out the rest: `end_of_turn_silence_ms` only ends a turn measured from
+results (`final`); the grace and `end_of_turn_vad_final_wait_ms` only follow
+a detector. The pause a caller may take is never set here with a detector in
+charge: it is `vad.silero_stop_ms` for Silero VAD and
+`barge_in.pipeline_talk_detect_silence_ms` for talk detection.
+
+Length no longer decides anything, so a one-word "yes" is answered as promptly
+as a paragraph. Every turn is logged as `Caller turn ended on silence` with the
+number of merged results and how long the caller was given.
+
+Superseded options in existing configs keep working with a warning:
+`aggregation_silence_sec` and `aggregation_timeout_sec` are read as the silence
+window and `aggregation_max_wait_sec` as the cap, all converted from seconds.
+`aggregation_min_words`, `aggregation_min_chars`, and
+`aggregation_wait_for_silence` are ignored and logged once per call as
+`Ignoring superseded transcript aggregation options` — the word and character
+thresholds are what answered callers mid-sentence.
+
+### Pipeline Reply Length
+
+A reply that stops mid-sentence or mid-word without any barge-in in the log
+was cut by the LLM's token limit, not by turn-taking: the endpoint returns
+`finish_reason: length` and the engine speaks what it got. Every
+OpenAI-compatible LLM adapter (`openai`, `native_llm`, Mistral, Groq and the
+other Chat Completions endpoints) now logs `LLM reply cut by max_tokens` with
+the `max_tokens` in force and the length of the cut reply, and `finish_reason`
+on every completed request. Raise `pipelines.<name>.options.llm.max_tokens`
+(the sample config ships `200`, which is short for a Russian reply with a list
+in it), or have the prompt ask for shorter, list-free answers, which also read
+better through TTS.
+
+### Pipeline Gated Audio
+
+While the agent speaks, the caller's frames are withheld so the agent cannot
+hear itself. Dropping them outright glues the audio either side of the gap
+together, and a word straddling a short gap reaches the recognizer garbled. The
+engine therefore feeds silence in their place, which keeps the recognizer's
+timeline continuous.
+
+- `pipelines.<name>.options.stt.gated_silence_ms`: how long silence is fed into
+  one gated stretch. Defaults to `3000`. Each silent frame costs the recognizer
+  one more inference, and past a few seconds the caller has long stopped talking
+  and a splice is harmless, so the budget caps what an agent turn costs. `0`
+  restores the previous behaviour of dropping the frames. The budget is renewed
+  as soon as real audio flows again.
+
+With `barge_in.pipeline_listen_during_playback` the frames are not withheld at
+all (Silero VAD, which owns barge-in, has already scored them), and with
+`vad.silero_stt_utterances` nothing streams to the recognizer in the first
+place: the engine keeps the caller's audio and sends whole utterances, in which
+the stretch where the agent was actually audible is zeros unless listening is
+on. The one exception is the utterance that interrupts the agent: the words
+that cut a reply off are sent whole, the part spoken while the agent was still
+audible included, so a barge-in never loses its own first words (the log line
+`Caller utterance sent to the recognizer` carries `interrupted_agent=True`).
+The gate closes at the stream start, but echo needs sound, so the 200–300 ms
+before the first audible chunk are never muted.
+
 ### Golden Baselines
 See the validated configurations in `config/`:
 - `ai-agent.golden-openai.yaml` - OpenAI Realtime (monolithic, fastest)
@@ -82,7 +227,7 @@ Environment variables for selecting local STT/TTS backends:
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
+| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `tone`, `onnx_asr`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
 | `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts`, `silero` | `piper` | Text-to-speech engine |
 
 **STT Backends**:
@@ -90,6 +235,7 @@ Environment variables for selecting local STT/TTS backends:
 - **Sherpa-ONNX**: Low-latency streaming ASR using ONNX runtime
 - **Kroko**: High-quality streaming ASR with 12+ languages (requires API key for hosted mode)
 - **T-one**: Native Russian telephony STT using the upstream streaming CTC pipeline
+- **onnx-asr** (`onnx_asr`): GigaAM v3 (Sber) and NeMo FastConformer RU through ONNX Runtime, offline models behind the Silero VAD gate (a phrase is recognized once the caller pauses; CUDA when the GPU image and a GPU are present). `ONNX_ASR_MODEL` picks the model (`gigaam-v3-e2e-ctc` by default), fetched from Hugging Face on first start; requires `INCLUDE_ONNX_ASR=true`. See [LOCAL_ONLY_SETUP.md](LOCAL_ONLY_SETUP.md#supported-stt-models).
 - **Faster-Whisper**: Whisper inference via `faster-whisper` (model IDs like `base`, `small`, etc., or a local model directory depending on your install)
 - **Whisper.cpp**: Local GGML Whisper inference with multilingual language hints
 
@@ -313,7 +459,7 @@ Outbound calling is implemented as an **engine-driven scheduler + SQLite + ARI o
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate) |
+| `AAVA_OUTBOUND_EXTENSION_IDENTITY` | `6789` | Extension identity for FreePBX routing (sets `AMPUSER` + `CALLERID(num)` on originate). A lead's Caller ID override replaces it for that lead's calls. |
 | `AAVA_OUTBOUND_AMD_CONTEXT` | `aava-outbound-amd` | Dialplan context name used for AMD hop (`continueInDialplan`) |
 | `AAVA_OUTBOUND_PBX_TYPE` | `freepbx` | PBX-specific AAVA Campaign channel vars: `freepbx` \| `generic`. Legacy `vicidial` remains readable for one migration release but cannot be newly selected in the UI; use Call Scheduling → VICIdial Remote Agents. |
 | `AAVA_OUTBOUND_DIAL_CONTEXT` | `from-internal` | Asterisk dialplan context for `Local/` channel origination |
@@ -337,17 +483,16 @@ See `docs/contributing/milestones/milestone-22-outbound-campaign-dialer.md` for 
 
 AAVA sends outbound channel variables in the ARI `POST /channels` JSON
 `variables` object. This includes Agent/provider routing, outbound correlation,
-FreePBX identity, AMD/consent controls, and the internal
-`AAVA_CUSTOM_VARS_JSON` lead-context value. Local-channel routes receive both
+FreePBX identity, and AMD/consent controls. Local-channel routes receive both
 ordinary and inherited variants so the metadata survives the `;1`/`;2`
 boundary.
 
-Lead `custom_vars` must serialize to at most 8,192 bytes. Nonempty context is
-reapplied and read back before the answered channel enters the AMD dialplan
-hop. A missing or mismatched value fails the attempt closed before provider
-startup. If the engine restarts while an originate is still ringing, it
-recovers the unfinished attempt and lead from SQLite before applying the same
-gate; unavailable authoritative metadata also fails closed. The value is
+Lead `custom_vars` never travel through channel variables and have no size
+limit: the engine keeps them in attempt metadata and the durable SQLite store
+and re-reads them by attempt id when the answered call returns to Stasis. If
+the engine restarts while an originate is still ringing, it recovers the
+unfinished attempt and lead from SQLite before starting the AI session;
+unavailable or corrupt authoritative metadata fails closed. The value is
 intentionally excluded from logs; use attempt, campaign, lead, and channel
 identifiers when troubleshooting.
 
@@ -429,19 +574,23 @@ contains configuration and verification evidence, but never the referenced API p
 Controls interruption of TTS playback when the caller speaks.
 
 - barge_in.enabled: true/false
-- barge_in.initial_protection_ms: 200–600 ms. Drop inbound immediately after TTS starts to avoid self‑echo.
+- barge_in.initial_protection_ms: 200–600 ms. Full agents (OpenAI Realtime, Deepgram, Google Live, ...) and the engine's own energy detector for pipelines: inbound caller audio is dropped for this long after agent output starts, against self-echo. Pipelines whose barge-in is decided by Silero VAD or Asterisk `TALK_DETECT` never read it (their window is `talk_detect_initial_protection_ms` below); the Barge-In page shows it under *Provider-owned mode*, and under the pipeline windows only while the energy detector is the one in charge.
 - barge_in.min_ms: 250–600 ms. Minimum sustained speech before a barge‑in is acknowledged (de‑bounce).
 - barge_in.energy_threshold: 1000–3000. RMS energy threshold; raise on noisy lines.
 - barge_in.cooldown_ms: 500–1500 ms. Ignore new barge‑ins after one triggers.
 - barge_in.post_tts_end_protection_ms: 250–500 ms. Short guard to avoid clipping the start of the next caller utterance.
-- barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only (local file playback) minimum talk duration before triggering barge-in.
-- barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold (more sensitive than full-agent mode).
+- barge_in.talk_detect_initial_protection_ms: default 1500. Pipelines: how long after agent audio starts the caller's speech may not interrupt a reply, against phone echo of the agent's own voice at the start of a reply. With Silero VAD the window only defers: speech that starts inside it and is still going when it ends interrupts the reply at that moment (`BARGE-IN (Silero VAD) triggered` with `deferred_ms`), and since the utterance that interrupts is recognized whole, none of it is lost; speech that stops inside the window does not interrupt. Asterisk `TALK_DETECT` still ignores a talking-start event inside the window. Counted from the stream start (the gating token), which is 200–300 ms before the first audible sound with a streaming TTS. `0` lets the caller interrupt from the first millisecond (only sensible with echo cancellation on the line). With `streaming.pipeline_discard_unheard_reply: true`, speech before the reply's first sound discards the reply instead. With it off, pre-audio input is discarded and the Silero protection window uses the played audio position. The Barge-In page exposes it as *Talk-Detect / Silero Initial Protection*. The window never outlasts the reply: when a reply shorter than the window ends on its own while the caller is talking inside it (a callee answering the agent's "Hello"), the window ends with the reply, the speech is the caller's turn from its first frame and, with `vad.silero_stt_utterances`, the utterance is sent to the recognizer whole, unmuted (`Protection window ended with the reply` in the log), without counting as a barge-in. `barge_in.protection_ends_with_reply: false` keeps the window running to its configured end, as before, for a line whose echo of a short reply outlasts the reply. The caller-inactivity watchdog's check-in and final message are protected like any agent speech, which on a short check-in covers almost all of it, but what the caller says over them is their answer: with `vad.silero_stt_utterances` the utterance is sent to the recognizer whole, even when it ends before the announcement does (`Caller speaking over an inactivity announcement; the utterance is kept whole`), so a short "yes" over "are you still there?" becomes a turn instead of being dropped as silence; the result is taken as the recognizer returns it. After the announcement has played, the watchdog's decision waits up to 6 s while Silero still hears the caller or their result is on its way (`Waited for the caller's answer over an inactivity announcement`), so an answer over the final message keeps the call; raw line sound never holds it.
+- barge_in.greeting_protection_ms: default 0. Not a third window: while the greeting plays (the call's `conversation_state` is `greeting` until the first playback ends), the window in force, whichever detector's, is replaced by this value when it is longer; it never shortens it. The Barge-In page shows it as *Greeting Protection Override*.
+- barge_in.pipeline_listen_during_playback: default `false`. Pipelines with Silero VAD owning barge-in: the caller's frames keep reaching the recognizer while the agent speaks instead of being replaced by silence (see [Pipeline Gated Audio](#pipeline-gated-audio)), so what they say over a reply is transcribed whether or not it interrupts the reply (the utterance that does interrupt it is recognized whole in either setting); the protection window above still decides when speech may interrupt. Words spoken into a reply that is already audible are answered after it ends (or after a barge-in cuts it); words spoken before its first sound discard it. Needs echo cancellation on the line or a phone that does not return the agent's voice, or the agent transcribes itself. Barge-In page: *Keep listening while the agent speaks*.
+- barge_in.pipeline_min_ms: 80–250 ms. Pipeline-only minimum talk duration before the engine's energy detector triggers barge-in. Read only when neither Silero VAD nor `TALK_DETECT` decides pipeline barge-in; the Barge-In page hides it otherwise.
+- barge_in.pipeline_energy_threshold: 200–1200. Pipeline-only RMS threshold of the same energy detector (more sensitive than full-agent mode); hidden with it.
 - barge_in.pipeline_talk_detect_enabled: true/false. Pipeline-only; uses Asterisk `TALK_DETECT` (ARI `ChannelTalkingStarted`) to trigger barge-in during channel playback.
 - barge_in.pipeline_talk_detect_silence_ms: 800–2000. Pipeline-only; `TALK_DETECT(set)` silence window.
 - barge_in.pipeline_talk_detect_talking_threshold: 1–32768 (default 256). Pipeline-only; global Asterisk `TALK_DETECT(set)` DSP magnitude threshold. Audio profiles can override it with `profiles.<name>.talk_detect_talking_threshold`; `wideband_pcm_16k` uses the live-validated value 1000 to reject wideband playback echo while retaining caller barge-in.
 
 Notes (pipelines / `local_hybrid`):
 
+- With `vad.silero_enabled` (and `vad.silero_barge_in`, the default), Silero VAD scores every caller frame in the engine, gated or not, and triggers pipeline barge-in on `vad.silero_start_ms` of sustained speech, using the same `talk_detect_initial_protection_ms`, `greeting_protection_ms` and `cooldown_ms` guards as talk detection. Output that starts while the caller is already talking (an inactivity check-in, a filler, a reply whose turn ended on a pause the caller did not take) is cut the moment it becomes audible, without the protection window: speech that predates the agent's audio cannot be its echo (`BARGE-IN (Silero VAD) triggered` with `over_speech=True`). The greeting is exempt, since a callee's "hello" runs into it by design. Silero's speech start also pauses the caller-inactivity watchdog whatever it leads to, so a check-in can never start over speech the engine is already hearing. The local energy check is then skipped; `TALK_DETECT` may stay enabled alongside it.
 - Pipelines play TTS locally (file playback), so the platform can flush playback on barge-in without colliding with provider-owned VAD/cancellation.
 - With ExternalMedia, Asterisk channel playback may pause/alter the inbound RTP stream; `TALK_DETECT` is the preferred trigger source for pipeline barge-in.
 - Prereqs: Asterisk must have talk detection available (`app_talkdetect.so` / `func_talkdetect.so`). Verify with `asterisk -rx 'module show like talkdetect'` and `asterisk -rx 'core show function TALK_DETECT'`.
@@ -470,6 +619,13 @@ Controls the pacing and robustness of streamed agent audio.
 - streaming.provider_grace_ms: Absorb late provider chunks to avoid tail-chop artifacts.
 - streaming.logging_level: Verbosity for the streaming manager.
 - streaming.egress_force_mulaw: When true, converts outbound streaming audio to μ-law 8 kHz regardless of provider encoding.
+- streaming.pipeline_streaming_overlap: default `true`. Pipelines: stream LLM tokens and synthesize sentence by sentence instead of waiting for the whole reply; needs an LLM adapter with token streaming and `downstream_mode: stream`. A pipeline overrides it with `options.tts.streaming_overlap` (*TTS Playback Policy → Streaming Overlap* in the pipeline editor); the log line `Pipeline streaming overlap policy resolved` shows the outcome.
+- streaming.pipeline_heard_reply_on_interrupt: default `true`. When the caller interrupts a pipeline reply, the conversation history keeps only what the caller could hear: the sentences that played in full plus a proportional prefix of the cut one (to a word boundary), marked with an ellipsis, and the entry carries `interrupted: true`. The estimate comes from the audio that had reached the transport when the barge-in cut the stream, so it applies to streaming playback. Off: the whole reply (serial mode) or the sentences queued so far (overlap mode) stay in the history as if they had been spoken. Log line: `Pipeline reply interrupted; keeping the heard part` (`played_ms`, `heard_chars`, `generated_chars`).
+- streaming.pipeline_heard_reply_lead_ms: default `200` (0–5000). Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction); subtracted from the played position. Raise it if the history keeps words the caller did not hear.
+- A reply still playing when the caller's next turn is released is cut the same way before the next reply starts when it is stale, that is when the caller's words were spoken before the reply started (the recognizer returned them late): it was produced without them; log line `Pipeline playback cut by the caller's next turn`. Words spoken into a reply after it became audible (inside the barge-in protection window, or too short to trigger a barge-in) are the caller's answer to what they are hearing: the turn stays pending until the reply ends or a barge-in cuts it, and is answered then, without cutting the reply. A second reply is never attached to a live stream.
+- streaming.pipeline_discard_unheard_reply: default `true`. Pipelines with Silero VAD: the end of a turn is a guess on a pause, and when the caller goes on talking after the turn was released but before the first sound of the reply has reached them, nothing of that reply is worth keeping. Silero's start then cancels the LLM request in flight (an OpenAI-compatible request is aborted; the local AI server is told to stop and its late answer is skipped), requests no TTS, stops a stream whose audio has not been sent, keeps the history clean of the reply and its caller turn, and the dialog worker holds the caller's words to answer them together with what they say next, as one turn (`Caller's words wait for their next words`). Log lines: `Reply discarded before its first sound; the caller went on` (`since_release_ms`), `LLM request cancelled: the caller went on before the reply`. Once the first bytes have reached the transport the reply is the caller's to interrupt (barge-in). Off: caller input is discarded from turn release through LLM generation, TTS synthesis, and buffering before the first audio reaches the transport. Audio, preroll, queued input and stale STT results from this interval cannot become another turn. Once the reply is audible, normal playback gating and barge-in apply; with Silero the protection window is measured from played audio so synthesis cannot consume it. An error, empty answer or cancelled turn releases the generation gate. The optional `barge_in.pipeline_listen_during_playback` does not override this pre-audio gate. Streaming page → *Interrupted Replies*.
+- streaming.pipeline_continue_reply_after_empty_interrupt: default `true`. Pipelines with Silero cutting the caller's utterances: when the speech that cut a reply off (a barge-in) comes back from the recognizer empty (a cough, noise, nothing intelligible), the reply is not left hanging mid-sentence. The model is asked, with the heard part of the reply in front of it, to go on from where it stopped (`streaming.pipeline_continue_reply_prompt`, sent in place of a caller turn and never stored; blank uses the built-in text), and the continuation joins the heard part in the history as one assistant turn. The caller speaking before the continuation's first sound discards it like any reply, and their words are then the next turn on their own; at most two continuations in a row are made when they too are cut off by nothing. Log lines: `Interrupted reply continued: the speech that cut it off came to nothing`, `Continuation discarded before its first sound; the caller went on`. Off: the reply stays cut off until the caller says something the recognizer understands. Streaming page → *Interrupted Replies*.
+- streaming.pipeline_hangup_final_wait_ms: default `1500` (0–10000). When the caller hangs up, the call's cleanup first treats a reply still playing as interrupted at the position the transport had reached (the history keeps the heard part, as for a barge-in). Then, when the caller's speech is outstanding (the speech detector saw them talk after the recognizer's last result, or a finalize was already pending), the recognizer is fed its closing silence and the cleanup waits up to this long for the result, which is recorded as the caller's last turn with no LLM reply, so the call record, the post-call summary and the webhooks carry it. Results the dialog was still holding for the end of the turn, a turn whose LLM request the hangup cancelled, and a turn whose reply came back after the cleanup began (it is never played) are recorded the same way. With `vad.silero_stt_utterances`, speech that began inside a reply's protection window and was still waiting for the window's end when the caller hung up is sent to the recognizer as the caller's audio: the hangup decides the deferred barge-in. Needed for the VAD-gated offline recognizers (GigaAM v3, Sherpa offline), which return a phrase only after their silence gate. `0` turns the wait off. Log lines: `Waited for the caller's last words after hangup` (`reason`, `arrived`, `waited_ms`) and `Caller's last words recorded after hangup`.
 - streaming.greeting_rtp_wait_ms: ExternalMedia-only. How long to wait (ms) for the remote RTP endpoint to be discovered during the initial greeting before falling back to file playback (prevents “dead air until caller speaks” in some Asterisk setups).
 
 ## VAD (Voice Activity Detection)
@@ -497,6 +653,157 @@ Common pitfalls:
 - Too-short utterances (e.g., 20 ms) cause empty STT transcripts → raise `min_utterance_duration_ms` and ensure `webrtc_end_silence_frames` is not too low.
 - Overly aggressive VAD (aggressiveness=2/3) may clip 8 kHz speech; prefer 0–1 for telephony.
 
+### Silero VAD (pipelines)
+
+Asterisk `TALK_DETECT`, WebRTC VAD and the energy checks all decide "speech"
+from signal energy, so breathing, line noise or a television count as the
+caller while a quiet trailing syllable counts as silence. Silero VAD v6 is a
+small neural network (about 2 MB, ONNX) that scores every 32 ms of audio with
+a speech probability, natively at 8 or 16 kHz, in well under a millisecond per
+chunk on one CPU core (about half a percent of a core per call). Enabled, it
+runs in the engine on the very frames that reach the recognizer for every
+modular-pipeline call and becomes the one detector behind barge-in, the
+inactivity watchdog and the end of the caller's turn (see
+[Pipeline End of Turn](#pipeline-end-of-turn-caller-turn-taking)). Full-agent
+providers are not affected.
+
+- `vad.silero_enabled`: `true`/`false` (default `false`). Requires
+  `onnxruntime` in the engine image (in `requirements.txt`; rebuild the
+  `ai_engine` image after upgrading) and the model file below. When either is
+  missing the engine logs `Silero VAD unavailable` at start and pipelines fall
+  back to talk detection or the result window exactly as before.
+- `vad.silero_model_path`: path of `silero_vad.onnx` inside the engine
+  container (default `models/vad/silero_vad.onnx`; `./models` is mounted at
+  `/app/models`).
+- `vad.silero_auto_download`: fetch the pinned release (v6.2.1, SHA-256
+  verified) into that path on first start when the file is missing (default
+  `true`). On hosts without outbound access run `scripts/fetch_silero_vad.sh`
+  instead, or place the file from the `silero-vad` 6.2.1 wheel
+  (`silero_vad/data/silero_vad.onnx`) there.
+- `vad.silero_threshold`: speech probability at or above which a chunk counts
+  as speech, 0–1 (default `0.5`). Raise it on noisy trunks, lower it for quiet
+  callers.
+- `vad.silero_stop_threshold`: probability below which speech ends. Defaults
+  to `silero_threshold − 0.15`, Silero's own margin; chunks between the two
+  thresholds neither end speech nor restart it.
+- `vad.silero_start_ms`: sustained speech before the caller counts as talking
+  (default `96`, three chunks). Holds the turn and triggers barge-in.
+- `vad.silero_stop_ms`: silence after the caller's last speech before they
+  count as quiet (default `300`). This is the pause a caller may take
+  mid-sentence; the answer follows it by the pipeline's grace plus the
+  recognizer's finalization, so 300 ms is snappy and 600–800 ms tolerates a
+  caller who thinks aloud.
+- `vad.silero_sample_rate`: the rate Silero scores the caller's audio at,
+  `8000` or `16000` (default unset: the line's own rate, 8 or 16 kHz; any
+  other rate is converted to 16 kHz as before). `16000` upsamples 8 kHz
+  telephone audio for Silero (linearly, per 20 ms frame). After a silent line
+  (operators that suppress silence send digital near-zero between phrases)
+  Silero's 8 kHz model can score a short answer such as «да», «тут» or
+  «алло» right at the threshold, so whether it opens an utterance depends on
+  where its 32 ms chunk grid falls, while its 16 kHz model scores the same
+  audio well above it: on a recorded outbound call whose last four answers
+  never reached the recognizer, scoring at 16 kHz caught all four at every
+  grid offset (2.4 on average at 8 kHz) and 23.2 of the call's 26 caller
+  phrases on average (21.1 at 8 kHz), with no extra cuts on the line's
+  background. `8000` scores
+  wideband audio at 8 kHz (alias-safe downsampling). Only Silero gets the
+  converted audio: the recognizer, Smart Turn and the energy checks keep the
+  line's own, and Silero keeps its 32 ms cadence. The cost is about twice
+  the CPU per chunk (about 0.4 ms instead of 0.2 ms, on the event loop), and
+  since Silero also drives barge-in, barge-in becomes as sensitive. The
+  per-call log line `Silero VAD tracking caller speech` carries the
+  `sample_rate` in use (`line` when unset). VAD page → *Silero VAD* →
+  *Scoring Rate*.
+- `vad.silero_stt_finalize_ms`: silence fed to the recognizer the moment the
+  caller is quiet (default `900`, `0` disables). A streaming recognizer only
+  closes a phrase after its own silence gate (T-one: 600 ms, at 300 ms chunk
+  boundaries); the burst satisfies it at once instead of in real time, so the
+  result arrives within a recognizer round trip of the stop rather than 600–900
+  ms later. Plain zeros through the normal audio path, so no recognizer change
+  is needed; a recognizer that already emitted the phrase simply scores a
+  little more silence.
+- `vad.silero_barge_in`: let Silero speech during agent playback trigger
+  barge-in (default `true`). Turn off to leave barge-in to `TALK_DETECT` while
+  Silero still decides the end of turn.
+- `vad.silero_stt_utterances`: the recognizer gets whole utterances cut by
+  Silero instead of a continuous stream (default `false`). The engine keeps
+  the caller's audio at the recognizer's 16 kHz and, the moment Silero
+  reports them quiet, sends everything from `vad.silero_utterance_preroll_ms`
+  (default `300`, the start Silero needed plus the onset before it) before
+  the frame that opened the speech to the frame that closed it (Silero's
+  stop silence included) as one utterance. The recognizer decodes it as it
+  is, with no voice activity detector, idle finalizer or echo guard of its
+  own; nothing streams in between and `silero_stt_finalize_ms` is not used.
+  A caller who never pauses is sent in pieces of at most
+  `vad.silero_utterance_max_ms` (default `20000`), cut at the newest quiet
+  chunk in the second half of the piece; the turn stays held while Silero
+  hears them, so the pieces still make one turn. A hangup flushes what they
+  were saying (`streaming.pipeline_hangup_final_wait_ms` waits for it). Local
+  AI Server backends that decode whole phrases take the utterance as
+  `stt_utterance` (GigaAM v3 / NeMo through onnx-asr, Sherpa offline,
+  faster-whisper, whisper.cpp; the server says so in `mode_ready` and in its
+  status `capabilities.stt_utterances`); an older server or a streaming
+  backend gets each utterance as audio followed by a closing silence instead,
+  with one warning per call. Log lines: `Silero cuts the caller's utterances
+  for the recognizer` at call start, `Caller utterance sent to the recognizer`
+  per utterance (`duration_ms`, `signal_ms`, `reason`). Pair it with
+  `barge_in.pipeline_listen_during_playback` so words spoken over a reply are
+  transcribed whole. VAD page → *Silero VAD*.
+
+Every call logs `Silero VAD tracking caller speech` at start; each end of
+speech logs `Silero VAD: caller quiet` at debug level with whether a finalize
+burst was sent and whether a result is still expected.
+
+### Smart Turn (pipelines)
+
+A voice-activity detector knows that the caller's sound stopped, not whether
+their thought did: «я хочу…» followed by a pause reads exactly like «да».
+[Smart Turn v3](https://github.com/pipecat-ai/smart-turn) (pipecat-ai,
+BSD-2) is an audio-native turn detector, a Whisper Tiny encoder with a linear
+head (8M parameters, 8 MB int8 ONNX) that scores the caller's own audio for
+whether the turn is complete from prosody and content rather than from a
+transcript, for 23 languages including Russian, in about 50 ms on one CPU
+core. The engine runs it in-process, on the caller audio Silero VAD already
+sees, whenever Silero reports the caller quiet; feature extraction is a numpy
+re-implementation of the Whisper front end validated against
+`transformers`, so nothing beyond `onnxruntime` is needed.
+
+The verdict slots into the end-of-turn policy: `complete` (probability at or
+above `vad.smart_turn_threshold`) changes nothing, the turn is released after
+the grace as before; `incomplete` holds it up to
+`vad.smart_turn_incomplete_hold_ms` past the stop, and a caller who goes on
+is judged again on the whole turn at the next stop, as in the Pipecat
+reference integration. A verdict still being computed holds the turn at most
+`vad.smart_turn_timeout_ms`. The recognizer is finalized at the stop either
+way, so the transcript is ready the moment the turn is released.
+
+- `vad.smart_turn_enabled`: `true`/`false` (default `false`). Requires
+  `vad.silero_enabled`; without Silero it stays off with an error at start.
+- `vad.smart_turn_model_path`: path of the ONNX file inside the engine
+  container (default `models/turn/smart-turn-v3.2-cpu.onnx`).
+- `vad.smart_turn_auto_download`: fetch the pinned v3.2 CPU build (SHA-256
+  verified) from the pipecat-ai Hugging Face release on first start when the
+  file is missing (default `true`); `scripts/fetch_smart_turn.sh` does the
+  same from the host.
+- `vad.smart_turn_threshold`: completion probability that releases the turn
+  at once (default `0.5`).
+- `vad.smart_turn_incomplete_hold_ms`: how long an incomplete verdict may
+  hold the turn past the Silero stop (default `3000`).
+- `vad.smart_turn_trailing_silence_ms`: how much of the silence after the
+  caller's last speech the model is shown (default `200`); the rest of the
+  Silero stop window is trimmed, matching the reference integration's VAD.
+- `vad.smart_turn_timeout_ms`: how long the turn waits for a verdict at most
+  (default `500`).
+- `vad.smart_turn_threads`: CPU threads for one inference (default `1`).
+
+Every judged stop logs `Smart Turn verdict` with `complete`, `probability`,
+`audio_ms` and `inference_ms`, and `Caller turn ended on silence` carries
+`turn_verdict` (`complete`, `incomplete` when the hold ran out, `pending`
+when the timeout did) and `turn_probability`. Telephony audio is 8 kHz
+upsampled with a proper low-pass to the model's 16 kHz; the model was trained
+on wideband speech, so judge its accuracy on your own recordings before
+raising the hold, and lower `vad.silero_stop_ms` only once it earns trust.
+
 ## Caller inactivity (`no_input`)
 
 The engine-level watchdog prevents an answered call from remaining open indefinitely when the caller stops responding. It is independent of provider endpointing/VAD: timing runs only while the conversation is ready and the caller, agent, and model are all idle.
@@ -507,10 +814,26 @@ The engine-level watchdog prevents an answered call from remaining open indefini
 - `no_input.initial_timeout_sec`: Idle time before the first check-in. Defaults to 30 seconds.
 - `no_input.grace_timeout_sec`: Reply window after each check-in. Defaults to 15 seconds.
 - `no_input.max_check_ins`: Number of check-ins before the final message and hangup. Defaults to 1; `0` skips directly to the final message.
-- `no_input.check_in_message`: Check-in text, spoken by the active provider/pipeline in the agent's configured voice.
+- `no_input.check_in_message`: Check-in text, spoken by the active provider/pipeline in the agent's configured voice. A pipeline synthesizes it with its own TTS adapter and, when its replies stream over the call's media (`downstream_mode: stream`, the default), delivers it on that stream; only file-playback pipelines write it to the media directory for ARI playback.
 - `no_input.final_message`: Non-empty text spoken before the ARI hangup. Blank or whitespace-only per-agent values inherit the safe default.
+- `no_input.stall_timeout_sec`: Hang up once nothing has been exchanged for this long. Defaults to `0` (off); `90`–`120` is a sensible value. See *Stalled conversations* below.
+- `no_input.max_call_duration_sec`: Hard cap on a call's length, counted from its start. Defaults to `0` (off). See *Maximum call duration* below.
 
-Caller media activity, provider speech-start events, and user transcripts reset the window. The timer pauses during greetings, agent TTS, LLM processing, sustained caller speech, and other output gating. A terminal watchdog hangup is stored in Call History as `no_input_timeout`, not as a provider error.
+A caller turn restarts the window and the check-ins: a transcript handed to the model, a provider speech-start or transcript event, a barge-in. Caller sound that a detector reports on its own (Silero VAD, `TALK_DETECT`, the engine's energy detector; `Caller sound reported to the inactivity watchdog` in the log) only pauses the clock while it lasts, after which the window starts over: a tone, hold music, noise or a cough the recognizer returns nothing for never earns a fresh check-in, and a check-in is answered only by a turn. The timer also pauses during greetings, agent TTS, LLM processing and other output gating. A terminal watchdog hangup is stored in Call History as `no_input_timeout`, not as a provider error.
+
+### Stalled conversations (`no_input.stall_timeout_sec`)
+
+The check-ins count only while the caller is quiet. A line that carries sound but no conversation therefore never triggers them: hold music, a noisy room, an IVR or a radio keep the speech detectors (Silero VAD, `TALK_DETECT`, provider VAD) reporting caller speech, the recognizer returns nothing the model could answer, and the call stays open until the trunk drops it. For outbound calls the check-ins are off by default anyway.
+
+`stall_timeout_sec` is the safety net for that case. It counts from the last *exchange*, which is either a caller turn handed to the model (a transcript accepted for an LLM turn) or an utterance the agent finished (a reply, the greeting; the watchdog's own check-ins and final message are not exchanges, so a line that never answers cannot keep itself open with them), and it ignores the speech detectors entirely: caller sound on its own never restarts it. It also counts from the moment the call's session is registered, before the greeting is done: a call whose setup never completes is a stall too, and the greeting playing pauses it like any agent output. It pauses while the agent is speaking, so a long reply is never cut, and while the caller is on hold or in a transfer; a hosted agent's reply to its own silence pseudo-turn does not count as an exchange. When it expires the engine speaks `final_message` (a caller turn that reaches the model during it keeps the call alive; caller sound alone does not, and neither does the message's own end, although it is an agent utterance), then hangs up and records the call as `no_input_timeout`, with `timed_out_reason: stall` in the session's `no_input_state` and the log line `Conversation stalled; hanging up` (`since_exchange_sec`, `last_exchange_source`, `caller_sound_active`), followed by `Hanging up stalled conversation`.
+
+It applies to inbound and outbound calls alike: only `no_input.enabled` turns it off, not `inbound_enabled`/`outbound_enabled`, so an outbound campaign can have it without the check-ins. Per-agent overrides set their own value (`0` disables it for that agent). In the Admin UI it is **Stall Timeout** under **Advanced Settings → Voice Activity Detection → Caller Inactivity** and under **Agents → Edit Agent → Caller Inactivity Overrides**. A value below the check-in flow (`initial_timeout_sec` plus `grace_timeout_sec` per check-in) ends a quiet caller's call before the final message; keep it above that flow for inbound calls, for example `90` with the default `30` + `15`.
+
+### Maximum call duration (`no_input.max_call_duration_sec`)
+
+`max_call_duration_sec` is a hard cap on a call's length. It counts from the call's start (for an outbound call, the time already spent in the AMD hop before the agent's session began is included), and nothing pauses it: not the caller talking, not the agent speaking, not a turn being processed. When it is reached the engine hangs up at once, mid-sentence if need be, without an announcement; a transfer or hold in progress only delays the hangup, which is retried every few seconds until the engine can end the call. The log line is `Call reached its maximum duration; hanging up` (`duration_sec`, `agent_speaking`, `caller_sound_active`), followed by `Hanging up call at its maximum duration`.
+
+A call ended this way is recorded as `max_duration` (Call History shows *Max duration reached*; the outbound attempt and the post-call webhook's `{call_outcome}` carry `max_duration`), as a policy outcome and not a provider failure. Like the stall timeout it applies to inbound and outbound calls alike, only `no_input.enabled` turns it off, and per-agent overrides set their own value (`0` disables it for that agent). In the Admin UI it is **Max Call Duration** next to the stall timeout, globally and per agent.
 
 Provider generation completion is not treated as caller playback completion. Before terminal hangup, the engine also drains provider/coalescing queues, jitter frames, frame remainder, active ARI playback, and a short transport-specific post-roll. This applies uniformly to AudioSocket and ExternalMedia/RTP; pipeline/file announcements use Asterisk `PlaybackFinished` as their authoritative boundary.
 
@@ -565,7 +888,99 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 
 - `openai_llm`: Chat Completions (`chat_base_url`, `chat_model`)
 - `openai_stt`: Speech-to-Text via `audio/transcriptions` (`stt_base_url`, `stt_model`)
-- `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `response_format`)
+- `openai_tts`: Text-to-Speech via `audio/speech` (`tts_base_url`, `tts_model`, `voice`, `tts_response_format`; for a self-hosted endpoint also `tts_streaming`, `tts_pcm_sample_rate_hz`, `tts_text_prefix`, `tts_extra_body`, see below)
+
+The three canonical keys inherit whatever `providers.openai` carries. Any other `<name>_stt`, `<name>_llm` or `<name>_tts` block with `type: openai` is registered under its own key as well (`deepseek_llm`, `whisper_stt`, `fish_tts`, which is what the Providers page saves for a modular OpenAI provider with its own name), so one config can hold several OpenAI-compatible endpoints. Such a block stands on its own: it needs an `api_key` (or `api_key_file`, `api_key_env`, `<NAME>_API_KEY`; any value for a self-hosted endpoint that checks none), and a pipeline references it by that key. A block the engine cannot register is named at startup, `Pipeline '...' cannot resolve tts component 'fish_tts' (placeholder adapter)`, together with the reason (disabled, no `type`, no `api_key`, a type not registered under custom keys). The Providers page's *Test* button asks the block's own host for `/models`, derived from `chat_base_url` or, for a speech-only block, from `tts_base_url` / `stt_base_url`. Every provider test runs inside the `ai_engine` container (`POST /providers/test` on its health server): in a split deployment the Admin UI container sits in another network than the engine host, so an endpoint on that host's loopback, or behind a proxy only that host reaches, is alive for calls and dead from the UI. The verdict says where it was produced; when the engine cannot be reached the same probe runs in the Admin UI container and the verdict says that too.
+
+**Self-hosted speech endpoints (TTS).** The same `openai_tts` component drives any server that speaks the `/v1/audio/speech` protocol, such as vLLM-Omni serving Fish Speech S2-Pro. Four keys cover what such a server needs beyond the OpenAI fields; each can also be given per pipeline under `options.tts` without the `tts_` prefix (`streaming`, `pcm_sample_rate_hz`, `text_prefix`, `extra_body`):
+
+```yaml
+providers:
+  fish_tts:
+    type: openai
+    api_key: local                      # vLLM-Omni without --api-key ignores it, but the adapter needs a value
+    tts_base_url: http://10.0.0.5:8091/v1/audio/speech
+    tts_model: fishaudio/s2-pro
+    voice: anna                         # a voice registered once via POST /v1/audio/voices
+    tts_response_format: pcm            # the request's response_format: pcm or wav
+    tts_streaming: true                 # stream: true, frames are played as they arrive
+    tts_pcm_sample_rate_hz: 44100       # Fish Speech S2-Pro speaks 44.1 kHz; a pcm body carries no header
+    tts_text_prefix: "<|speaker:0|>"    # keeps Fish Speech on the reference voice
+    tts_extra_body:                     # forwarded verbatim in the request body
+      stream_format: audio
+      extra_params:
+        top_p: 0.8
+        temperature: 0.7
+    target_encoding: mulaw
+    target_sample_rate_hz: 8000
+    output_resampler: bandlimited       # low-pass before 44.1 kHz is brought down to 8 or 16 kHz
+```
+
+- `tts_response_format`: the request's `response_format`, `wav` (default) or `pcm`. At provider level the key carries the `tts_` prefix; per pipeline it is `options.tts.response_format`. A bare `response_format` in the provider block is not read by the TTS adapter.
+- `tts_streaming`: the request carries `stream: true` and the adapter plays the reply while it is still being generated. The engine already hands pipeline TTS one sentence at a time (`streaming.pipeline_streaming_overlap`), so the caller waits for the first frames of a sentence instead of the whole sentence. Only `pcm` and `wav` bodies are understood; a streamed `wav` is read from its header. `response_timeout_sec` is then the time the endpoint may stay silent between two chunks.
+- `tts_pcm_sample_rate_hz`: rate of a `pcm` body (OpenAI 24000, Fish Speech S2-Pro 44100). A non-integer ratio to the call's rate is resampled with a fractional-phase, stateful resampler so chunk boundaries stay seamless; with `output_resampler: bandlimited` or `fir` the audio is low-passed at the source rate first, so the band above the target is removed instead of folded back.
+- `tts_text_prefix`: put in front of the text of every request unless it is already there.
+- `tts_extra_body`: request-body fields forwarded verbatim. `model`, `input`, `voice`, `response_format` and `stream` are set by the engine and cannot be overridden here; a `tts_extra_body` entry for one of them is ignored with a warning.
+- The OpenAI model and voice fallbacks (an `org/model` name or a Groq voice name is replaced by the provider default) apply only when `tts_base_url` points at an `openai.com` host; a self-hosted endpoint gets the configured model and voice as they are.
+
+- `tts_voices_dir`: directory inside the `ai_engine` container from which the scripted form of voice registration reads a sample (`/voices` by default); the Providers page uploads from the browser and does not need it.
+
+**Registering a voice from the Providers page.** vLLM-Omni keeps a registry of reference voices (`POST /v1/audio/voices`: the sample, its transcript and a name), and a request then says `voice: <name>` instead of carrying the sample. The server accepts only an upload, no path, so the sample travels from the browser: open a saved `type: openai` TTS provider, and under *Reference voice* pick the file (wav, mp3, flac, ogg, aac, webm or m4a; 1 to 30 s of one speaker, at most 10 MB), give the exact transcript of what is said in it (required: without it the server stores the sample but does not clone from it), optionally a voice name (the file name without its extension by default) and a consent ID. The Admin UI relays the file to the engine, which shares a host and a network with the server, and the engine uploads it to the provider's own `/audio/voices`. The card reports the server's answer, `Voice 'anna' registered at 127.0.0.1 …` or the reason it refused (too short, too long, wrong format), and offers to set the provider's `voice` to the registered name. *Registered voices* lists what the server holds (name, date, sample size, transcript) with a *Use* link per voice. A name that already exists is replaced. Keep the server's registry directory on a volume (`SPEAKER_SAMPLES_DIR`, `/root/.cache/vllm-omni/speakers` by default), or the voices vanish when its container is recreated.
+
+The engine endpoints behind the card, on its health server with the same authorization as `/reload`: `POST /providers/<key>/voices` takes a multipart upload (`audio_sample`, `ref_text`, `name`, `consent`) or JSON naming a file inside `tts_voices_dir` (`{"file": "anna.wav", "ref_text": "…"}`, for scripts), and `GET /providers/<key>/voices` lists the voices. When the Admin UI cannot reach the engine's health server over the network (it listens on the engine's loopback by default), it stages the sample into the engine container through the Docker socket and the engine deletes it after the upload.
+
+An example pipeline lives in `examples/pipelines/fish_s2_vllm_omni.yaml`.
+
+**Vendor fields (LLM).** A provider block describes one endpoint, so any key the engine has no meaning for is treated as a parameter for that endpoint and is forwarded verbatim in the Chat Completions body. Write the vendor's own parameter name directly in the block:
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://api.mistral.ai/v1
+    chat_model: mistral-small-latest
+    prompt_cache_key: prompt-1        # or ${CACHE_KEY:-prompt-1}
+    safe_prompt: true
+```
+
+Three groups never leave the engine: fields of the typed provider config (`chat_base_url`, `chat_model`, `response_timeout_sec`, `voice`, …), routing and identity metadata (`type`, `name`, `enabled`, `capabilities`, `base_url`, `model`, `timeout_sec`, …), and anything shaped like a credential (a key containing `api_key`, `secret`, `password` or `credential`, or named `token` / ending in `_token`). `max_tokens` is a request parameter, not a credential, and is forwarded.
+
+The flip side is that a typo now reaches the endpoint, and an API that rejects unknown parameters will fail the request. Every call that carries forwarded fields logs their names (never their values) as `Forwarding extra_body fields to the LLM`, so check that line first when an endpoint starts returning 400.
+
+Keys the engine owns in the request itself (`model`, `messages`, `stream`, `tools`, `tool_choice`) cannot be overridden and are ignored with a warning. An explicit `extra_body:` mapping is still supported, in the provider block, in a pipeline's `options.llm`, or in runtime options, shallow-merged in that order; it wins over a bare key of the same name and is the only way to set a field per pipeline rather than per provider.
+
+For prompt caching (`prompt_cache_key` on OpenAI and Mistral, where cached input tokens bill at a fraction of the normal rate), pick a value that stays the same across calls sharing a system prompt and bump it when that prompt changes. A per-call value defeats the cache, and the key must not contain secrets or personal data.
+
+**Transport (LLM).** One Chat Completions request is made per caller turn, and the pause between turns (the reply's playback plus the caller's next words) usually outlasts aiohttp's 15 s idle window, so by default almost every reply pays a fresh TCP+TLS handshake. Two typed keys on the provider block, both also accepted per pipeline under `options.llm` where they override the block, change that; neither is ever forwarded to the endpoint as a body field:
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://api.mistral.ai/v1
+    keepalive_timeout_sec: 240        # idle window for connection reuse; absent = aiohttp's 15 s
+    proxy: "http://xray:8080"         # optional; empty or absent = direct connection
+```
+
+- `keepalive_timeout_sec`: how long an idle connection to the endpoint is kept for reuse. It stands on its own and does not need a proxy; a window of 120-300 s outlasts a turn, so the next request reuses the connection. `0` or an unparsable value falls back to the default.
+- `proxy`: an HTTP proxy URL for this adapter's Chat Completions requests alone, with the same rules as the ElevenLabs adapter (`http://` and `https://` only, inline credentials moved into a `Proxy-Authorization` header and never logged, a malformed value fails the adapter rather than connecting directly). The container's `HTTPS_PROXY` is ignored either way. The OpenAI STT and TTS adapters keep their direct path.
+
+After `data: [DONE]` the adapter now reads the streamed body to its end before releasing the connection: aiohttp closes a connection whose body was left unread, and the chunk terminator can land a packet after the `[DONE]` line, which silently cost the next turn a handshake.
+
+Whether a request reused a connection is visible in the log: `OpenAI chat completion received` and the new `OpenAI streaming completed` line (with `finish_reason`, `chars`, `first_token_ms`, `total_ms`) carry `connection=reused` or `connection=new` with `connect_ms` (TCP, TLS and, through a proxy, the CONNECT round trip) and `headers_ms` (until the response headers). The ElevenLabs TTS `synthesis completed` lines carry the same fields. `OpenAI-compatible LLM transport ready` at the first request of a session reports the proxy and keepalive in force.
+
+**Prompt warm-up (LLM).** Each call gets its own adapter and connection pool, so the first Chat Completions request of every call pays a new TCP+TLS connection (through a proxy, the CONNECT round trip on top) and the prefill of the whole system prompt, and both land on the caller's first reply. `warm_up: true` on the provider block (or per pipeline under `options.llm`, where it overrides the block; never forwarded to the endpoint) sends one `max_tokens: 1` request the moment the prompt, the tools and the greeting are resolved, while the greeting is synthesized and played. It carries exactly the prefix the first turn will carry: the system prompt with its variables substituted, the tool schemas, the greeting as the assistant's first message, and any vendor field such as `prompt_cache_key`, followed by a one-character user message, through the adapter's own session. The reply is discarded and never enters the history. By the first real turn the connection is open in the pool (`connection=reused` on `OpenAI streaming completed`) and, on an endpoint with prefix caching (vLLM with prefix caching on, OpenAI, Mistral), the prompt prefix is cached, so that turn prefills only the caller's words.
+
+```yaml
+providers:
+  native_llm:
+    type: openai
+    chat_base_url: https://ai-api.example.com/v1
+    keepalive_timeout_sec: 150
+    warm_up: true                     # default false
+```
+
+The log shows `Pipeline LLM warm-up started` (debug) and `LLM prompt warm-up completed` with `total_ms`, `messages_count`, `tools_count`, the connection fields, and `prompt_tokens` / `cached_tokens` where the endpoint reports them (`cached_tokens` on the warm-up itself says whether the previous call's prefix was still cached). A failed warm-up logs `LLM prompt warm-up failed` and costs the call nothing else; hangup cancels one still in flight; a caller who interrupts the greeting before it completes simply gets a second connection. Off by default, because a metered API bills one extra prompt per call (the warm-up at the full input price, the first turn at the cached price). The prefix cache only helps where the chat template puts the system prompt at the start of the token stream; a template that attaches it to the last user message (the older Mistral ones do) still gets the handshake out of the way, but not the prefill.
 
 Requirements:
 
@@ -625,6 +1040,7 @@ Config notes:
 ### Local provider (pipelines)
 
 - Local STT/LLM/TTS parameters live under pipeline `options`. The engine plays `llm.initial_greeting` first if configured.
+- `providers.<name>.stt_input_resampler`: how the caller's 8 kHz audio is brought to the 16 kHz the local recognizers decode before it is sent to the Local AI Server. `fir` (default) is a polyphase windowed-sinc interpolator: flat telephone band, no spectral images, about 3 ms of delay. `linear` restores the previous interpolation, which rolls the band off by 2–3 dB at 3 kHz and mirrors it above 4 kHz (a 3 kHz tone at 5 kHz, about −13 dB), which an offline recognizer such as GigaAM v3 sees in its features. Applies to the `local` STT provider of a pipeline and to the full local agent; the Providers page exposes it as **STT Input Upsampler**.
 
 ### Google Live (monolithic agent)
 

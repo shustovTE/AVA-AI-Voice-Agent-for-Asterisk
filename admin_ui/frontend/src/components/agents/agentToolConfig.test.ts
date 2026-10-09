@@ -100,6 +100,46 @@ describe('per-agent no-input configuration', () => {
     });
 });
 
+describe('per-agent stall timeout override', () => {
+    const roundTrip = (stall_timeout_sec: unknown) => {
+        const state = parseAgentConfig({
+            provider: 'openai_realtime',
+            extra_json: JSON.stringify({ no_input: { stall_timeout_sec, initial_timeout_sec: 45 } }),
+        });
+        const serialized = serializeAgentConfig(state);
+        return JSON.parse(serialized.extra_json || '{}').no_input;
+    };
+
+    it('round-trips a stall timeout, including an explicit zero that disables it for the agent', () => {
+        expect(roundTrip(90)).toEqual({ stall_timeout_sec: 90, initial_timeout_sec: 45 });
+        expect(roundTrip(0)).toEqual({ stall_timeout_sec: 0, initial_timeout_sec: 45 });
+    });
+
+    it('drops a stall timeout outside its range or of the wrong type', () => {
+        expect(roundTrip(-1)).toEqual({ initial_timeout_sec: 45 });
+        expect(roundTrip(7201)).toEqual({ initial_timeout_sec: 45 });
+        expect(roundTrip('90')).toEqual({ initial_timeout_sec: 45 });
+    });
+});
+
+describe('per-agent max call duration override', () => {
+    const roundTrip = (max_call_duration_sec: unknown) => {
+        const state = parseAgentConfig({
+            provider: 'openai_realtime',
+            extra_json: JSON.stringify({ no_input: { max_call_duration_sec } }),
+        });
+        return JSON.parse(serializeAgentConfig(state).extra_json || '{}').no_input ?? {};
+    };
+
+    it('round-trips a cap, including an explicit zero, and drops one outside its range', () => {
+        expect(roundTrip(1800)).toEqual({ max_call_duration_sec: 1800 });
+        expect(roundTrip(0)).toEqual({ max_call_duration_sec: 0 });
+        expect(roundTrip(-1)).toEqual({});
+        expect(roundTrip(86401)).toEqual({});
+        expect(roundTrip('1800')).toEqual({});
+    });
+});
+
 describe('per-agent connection audio configuration', () => {
     it('round-trips the caller-only media URI through extra_json', () => {
         const state = parseAgentConfig({

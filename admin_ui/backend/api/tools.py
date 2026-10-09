@@ -949,6 +949,7 @@ _PASSTHROUGH_FIELDS = (
     "summary_max_words",
     "summary_timeout_ms",
     "summary_prompt",
+    "send_on_failed_dial",
     "description",
     "return_raw_json",
     "error_message",
@@ -1000,6 +1001,9 @@ class ManagedToolParameter(BaseModel):
     type: str = "string"
     description: str = ""
     required: bool = False
+    # Allowed values; the engine advertises them as the parameter's JSON
+    # `enum` and rejects any other value before the request is made.
+    enum: Optional[List[str]] = None
 
 
 class ManagedToolWrite(BaseModel):
@@ -1024,6 +1028,9 @@ class ManagedToolWrite(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    # Post-call webhooks: also send for an outbound attempt that never became
+    # a call (the engine's default is true).
+    send_on_failed_dial: Optional[bool] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1105,6 +1112,9 @@ class ManagedToolPatch(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    # Post-call webhooks: also send for an outbound attempt that never became
+    # a call (the engine's default is true).
+    send_on_failed_dial: Optional[bool] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1341,7 +1351,7 @@ def _build_tool_doc(data: Dict[str, Any], phase: str) -> Dict[str, Any]:
     params = data.get("parameters")
     if params is not None:
         doc["parameters"] = [
-            p if isinstance(p, dict) else p.model_dump() for p in params
+            p if isinstance(p, dict) else p.model_dump(exclude_none=True) for p in params
         ]
     return doc
 
@@ -1514,7 +1524,7 @@ async def patch_managed_tool(name: str, body: ManagedToolPatch):
     patch = body.model_dump(exclude_unset=True)
     if "parameters" in patch and patch["parameters"] is not None:
         patch["parameters"] = [
-            p if isinstance(p, dict) else p.model_dump() for p in patch["parameters"]
+            p if isinstance(p, dict) else p.model_dump(exclude_none=True) for p in patch["parameters"]
         ]
 
     old_phase = _phase_for(cur_block, cur_doc)

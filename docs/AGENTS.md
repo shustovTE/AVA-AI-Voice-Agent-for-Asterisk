@@ -5,6 +5,10 @@ An **agent** is the v1a evolution of a "context": a named configuration bundle t
 - **Provider** — which AI backend handles the call (e.g. `deepgram`, `openai_realtime`, `local_hybrid`)
 - **Prompt** — the system-level instructions and persona
 - **Greeting** — the first thing the agent says when it picks up
+- **Lead Context block** (outbound) — whether the lead's `custom_vars` are
+  appended to the prompt as a read-only `## Lead Context` JSON block. Custom
+  variables are always available as `{var}` placeholders in the prompt and
+  greeting; turn the block off when the placeholders already cover them.
 - **Connection audio** — optional caller-only ringback/comfort media while the provider or pipeline initializes
 - **Voice** — per-agent voice override (v7.3.0+): pick a voice for this agent, or leave empty to use the provider's default voice. Multiple agents can share one provider, each with its own voice. See [Voice Selection](VOICE_SELECTION.md)
 - **Audio profile** — telephony format / sample-rate profile (e.g. `telephony_ulaw_8k`)
@@ -120,6 +124,22 @@ Under **Agents → Edit Agent → Tools → Hangup Guardrail**, choose how the A
 - **Replace global markers** uses only the Agent list. At least one marker is required.
 
 Enter one normalized phrase per line. Very short or single-word markers can match ordinary conversation, so the UI warns about them; use distinctive phrases where possible and test both expected and false-positive utterances. Saving an Agent affects new calls only. Active calls keep the effective marker snapshot they started with.
+
+**Hang up on assistant farewell** (same section, off by default): when enabled,
+AAVA ends the call after the **Agent itself** speaks an *Assistant Farewell
+Marker* («до свидания», «всего доброго», goodbye…) at the end of an utterance.
+The farewell audio finishes playing before the hangup (the standard
+`cleanup_after_tts` drain, with the bounded terminal fallback), and a marker
+mentioned mid-sentence does not trigger. A caller who interrupts the farewell
+(barge-in) cancels this hangup: it is a guess about the conversation, the
+caller's words go to the model as an ordinary turn and the model may say
+goodbye again; an explicit `hangup_call` is not cancelled. With strategy *extend*/*replace* the
+Agent can add or replace the farewell marker list; empty keeps the global
+list. This is a deterministic safety net for providers whose platform-side
+agent does not reliably end the call itself (e.g. ElevenLabs); it also lets
+the modular pipeline path hang up on the agent's farewell without requiring
+caller end intent. Pair it with a prompt rule such as "при завершении звонка
+всегда говори «До свидания»".
 
 The Agent row stores this nullable first-class value in `hangup_policy_json`. Legacy YAML imports may use the equivalent form:
 

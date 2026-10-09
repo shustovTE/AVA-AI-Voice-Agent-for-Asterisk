@@ -551,6 +551,7 @@ providers:
     voice_id: "21m00Tcm4TlvDq8ikWAM"   # Rachel (warm, professional)
     model_id: "eleven_turbo_v2_5"        # Fast, high-quality
     output_format: "ulaw_8000"           # Telephony-optimized
+    stream: true                         # Play audio as it arrives
     stability: 0.5
     similarity_boost: 0.75
     style: 0.0
@@ -560,7 +561,77 @@ providers:
 **Key settings**:
 - **`voice_id`**: Choose from the [ElevenLabs Voice Library](https://elevenlabs.io/voice-library). Default is Rachel (`21m00Tcm4TlvDq8ikWAM`).
 - **`model_id`**: `eleven_turbo_v2_5` offers the best balance of speed and quality for telephony.
-- **`output_format`**: Must be `ulaw_8000` for telephony. ElevenLabs returns μ-law encoded audio at 8 kHz.
+- **`output_format`**: the format requested from ElevenLabs. The adapter decodes the raw formats the API offers and nothing else: 16-bit PCM at any rate (`pcm_8000`, `pcm_16000`, `pcm_22050`, `pcm_24000`, `pcm_32000`, `pcm_44100` on the Pro tier or above, `pcm_48000`) and the two 8 kHz telephony codecs (`ulaw_8000`, `alaw_8000`). `mp3_*` and `opus_*` are valid API values, but the engine ships no decoder for them, so they are refused before any request is made, with the accepted list in the error. `ulaw_8000` (the default) or `pcm_8000` suits an 8 kHz call; a wideband (16 kHz) call switches any 8 kHz format to `pcm_16000` on its own so the API is not the bottleneck. A rate other than the call's is resampled by the engine, which keeps that provider on the buffered path (see `stream`).
+- **`stream`**: Default `true`. Requests `/text-to-speech/{voice_id}/stream` and starts playback on the first bytes instead of waiting for the whole sentence, which removes the synthesis time of each sentence from the reply latency. Set `false` to go back to the buffered request. The setting is ignored (and the buffered path used) when the requested `output_format` needs resampling to the call's transport rate, because the resampler keeps no state between chunks.
+
+### Routing ElevenLabs Through a Proxy
+
+Both settings are optional and apply to this adapter alone, so a deployment can
+keep the engine, the models and Asterisk on the direct path and send only the
+one remote leg through a tunnel.
+
+```yaml
+providers:
+  elevenlabs_tts:
+    proxy: "http://xray:8080"      # empty or absent = direct connection
+    keepalive_timeout_sec: 120     # absent = aiohttp's 15 s default
+    read_timeout_sec: 8            # no byte for this long = a dead stream; 0 = no limit
+```
+
+- **`proxy`**: an HTTP proxy URL, for example a local Xray or 3x-ui HTTP
+  inbound on the container network. HTTPS is tunnelled through it with
+  `CONNECT`. Only `http://` and `https://` are accepted: aiohttp has no SOCKS
+  support of its own, and a `socks5://` value is rejected at startup rather
+  than failing later inside a call. Credentials may be written inline
+  (`http://user:pass@host:port`); they are moved into a `Proxy-Authorization`
+  header and never logged, but they do sit in the config file like any other
+  setting, so an inbound without auth on a private container network avoids
+  keeping a password there. A malformed value fails the adapter instead of
+  quietly connecting directly, so traffic meant for the tunnel cannot leak out
+  the default route.
+- **`keepalive_timeout_sec`**: how long an idle connection to ElevenLabs is
+  kept for reuse. Audio is streamed a sentence at a time over one session per
+  call, so when the connection is dropped between sentences the next one pays a
+  fresh TLS handshake, and through a proxy that costs several extra round
+  trips. A window that outlasts a caller's pause (60-180 s) removes that from
+  the middle of a conversation. The first sentence of each call still
+  handshakes, which lands on the greeting where it matters least. Whether a
+  sentence reused the connection is in its `ElevenLabs TTS synthesis
+  completed` log line: `connection=reused`, or `connection=new` with
+  `connect_ms` for the handshake it paid.
+- **`read_timeout_sec`** (default `8`): how long a request may go without a
+  byte, before the first one or between chunks, before it counts as a dead
+  stream. A live stream delivers a chunk every few milliseconds and its first
+  byte within a few hundred, so eight seconds of silence is a connection that
+  will never answer: a pooled connection through a proxy can die without a
+  reset, and without this limit aiohttp waits five minutes while the dialog
+  worker sits on the reply, unable to answer the caller's next words. When
+  nothing had arrived yet the adapter drops its connection pool and retries the
+  request once on a fresh connection (`ElevenLabs TTS gave no audio in time;
+  retrying on a fresh connection`); a stream that stalls after its first bytes,
+  or a second dead stream, fails the reply (`ElevenLabs TTS stalled`). The
+  engine then skips that reply rather than falling back to file playback,
+  keeps only what was heard of it in the history, and answers the caller's
+  next words as usual. `0` removes the limit.
+
+Both keys are also accepted per pipeline under `options.tts`, where they
+override the provider block. The Admin UI exposes them in either editor: under
+**Network Routing** in the ElevenLabs provider form (TTS Engine mode), and as
+**HTTP Proxy** and **Keepalive Timeout** when the provider is configured as
+*Modular (single capability)* with a TTS provider type of `elevenlabs`.
+
+**Test connection** on the Providers page probes ElevenLabs the way the
+adapter will reach it: through `proxy` when it is set, directly otherwise, and
+never through an `HTTPS_PROXY` of the container, which the adapter ignores
+too. The result says which route it took and, on failure, which hop failed:
+`Proxy … refused the tunnel` (the proxy answered but would not connect
+onward), `Cannot connect to proxy …` (nothing listens there), `Reached
+ElevenLabs via proxy …, but the API key was rejected` (the route works, the
+key does not), or a timeout on the route. A `socks5://` value is reported as
+rejected right there, exactly as the engine would refuse it at startup.
+The probe runs inside the `ai_engine` container, so a proxy that only the
+engine host can reach is tested through the same route the adapter takes; the
+verdict says where it was produced.
 
 ### Pipeline Configuration
 

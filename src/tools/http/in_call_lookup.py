@@ -395,9 +395,10 @@ class InCallHTTPTool(Tool):
                     }
                     
                     if self.config.return_raw_json:
-                        # Return full JSON to AI
+                        # Return full JSON to AI. The pipeline hands the model
+                        # only ``message``, so the JSON itself has to be there.
                         result["data"] = data
-                        result["message"] = f"Retrieved data successfully."
+                        result["message"] = json.dumps(data, ensure_ascii=False)
                     else:
                         # Extract output variables
                         extracted = self._extract_output_variables(data)

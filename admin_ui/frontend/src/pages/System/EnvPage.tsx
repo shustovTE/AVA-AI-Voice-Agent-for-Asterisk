@@ -624,9 +624,12 @@ const EnvPage = () => {
         // Local AI Server - Sherpa offline/VAD
         'SHERPA_MODEL_TYPE', 'SHERPA_VAD_MODEL_PATH', 'SHERPA_VAD_THRESHOLD',
         'SHERPA_VAD_MIN_SILENCE_MS', 'SHERPA_VAD_MIN_SPEECH_MS', 'SHERPA_OFFLINE_PREROLL_MS',
-        'SHERPA_OFFLINE_DEBUG_SEGMENTS',
+        'SHERPA_OFFLINE_POSTROLL_MS', 'SHERPA_OFFLINE_NORMALIZE_DBFS', 'SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB',
+        'LOCAL_STT_RESAMPLER', 'SHERPA_OFFLINE_DEBUG_SEGMENTS',
         // Local AI Server - Tone STT
         'TONE_MODEL_PATH', 'TONE_DECODER_TYPE', 'TONE_KENLM_PATH', 'INCLUDE_TONE',
+        'ONNX_ASR_MODEL', 'ONNX_ASR_MODEL_PATH', 'ONNX_ASR_CACHE_DIR', 'ONNX_ASR_QUANTIZATION', 'ONNX_ASR_DEVICE', 'INCLUDE_ONNX_ASR',
+        'ONNX_ASR_DECODER_DEVICE', 'ONNX_ASR_PREPROCESSOR', 'ONNX_ASR_CUDNN_ALGO_SEARCH', 'ONNX_ASR_WARMUP',
         // Local AI Server - Silero TTS
         'INCLUDE_SILERO', 'SILERO_SPEAKER', 'SILERO_LANGUAGE', 'SILERO_MODEL_ID',
         'SILERO_SAMPLE_RATE', 'SILERO_MODEL_PATH'
@@ -649,6 +652,71 @@ const EnvPage = () => {
     const logFilePathTooltip = logFilePath.startsWith(defaultContainerMediaPrefix) || !logFilePath
         ? `This is a path inside the ai_engine container. With the default docker-compose mount (./asterisk_media → /mnt/asterisk_media), the host file is ${hostLogPathHint}. You can confirm mounts in Admin → Docker Services.`
         : 'This is a path inside the ai_engine container. To find the host file location, confirm the ai_engine mounts in Admin → Docker Services.';
+
+    // The phrase segmenter shared by the VAD-gated offline recognizers (Sherpa offline, onnx-asr):
+    // the Silero VAD gate, the audio kept around a phrase, its loudness and the 8 kHz ingress.
+    const renderOfflineSegmenterFields = (prefix: string) => (
+        <>
+            <FormInput
+                label={`${prefix} VAD Model Path`}
+                value={env['SHERPA_VAD_MODEL_PATH'] || '/app/models/vad/silero_vad.onnx'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MODEL_PATH', e.target.value)}
+                tooltip="Path to the Silero VAD ONNX model that cuts the caller's audio into phrases before offline decoding. Downloaded automatically when missing."
+            />
+            <FormInput
+                label={`${prefix} VAD Threshold`}
+                value={env['SHERPA_VAD_THRESHOLD'] || '0.35'}
+                onChange={(e) => updateEnv('SHERPA_VAD_THRESHOLD', e.target.value)}
+                tooltip="Speech probability at which the phrase VAD opens (0-1). Lower values hear softer speech and quiet consonants earlier but can admit more noise; 0.25-0.35 suits telephone audio."
+            />
+            <FormInput
+                label={`${prefix} VAD Min Silence (ms)`}
+                value={env['SHERPA_VAD_MIN_SILENCE_MS'] || '700'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MIN_SILENCE_MS', e.target.value)}
+                tooltip="Silence that closes a phrase. Higher values keep a phrase with a pause in one piece; the recognizer's result arrives this long after the caller stops, so keep the pipeline's end_of_turn_vad_final_wait_ms above it."
+            />
+            <FormInput
+                label={`${prefix} VAD Min Speech (ms)`}
+                value={env['SHERPA_VAD_MIN_SPEECH_MS'] || '200'}
+                onChange={(e) => updateEnv('SHERPA_VAD_MIN_SPEECH_MS', e.target.value)}
+                tooltip="Voiced duration before the VAD accepts a phrase; a shorter reply is dropped. 120-200 ms for one-word replies (yes, no, numbers)."
+            />
+            <FormInput
+                label={`${prefix} Pre-roll (ms)`}
+                value={env['SHERPA_OFFLINE_PREROLL_MS'] || '350'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_PREROLL_MS', e.target.value)}
+                tooltip="Audio taken from the stream before the VAD's start of a phrase, so the first consonant the VAD missed is decoded. 0 turns it off."
+            />
+            <FormInput
+                label={`${prefix} Post-roll (ms)`}
+                value={env['SHERPA_OFFLINE_POSTROLL_MS'] || '300'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_POSTROLL_MS', e.target.value)}
+                tooltip="Audio taken from the stream after the VAD's end of a phrase (the VAD cuts where the closing silence began), so the last consonant is decoded. At most the min-silence window is available; 0 turns it off."
+            />
+            <FormInput
+                label={`${prefix} Loudness Target (dBFS)`}
+                value={env['SHERPA_OFFLINE_NORMALIZE_DBFS'] || '-20'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_NORMALIZE_DBFS', e.target.value)}
+                tooltip="Each phrase is brought to this RMS level (measured on the speech part) before decoding, since telephone audio often reaches the recognizer at -35...-45 dBFS. -20 is a common ASR level; 0 turns the normalization off."
+            />
+            <FormInput
+                label={`${prefix} Max Gain (dB)`}
+                value={env['SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB'] || '24'}
+                onChange={(e) => updateEnv('SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB', e.target.value)}
+                tooltip="Largest boost the loudness normalization may apply, so faint noise is not amplified without limit. Peaks are always kept below full scale."
+            />
+            <FormSelect
+                label="Local STT 8 kHz Upsampler"
+                value={env['LOCAL_STT_RESAMPLER'] || 'fir'}
+                onChange={(e) => updateEnv('LOCAL_STT_RESAMPLER', e.target.value)}
+                options={[
+                    { value: 'fir', label: 'FIR (polyphase windowed-sinc, alias-safe)' },
+                    { value: 'ratecv', label: 'ratecv (legacy linear interpolation)' },
+                ]}
+                tooltip="How the server brings 8 kHz client audio to the recognizer's 16 kHz. The engine already sends 16 kHz (see the local provider's STT Input Upsampler), so this applies to clients that still send 8 kHz. Linear interpolation mirrors the top of the telephone band above 4 kHz; the FIR does not."
+            />
+        </>
+    );
 
     return (
         <div className="space-y-6">
@@ -1399,6 +1467,7 @@ const EnvPage = () => {
                                 { value: 'kroko', label: 'Kroko (Cloud/Embedded)' },
                                 { value: 'sherpa', label: 'Sherpa-ONNX (Local)' },
                                 { value: 'tone', label: `T-one${localCaps && !localCaps.stt?.tone?.available ? ' (requires rebuild)' : ''}` },
+                                { value: 'onnx_asr', label: `GigaAM v3 / NeMo (onnx-asr)${localCaps && !localCaps.stt?.onnx_asr?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'faster_whisper', label: `Faster Whisper${localCaps && !localCaps.stt?.faster_whisper?.available ? ' (requires rebuild)' : ''}` },
                                 { value: 'whisper_cpp', label: `Whisper.cpp (GGML)${localCaps && !localCaps.stt?.whisper_cpp?.available ? ' (requires rebuild)' : ''}` },
                             ]}
@@ -1569,40 +1638,95 @@ const EnvPage = () => {
                                         ? 'Path to a non-streaming Sherpa transducer model directory such as sherpa-onnx-zipformer-en-2023-06-26.'
                                         : 'Path to a streaming Sherpa model directory.'}
                                 />
-                                {(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline' && (
-                                    <>
-                                        <FormInput
-                                            label="Sherpa VAD Model Path"
-                                            value={env['SHERPA_VAD_MODEL_PATH'] || '/app/models/vad/silero_vad.onnx'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MODEL_PATH', e.target.value)}
-                                            tooltip="Path to the Silero VAD ONNX model used to segment speech before offline decoding."
-                                        />
-                                        <FormInput
-                                            label="Sherpa VAD Threshold"
-                                            value={env['SHERPA_VAD_THRESHOLD'] || '0.35'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_THRESHOLD', e.target.value)}
-                                            tooltip="Speech sensitivity for Sherpa offline Silero VAD. Lower values hear softer speech earlier but can admit more noise."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Min Silence (ms)"
-                                            value={env['SHERPA_VAD_MIN_SILENCE_MS'] || '700'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SILENCE_MS', e.target.value)}
-                                            tooltip="Silence required before Sherpa offline closes a segment. Higher values reduce short-phrase fragmentation."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Min Speech (ms)"
-                                            value={env['SHERPA_VAD_MIN_SPEECH_MS'] || '200'}
-                                            onChange={(e) => updateEnv('SHERPA_VAD_MIN_SPEECH_MS', e.target.value)}
-                                            tooltip="Minimum voiced duration before Sherpa offline accepts a speech segment."
-                                        />
-                                        <FormInput
-                                            label="Sherpa Offline Preroll (ms)"
-                                            value={env['SHERPA_OFFLINE_PREROLL_MS'] || '350'}
-                                            onChange={(e) => updateEnv('SHERPA_OFFLINE_PREROLL_MS', e.target.value)}
-                                            tooltip="Audio padding retained before VAD start so Sherpa offline does not clip the beginning of utterances."
-                                        />
-                                    </>
-                                )}
+                                {(env['SHERPA_MODEL_TYPE'] || 'online') === 'offline' && renderOfflineSegmenterFields('Sherpa')}
+                            </>
+                        )}
+
+                        {sttBackend === 'onnx_asr' && (
+                            <>
+                                <FormSelect
+                                    label="onnx-asr Model"
+                                    value={env['ONNX_ASR_MODEL'] || 'gigaam-v3-e2e-ctc'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_MODEL', e.target.value)}
+                                    options={[
+                                        { value: 'gigaam-v3-e2e-ctc', label: 'GigaAM v3 E2E CTC (ru, punctuation)' },
+                                        { value: 'gigaam-v3-e2e-rnnt', label: 'GigaAM v3 E2E RNNT (ru, punctuation)' },
+                                        { value: 'gigaam-v3-ctc', label: 'GigaAM v3 CTC (ru, lowercase)' },
+                                        { value: 'gigaam-v3-rnnt', label: 'GigaAM v3 RNNT (ru, lowercase)' },
+                                        { value: 'nemo-fastconformer-ru-ctc', label: 'NeMo FastConformer RU (CTC)' },
+                                        { value: 'nemo-fastconformer-ru-rnnt', label: 'NeMo FastConformer RU (RNNT)' },
+                                    ]}
+                                    tooltip="Offline Russian ASR run by the Local AI Server through ONNX Runtime; the model is downloaded from Hugging Face on first start. The e2e variants add punctuation and number normalization. Phrases are cut by the Silero VAD gate (SHERPA_VAD_* settings) and recognized once the caller pauses."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Device"
+                                    value={env['ONNX_ASR_DEVICE'] || 'auto'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_DEVICE', e.target.value)}
+                                    options={[
+                                        { value: 'auto', label: 'Auto (CUDA when available)' },
+                                        { value: 'cuda', label: 'CUDA (GPU image)' },
+                                        { value: 'cpu', label: 'CPU' },
+                                    ]}
+                                    tooltip="CUDA needs the GPU image (docker-compose.gpu.yml) so onnxruntime-gpu is installed; on the CPU a 5-second phrase takes about a second."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Quantization"
+                                    value={env['ONNX_ASR_QUANTIZATION'] || ''}
+                                    onChange={(e) => updateEnv('ONNX_ASR_QUANTIZATION', e.target.value)}
+                                    options={[
+                                        { value: '', label: 'fp32 (default)' },
+                                        { value: 'int8', label: 'int8 (smaller, faster on CPU)' },
+                                    ]}
+                                    tooltip="int8 weights are about a quarter of the size and faster on a CPU; on a GPU keep fp32."
+                                />
+                                <FormInput
+                                    label="onnx-asr Model Directory (optional)"
+                                    value={env['ONNX_ASR_MODEL_PATH'] || ''}
+                                    onChange={(e) => updateEnv('ONNX_ASR_MODEL_PATH', e.target.value)}
+                                    tooltip="Directory that already holds the model files (config.json, the .onnx and the vocabulary). Leave empty to download into ONNX_ASR_CACHE_DIR (/app/models/stt/onnx-asr) on first start."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Transducer Decoder"
+                                    value={env['ONNX_ASR_DECODER_DEVICE'] || 'cpu'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_DECODER_DEVICE', e.target.value)}
+                                    options={[
+                                        { value: 'cpu', label: 'CPU (default)' },
+                                        { value: 'model', label: 'Same device as the model' },
+                                    ]}
+                                    tooltip="RNNT models only. The decoder and joiner run once per 40 ms of audio on tiny tensors: a fraction of a millisecond per step on the CPU, a kernel launch plus two copies on CUDA, so on a GPU the CPU is faster. The encoder stays on the model's device. CTC models have no such loop."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Mel Preprocessor"
+                                    value={env['ONNX_ASR_PREPROCESSOR'] || 'cpu'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_PREPROCESSOR', e.target.value)}
+                                    options={[
+                                        { value: 'cpu', label: 'NumPy on the CPU (default)' },
+                                        { value: 'model', label: 'ONNX session on the model device' },
+                                    ]}
+                                    tooltip="The log-mel spectrogram of a few seconds of audio costs a few milliseconds in NumPy; as a CUDA session it is a new input shape for every utterance length plus copies to and from the card."
+                                />
+                                <FormSelect
+                                    label="onnx-asr cuDNN Algorithm Search"
+                                    value={env['ONNX_ASR_CUDNN_ALGO_SEARCH'] || 'HEURISTIC'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_CUDNN_ALGO_SEARCH', e.target.value)}
+                                    options={[
+                                        { value: 'HEURISTIC', label: 'HEURISTIC (default)' },
+                                        { value: 'DEFAULT', label: "DEFAULT (cuDNN's own choice)" },
+                                        { value: 'EXHAUSTIVE', label: 'EXHAUSTIVE (benchmark per new length)' },
+                                    ]}
+                                    tooltip="CUDA only. onnxruntime's own default, EXHAUSTIVE, benchmarks every convolution algorithm again for every new input length, and utterance lengths are all different: that is the slow first utterance and the spikes on new lengths."
+                                />
+                                <FormSelect
+                                    label="onnx-asr Warm-up"
+                                    value={env['ONNX_ASR_WARMUP'] || 'true'}
+                                    onChange={(e) => updateEnv('ONNX_ASR_WARMUP', e.target.value)}
+                                    options={[
+                                        { value: 'true', label: 'On (default)' },
+                                        { value: 'false', label: 'Off' },
+                                    ]}
+                                    tooltip="Decode 1, 3, 8 and 20 s of silence right after the model loads, so the first real utterance pays nothing for lazy initialization and the memory arena is already grown to the longest utterance."
+                                />
+                                {renderOfflineSegmenterFields('onnx-asr')}
                             </>
                         )}
 

@@ -33,6 +33,9 @@ HangupCallback = Callable[[str], Awaitable[None]]
 PauseCallback = Callable[[str], Awaitable[bool]]
 
 _DEFAULT_CHECK_IN_MESSAGE = "Are you still there?"
+# How soon the maximum-duration hangup is retried while a transfer or hold
+# keeps the engine from ending the call.
+_HARD_LIMIT_RETRY_SEC = 5.0
 _DEFAULT_FINAL_MESSAGE = "I still can't hear you, so I'll end the call now. Goodbye."
 
 
@@ -94,6 +97,16 @@ class NoInputPolicy:
     max_check_ins: int = 1
     check_in_message: str = _DEFAULT_CHECK_IN_MESSAGE
     final_message: str = _DEFAULT_FINAL_MESSAGE
+    # Hang up once nothing has been exchanged for this long: no caller words
+    # reached the model and the agent did not finish an utterance. Unlike the
+    # check-ins it ignores the caller-speech detectors, so hold music, noise or
+    # an IVR cannot keep the call open, and it applies to inbound and outbound
+    # calls alike. 0 disables it.
+    stall_timeout_sec: float = 0.0
+    # Hang up when the call has lasted this long, whatever it is doing: a hard
+    # cap counted from the call's start, paused by nothing (a transfer in
+    # progress only delays it). Inbound and outbound alike. 0 disables it.
+    max_call_duration_sec: float = 0.0
 
     @classmethod
     def from_mapping(cls, value: Optional[Mapping[str, Any]]) -> "NoInputPolicy":
@@ -108,13 +121,23 @@ class NoInputPolicy:
             max_check_ins=_coerce_int(raw.get("max_check_ins", 1), 1, 0, 10),
             check_in_message=_coerce_message(raw.get("check_in_message"), _DEFAULT_CHECK_IN_MESSAGE),
             final_message=_coerce_message(raw.get("final_message"), _DEFAULT_FINAL_MESSAGE),
+            stall_timeout_sec=_coerce_float(raw.get("stall_timeout_sec", 0.0), 0.0, 0.0, 7200.0),
+            max_call_duration_sec=_coerce_float(raw.get("max_call_duration_sec", 0.0), 0.0, 0.0, 86400.0),
         )
 
     def applies_to(self, *, is_outbound: bool) -> bool:
-        """Return whether this policy applies to the call direction."""
+        """Return whether the inactivity check-ins apply to the call direction."""
         if not self.enabled:
             return False
         return self.outbound_enabled if is_outbound else self.inbound_enabled
+
+    def stall_applies(self) -> bool:
+        """Return whether the stall timer runs; it ignores the call direction."""
+        return bool(self.enabled and self.stall_timeout_sec > 0)
+
+    def max_duration_applies(self) -> bool:
+        """Return whether the hard duration cap runs; it ignores the call direction."""
+        return bool(self.enabled and self.max_call_duration_sec > 0)
 
 
 @dataclass
@@ -133,10 +156,29 @@ class _CallState:
     terminal: bool = False
     phase: str = "waiting"
     check_ins: int = 0
+    # Caller turns handed to the model, which is what keeps a stalled call
+    # alive through its final message: an utterance of the agent's own, the
+    # final message included, is an exchange for the timer but not a turn.
+    caller_turns: int = 0
     deadline: Optional[float] = None
     output_pause_remaining: Optional[float] = None
     last_activity_at: float = field(default_factory=time.monotonic)
     last_activity_source: str = "call_start"
+    # The last caller sound a detector reported. Sound holds the clock while it
+    # lasts and nothing more: it is not a turn and not an exchange.
+    last_sound_at: Optional[float] = None
+    last_sound_source: Optional[str] = None
+    # Whether the check-in/final-message machinery runs for this call (the
+    # direction gates); the stall timer runs whenever the policy sets it.
+    inactivity_enabled: bool = True
+    # The last exchange: a caller turn handed to the model or an utterance the
+    # agent finished. Caller sound alone never moves it.
+    last_exchange_at: float = field(default_factory=time.monotonic)
+    last_exchange_source: str = "call_start"
+    # When the call started (monotonic; registration minus the time already
+    # elapsed) and when the hard duration cap ends it, None when it is off.
+    started_at: float = field(default_factory=time.monotonic)
+    max_duration_deadline: Optional[float] = None
 
 
 class NoInputWatchdog:
@@ -177,6 +219,15 @@ class NoInputWatchdog:
             "deadline": state.deadline,
             "last_activity_at": state.last_activity_at,
             "last_activity_source": state.last_activity_source,
+            "last_sound_at": state.last_sound_at,
+            "last_sound_source": state.last_sound_source,
+            "inactivity_enabled": state.inactivity_enabled,
+            "stall_timeout_sec": state.policy.stall_timeout_sec,
+            "last_exchange_at": state.last_exchange_at,
+            "last_exchange_source": state.last_exchange_source,
+            "max_call_duration_sec": state.policy.max_call_duration_sec,
+            "started_at": state.started_at,
+            "max_duration_deadline": state.max_duration_deadline,
         }
 
     async def register(
@@ -185,17 +236,41 @@ class NoInputWatchdog:
         policy: NoInputPolicy,
         *,
         is_outbound: bool,
+        elapsed_sec: float = 0.0,
     ) -> bool:
-        """Replace any prior state and start a watchdog when policy applies."""
+        """Replace any prior state and start a watchdog when policy applies.
+
+        The check-ins follow the direction gates; the stall timer and the
+        hard duration cap run for either direction whenever the policy sets
+        them. Nothing is registered when none applies. ``elapsed_sec`` is how
+        long the call has already lasted, so the cap counts from its start.
+        """
         await self.stop(call_id)
-        if not policy.applies_to(is_outbound=is_outbound):
+        inactivity_enabled = policy.applies_to(is_outbound=is_outbound)
+        stall_enabled = policy.stall_applies()
+        max_duration_enabled = policy.max_duration_applies()
+        if not inactivity_enabled and not stall_enabled and not max_duration_enabled:
             logger.info(
                 "Caller inactivity watchdog disabled for call",
                 call_id=call_id,
                 is_outbound=is_outbound,
             )
             return False
-        state = _CallState(call_id=call_id, policy=policy, is_outbound=is_outbound)
+        state = _CallState(
+            call_id=call_id,
+            policy=policy,
+            is_outbound=is_outbound,
+            inactivity_enabled=inactivity_enabled,
+        )
+        try:
+            elapsed = max(0.0, float(elapsed_sec or 0.0))
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        if not math.isfinite(elapsed):
+            elapsed = 0.0
+        state.started_at = self._clock() - elapsed
+        if max_duration_enabled:
+            state.max_duration_deadline = state.started_at + policy.max_call_duration_sec
         self._states[call_id] = state
         state.task = asyncio.create_task(self._run(state), name=f"no-input-{call_id}")
         _NO_INPUT_ACTIVE.inc()
@@ -203,9 +278,13 @@ class NoInputWatchdog:
             "Caller inactivity watchdog registered",
             call_id=call_id,
             is_outbound=is_outbound,
+            check_ins_enabled=inactivity_enabled,
             initial_timeout_sec=policy.initial_timeout_sec,
             grace_timeout_sec=policy.grace_timeout_sec,
             max_check_ins=policy.max_check_ins,
+            stall_timeout_sec=policy.stall_timeout_sec if stall_enabled else None,
+            max_call_duration_sec=policy.max_call_duration_sec if max_duration_enabled else None,
+            elapsed_sec=round(elapsed, 1) if elapsed else None,
         )
         return True
 
@@ -229,9 +308,15 @@ class NoInputWatchdog:
         if not state:
             return
         state.ready = True
+        self._note_exchange(state, "ready")
         if not state.output_active and not state.processing and not state.suspended:
             self._reset_initial_deadline(state)
         self._wake(state)
+
+    def _note_exchange(self, state: _CallState, source: str) -> None:
+        """Restart the stall timer: the conversation moved."""
+        state.last_exchange_at = self._clock()
+        state.last_exchange_source = source
 
     async def note_activity(self, call_id: str, source: str) -> None:
         """Reset inactivity state for authoritative caller activity."""
@@ -256,13 +341,26 @@ class NoInputWatchdog:
             return
         state.processing = bool(active)
         if active:
+            # A caller turn reached the model: an exchange.
+            state.caller_turns += 1
+            self._note_exchange(state, "caller_turn")
             state.deadline = None
         elif state.ready and not state.output_active and not state.suspended:
             self._reset_initial_deadline(state)
         self._wake(state)
 
     async def note_input_state(self, call_id: str, active: bool, source: str) -> None:
-        """Pause timing for sustained caller speech and restart after it ends."""
+        """Pause timing while a detector reports caller sound; resume after it ends.
+
+        Sound is not an answer. A detector (Silero VAD, TALK_DETECT, the
+        engine's energy detector) also reports a tone, hold music, noise and
+        a cough the recognizer returns nothing for, and counting any of it as
+        the caller being back restarted the check-ins: a dead line that beeped
+        every half minute got a fresh "are you still there?" after every beep
+        and never the final message. The check-in count and the activity clock
+        move only on a caller turn (``note_activity``); sound holds the clock
+        while it lasts, and the window starts over when it ends.
+        """
         state = self._states.get(call_id)
         if not state or state.terminal:
             return
@@ -274,12 +372,10 @@ class NoInputWatchdog:
             return
         state.input_active = bool(active)
         if active:
-            state.last_activity_at = self._clock()
-            state.last_activity_source = source
-            state.check_ins = 0
-            state.phase = "waiting"
+            state.last_sound_at = self._clock()
+            state.last_sound_source = source
             state.deadline = None
-            _NO_INPUT_EVENTS.labels("caller_activity").inc()
+            _NO_INPUT_EVENTS.labels("caller_sound").inc()
         elif state.ready and not state.output_active and not state.processing and not state.suspended:
             self._reset_initial_deadline(state)
         self._wake(state)
@@ -313,6 +409,13 @@ class NoInputWatchdog:
             return
         state.output_active = False
         state.processing = False
+        if reset_timer and not state.self_announcement:
+            # The agent finished an utterance (a reply or the greeting): an
+            # exchange. A hosted agent's reply to its own silence pseudo-turn
+            # (reset_timer=False) is not one, and neither are the watchdog's
+            # own check-ins and final message: a line that never answers must
+            # not keep itself open with them.
+            self._note_exchange(state, "agent_output")
         if preserve_policy_state:
             state.output_pause_remaining = None
             self._wake(state)
@@ -358,13 +461,36 @@ class NoInputWatchdog:
     def _can_count(self, state: _CallState) -> bool:
         """Return whether idle time may currently advance."""
         return bool(
-            state.ready
+            state.inactivity_enabled
+            and state.ready
             and not state.input_active
             and not state.output_active
             and not state.processing
             and not state.suspended
             and not state.terminal
         )
+
+    def _stall_can_count(self, state: _CallState) -> bool:
+        """Return whether the stall timer may currently advance.
+
+        Caller sound (``input_active``) is deliberately not a reason to pause:
+        hold music and noise are what this timer is for. Agent output pauses it
+        so a long utterance is never cut; a caller turn being processed does
+        not, since accepting the turn already restarted it and a reply that
+        never comes is a stall too. Nor does it wait for ``ready``: it counts
+        from registration, so a call whose setup never completes (a greeting
+        that never finishes) is a stall as well, and the greeting playing
+        pauses it like any agent output.
+        """
+        return bool(
+            state.policy.stall_timeout_sec > 0
+            and not state.output_active
+            and not state.suspended
+            and not state.terminal
+        )
+
+    def _stall_deadline(self, state: _CallState) -> float:
+        return state.last_exchange_at + state.policy.stall_timeout_sec
 
     async def _wait_for_change(self, state: _CallState, timeout: Optional[float] = None) -> bool:
         """Wait for a state change and report whether one beat the timeout."""
@@ -379,20 +505,57 @@ class NoInputWatchdog:
             return False
 
     async def _run(self, state: _CallState) -> None:
-        """Drive check-in and terminal transitions for one call."""
+        """Drive check-in, stall and terminal transitions for one call."""
         try:
             while self._states.get(state.call_id) is state and not state.terminal:
-                if not self._can_count(state):
+                inactivity_counting = self._can_count(state)
+                stall_counting = self._stall_can_count(state)
+                # The hard cap counts whatever the call is doing.
+                hard_deadline = state.max_duration_deadline
+                if not inactivity_counting and not stall_counting and hard_deadline is None:
                     await self._wait_for_change(state)
                     continue
 
-                if state.deadline is None:
+                if inactivity_counting and state.deadline is None:
                     self._reset_initial_deadline(state)
-                changed = await self._wait_for_change(
-                    state,
-                    max(0.0, float(state.deadline or self._clock()) - self._clock()),
-                )
-                if changed or not self._can_count(state):
+                # Wait for whichever deadline comes first.
+                candidates = []
+                if inactivity_counting:
+                    candidates.append(("inactivity", float(state.deadline or self._clock())))
+                if stall_counting:
+                    candidates.append(("stall", self._stall_deadline(state)))
+                if hard_deadline is not None:
+                    candidates.append(("max_duration", float(hard_deadline)))
+                kind, deadline = min(candidates, key=lambda item: item[1])
+                changed = await self._wait_for_change(state, max(0.0, deadline - self._clock()))
+                if changed:
+                    continue
+
+                if kind == "max_duration":
+                    if state.max_duration_deadline is None or state.max_duration_deadline > self._clock():
+                        continue
+                    if self._should_pause and await self._should_pause(state.call_id):
+                        # A transfer or hold in progress: the engine would refuse
+                        # the hangup now. Try again shortly rather than give up.
+                        state.max_duration_deadline = self._clock() + _HARD_LIMIT_RETRY_SEC
+                        _NO_INPUT_EVENTS.labels("policy_paused").inc()
+                        continue
+                    await self._finish_for_max_duration(state)
+                    continue
+
+                if kind == "stall":
+                    if not self._stall_can_count(state) or self._stall_deadline(state) > self._clock():
+                        continue
+                    if self._should_pause and await self._should_pause(state.call_id):
+                        # On hold or in a transfer: the conversation is not
+                        # expected to move. Count again from here.
+                        self._note_exchange(state, "policy_paused")
+                        _NO_INPUT_EVENTS.labels("policy_paused").inc()
+                        continue
+                    await self._finish_for_stall(state)
+                    continue
+
+                if not self._can_count(state):
                     continue
 
                 # Transfer/MOH state can be changed by a tool through SessionStore
@@ -465,6 +628,104 @@ class NoInputWatchdog:
         state.output_active = False
         state.phase = "grace"
         state.deadline = self._clock() + state.policy.grace_timeout_sec
+
+    async def _finish_for_max_duration(self, state: _CallState) -> None:
+        """Hang up a call that has lasted its maximum duration."""
+        state.terminal = True
+        state.phase = "max_duration_hangup"
+        state.deadline = None
+        _NO_INPUT_EVENTS.labels("max_duration_hangup").inc()
+        logger.info(
+            "Call reached its maximum duration; hanging up",
+            call_id=state.call_id,
+            max_call_duration_sec=state.policy.max_call_duration_sec,
+            duration_sec=round(self._clock() - state.started_at, 1),
+            agent_speaking=state.output_active,
+            caller_sound_active=state.input_active,
+        )
+        try:
+            await self._hangup(state.call_id)
+        except Exception:
+            logger.error(
+                "Maximum duration hangup callback failed",
+                call_id=state.call_id,
+                exc_info=True,
+            )
+            _NO_INPUT_EVENTS.labels("watchdog_error").inc()
+
+    async def _finish_for_stall(self, state: _CallState) -> None:
+        """Speak the final message, then hang up a call in which nothing has been exchanged for the stall timeout.
+
+        Only a caller turn that reaches the model while the final message
+        plays keeps the call alive. The message's own end reaches the timer
+        as an agent utterance (the engine reports every agent output), so the
+        exchange clock cannot be the test: it moved with the message, and the
+        hangup was skipped, each stall timeout again until the duration cap.
+        """
+        exchange_before = state.last_exchange_at
+        source_before = state.last_exchange_source
+        turns_before = state.caller_turns
+        if state.policy.final_message:
+            state.phase = "stall_announcement"
+            state.deadline = None
+            state.self_announcement = True
+            logger.info(
+                "Conversation stalled; speaking the final message",
+                call_id=state.call_id,
+                stall_timeout_sec=state.policy.stall_timeout_sec,
+                since_exchange_sec=round(self._clock() - state.last_exchange_at, 1),
+                last_exchange_source=state.last_exchange_source,
+                caller_sound_active=state.input_active,
+            )
+            try:
+                spoken = await self._announce(
+                    state.call_id,
+                    state.policy.final_message,
+                    "final",
+                )
+                if not spoken:
+                    _NO_INPUT_EVENTS.labels("announcement_failed").inc()
+            except Exception:
+                logger.error(
+                    "Conversation stall final announcement failed",
+                    call_id=state.call_id,
+                    exc_info=True,
+                )
+                _NO_INPUT_EVENTS.labels("announcement_failed").inc()
+            finally:
+                state.self_announcement = False
+
+            # A caller turn handed to the model during the announcement: the
+            # conversation moved after all, so the call goes on.
+            if state.caller_turns > turns_before:
+                state.phase = "waiting"
+                state.output_active = False
+                self._reset_initial_deadline(state)
+                _NO_INPUT_EVENTS.labels("caller_resumed").inc()
+                return
+
+        state.terminal = True
+        state.phase = "stall_hangup"
+        state.deadline = None
+        _NO_INPUT_EVENTS.labels("stall_hangup").inc()
+        logger.info(
+            "Conversation stalled; hanging up",
+            call_id=state.call_id,
+            stall_timeout_sec=state.policy.stall_timeout_sec,
+            since_exchange_sec=round(self._clock() - exchange_before, 1),
+            last_exchange_source=source_before,
+            caller_sound_active=state.input_active,
+            last_activity_source=state.last_activity_source,
+        )
+        try:
+            await self._hangup(state.call_id)
+        except Exception:
+            logger.error(
+                "Conversation stall hangup callback failed",
+                call_id=state.call_id,
+                exc_info=True,
+            )
+            _NO_INPUT_EVENTS.labels("watchdog_error").inc()
 
     async def _finish_for_no_input(self, state: _CallState) -> None:
         """Speak the terminal warning and attempt the engine-owned hangup."""

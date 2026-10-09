@@ -311,11 +311,24 @@ class ARIClient:
         logger.info("Disconnected from ARI.")
 
     def add_event_handler(self, event_type: str, handler: Callable):
-        """Register a handler for a specific ARI event type."""
-        if event_type not in self.event_handlers:
-            self.event_handlers[event_type] = []
-        self.event_handlers[event_type].append(handler)
-        logger.debug("Added event handler", event_type=event_type, handler=handler.__name__)
+        """Register a handler for a specific ARI event type.
+
+        Registration is idempotent. Engine.start() runs again on a reconnect or a
+        second bootstrap path, and a stacked handler makes every ARI event fire
+        its side effects twice — for PlaybackFinished that meant the second pass
+        found the playback already popped and warned about an unknown id.
+        """
+        handlers = self.event_handlers.setdefault(event_type, [])
+        name = getattr(handler, "__name__", repr(handler))
+        if handler in handlers:
+            logger.debug(
+                "Event handler already registered; skipping duplicate",
+                event_type=event_type,
+                handler=name,
+            )
+            return
+        handlers.append(handler)
+        logger.debug("Added event handler", event_type=event_type, handler=name)
 
     async def handle_audio_frame(self, event_data: dict, audio_handler: Callable):
         """Handle audio frames from snoop channels."""

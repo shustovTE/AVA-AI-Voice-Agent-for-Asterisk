@@ -19,6 +19,9 @@ tenacity==8.2.3
 # WebRTC VAD for robust speech detection
 webrtcvad==2.0.10
 
+# Silero VAD (vad.silero_enabled): the ONNX runtime for the engine-side neural speech detector
+onnxruntime==1.30.0
+
 # Email tools dependencies
 resend>=2.32.2
 jinja2==3.1.6

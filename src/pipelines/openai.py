@@ -24,6 +24,7 @@ import aiohttp
 import websockets
 
 from ..audio import (
+    StreamingResampler,
     convert_pcm16le_to_target_format,
     resample_audio,
     resolve_output_resampler_policy,
@@ -31,6 +32,8 @@ from ..audio import (
 from ..config import AppConfig, OpenAIProviderConfig
 from ..logging_config import get_logger
 from .base import LLMComponent, STTComponent, TTSComponent, LLMResponse
+from ..utils.http_trace import HttpTrace, build_trace_config
+from ..utils.proxy_url import split_proxy_credentials
 from ..tools.registry import tool_registry
 
 logger = get_logger(__name__)
@@ -84,6 +87,77 @@ def _make_ws_headers(options: Dict[str, Any]) -> Iterable[tuple[str, str]]:
     if options.get("project"):
         headers.append(("OpenAI-Project", options["project"]))
     return headers
+
+
+# Request-body fields the engine sets itself; an extra_body entry for one of
+# these would silently break streaming, tool calls or the conversation history.
+_ENGINE_OWNED_PAYLOAD_KEYS = frozenset(
+    {"model", "messages", "stream", "tools", "tool_choice"}
+)
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """Return *value* when it is a mapping, else an empty dict."""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+# Speech-request fields the engine sets itself; a `tts_extra_body` entry for
+# one of these would break the response handling or the streaming contract.
+_TTS_ENGINE_OWNED_PAYLOAD_KEYS = frozenset({"model", "input", "voice", "response_format", "stream"})
+
+# A streamed WAV body whose header has not shown its data chunk after this many
+# bytes is not a WAV body.
+_WAV_HEADER_SCAN_LIMIT = 64 * 1024
+
+
+def _is_openai_host(url: str) -> bool:
+    """True for OpenAI's own endpoints, where the model and voice enums are known."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "openai.com" or host.endswith(".openai.com")
+
+
+def _parse_wav_header(buffer: bytes) -> Optional[tuple[int, int]]:
+    """Return ``(sample_rate, data_offset)`` once a mono PCM16 WAV header is complete.
+
+    ``None`` means more bytes are needed. A streamed WAV carries a header with
+    a placeholder data size, so only the format chunk and the position of the
+    data chunk matter; the samples run until the body ends.
+    """
+    if len(buffer) < 12:
+        return None
+    if buffer[:4] != b"RIFF" or buffer[8:12] != b"WAVE":
+        raise RuntimeError(
+            "Expected a RIFF/WAVE body from the speech endpoint "
+            f"but received bytes starting with {buffer[:12]!r}"
+        )
+    sample_rate: Optional[int] = None
+    offset = 12
+    while True:
+        if len(buffer) < offset + 8:
+            return None
+        chunk_id = buffer[offset : offset + 4]
+        chunk_size = int.from_bytes(buffer[offset + 4 : offset + 8], "little")
+        if chunk_id == b"data":
+            if sample_rate is None:
+                raise RuntimeError("WAV body has a data chunk before its format chunk")
+            return sample_rate, offset + 8
+        if chunk_id == b"fmt ":
+            if len(buffer) < offset + 8 + 16:
+                return None
+            fmt = buffer[offset + 8 : offset + 24]
+            channels = int.from_bytes(fmt[2:4], "little")
+            sample_rate = int.from_bytes(fmt[4:8], "little")
+            bits = int.from_bytes(fmt[14:16], "little")
+            if channels != 1 or bits != 16:
+                raise RuntimeError(
+                    f"Only mono PCM16 WAV is supported; got channels={channels} bits={bits}"
+                )
+        offset += 8 + chunk_size + (chunk_size & 1)
+        if offset > _WAV_HEADER_SCAN_LIMIT:
+            raise RuntimeError("WAV body shows no data chunk within its first 64 KiB")
 
 
 def _make_http_headers(options: Dict[str, Any]) -> Dict[str, str]:
@@ -405,6 +479,92 @@ class OpenAILLMAdapter(LLMComponent):
         self._session: Optional[aiohttp.ClientSession] = None
         self._default_timeout = float(self._pipeline_defaults.get("response_timeout_sec", provider_config.response_timeout_sec))
         self._pending_tool_calls_by_call: dict = {}
+        # Transport settings describe the connection, not one request, so they
+        # are resolved once here, as the ElevenLabs adapter does. A malformed
+        # proxy fails now rather than leaking traffic onto the direct route.
+        self._proxy_url, self._proxy_headers = split_proxy_credentials(
+            self._transport_setting("proxy")
+        )
+        self._keepalive_timeout_sec = self._resolve_keepalive_timeout()
+        self.warm_up_enabled = self._resolve_warm_up()
+        self._trace_enabled = False
+
+    # After ``data: [DONE]`` the body has at most a chunk terminator left; a
+    # server that never ends it must not stall the turn.
+    STREAM_DRAIN_TIMEOUT_SEC = 1.0
+
+    def _transport_setting(self, key: str) -> Any:
+        """Read one transport setting: the pipeline's options.llm override the provider block."""
+        if key in self._pipeline_defaults:
+            return self._pipeline_defaults[key]
+        return getattr(self._provider_defaults, key, None)
+
+    def _resolve_keepalive_timeout(self) -> Optional[float]:
+        raw = self._transport_setting("keepalive_timeout_sec")
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring unparsable LLM keepalive_timeout_sec",
+                component=self.component_key,
+                value=repr(raw),
+            )
+            return None
+        return value if value > 0 else None
+
+    def _resolve_warm_up(self) -> bool:
+        raw = self._transport_setting("warm_up")
+        if isinstance(raw, bool):
+            return raw
+        if raw is None or raw == "":
+            return False
+        text = str(raw).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        logger.warning(
+            "Ignoring unparsable LLM warm_up",
+            component=self.component_key,
+            value=repr(raw),
+        )
+        return False
+
+    def _request_kwargs(self, timeout: Any, trace: HttpTrace) -> Dict[str, Any]:
+        """Per-request transport arguments: the proxy when set, tracing when ours."""
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if self._proxy_url:
+            kwargs["proxy"] = self._proxy_url
+            if self._proxy_headers:
+                kwargs["proxy_headers"] = self._proxy_headers
+        if self._trace_enabled:
+            kwargs["trace_request_ctx"] = trace
+        return kwargs
+
+    def _trace_fields(self, trace: Optional[HttpTrace]) -> Dict[str, Any]:
+        if trace is None or not self._trace_enabled:
+            return {}
+        return trace.as_log_fields()
+
+    async def _drain_stream(self, call_id: str, response: Any) -> None:
+        """Read the body to its end after ``[DONE]`` so the connection can be pooled.
+
+        aiohttp closes a connection whose body was left unread, and the chunk
+        terminator can land a packet after the ``[DONE]`` line, so breaking out
+        at once could cost the next turn a fresh TLS handshake.
+        """
+        reader = getattr(getattr(response, "content", None), "read", None)
+        if not callable(reader):
+            return
+        try:
+            await asyncio.wait_for(reader(), timeout=self.STREAM_DRAIN_TIMEOUT_SEC)
+        except Exception:
+            logger.debug(
+                "OpenAI stream not drained after [DONE]; the connection will be closed",
+                call_id=call_id,
+            )
 
     async def start(self) -> None:
         logger.debug(
@@ -502,8 +662,14 @@ class OpenAILLMAdapter(LLMComponent):
         retries = 1
         tools_stripped = False
         for attempt in range(retries + 1):
+            trace = HttpTrace()
             try:
-                async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    **self._request_kwargs(merged["timeout_sec"], trace),
+                ) as response:
                     body = await response.text()
                     if response.status >= 400:
                         logger.error(
@@ -543,12 +709,16 @@ class OpenAILLMAdapter(LLMComponent):
                     message = choices[0].get("message") or {}
                     content = message.get("content", "")
                     tool_calls = message.get("tool_calls") or []
+                    finish_reason = choices[0].get("finish_reason")
+                    self._note_finish_reason(call_id, finish_reason, payload, len(content or ""))
                     
                     # Log response
                     log_ctx = {
                         "call_id": call_id,
                         "model": payload.get("model"),
                         "preview": (content or "")[:80],
+                        "finish_reason": finish_reason,
+                        **self._trace_fields(trace),
                     }
                     if tool_calls:
                         log_ctx["tool_calls"] = len(tool_calls)
@@ -682,26 +852,26 @@ class OpenAILLMAdapter(LLMComponent):
         payload["stream"] = True
 
         # Include tools in streaming request so the LLM can return tool calls
-        tools_list = merged.get("tools")
-        tool_schemas = []
-        call_tool_registry = self.tool_registry_or(tool_registry)
-        if tools_list and isinstance(tools_list, list):
-            for tool_name in tools_list:
-                tool = call_tool_registry.get(tool_name)
-                if tool:
-                    tool_schemas.append(tool.definition.to_openai_schema())
-        if tool_schemas:
-            payload["tools"] = tool_schemas
-            payload["tool_choice"] = "auto"
+        self._attach_tools(payload, merged)
 
         headers = _make_http_headers(merged)
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
 
         # Accumulate tool call deltas across chunks
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
+        finish_reason: Optional[str] = None
+        generated_chars = 0
+        first_token_ms: Optional[float] = None
+        started_at = time.perf_counter()
+        trace = HttpTrace()
 
         try:
-            async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
+            async with self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                **self._request_kwargs(merged["timeout_sec"], trace),
+            ) as response:
                 if response.status >= 400:
                     body = await response.text()
                     logger.error("OpenAI streaming failed", call_id=call_id, status=response.status, body_preview=body[:128])
@@ -713,14 +883,20 @@ class OpenAILLMAdapter(LLMComponent):
                         continue
                     data_str = line_str[6:]
                     if data_str == "[DONE]":
+                        await self._drain_stream(call_id, response)
                         break
                     try:
                         chunk = json.loads(data_str)
                         choices = chunk.get("choices", [])
                         if choices:
+                            if choices[0].get("finish_reason"):
+                                finish_reason = str(choices[0]["finish_reason"])
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
+                                if first_token_ms is None:
+                                    first_token_ms = (time.perf_counter() - started_at) * 1000.0
+                                generated_chars += len(content)
                                 yield content
 
                             # Accumulate tool call deltas
@@ -743,6 +919,18 @@ class OpenAILLMAdapter(LLMComponent):
                                     entry["arguments"] += func["arguments"]
                     except json.JSONDecodeError:
                         continue
+
+            self._note_finish_reason(call_id, finish_reason, payload, generated_chars)
+            logger.info(
+                "OpenAI streaming completed",
+                call_id=call_id,
+                model=payload.get("model"),
+                finish_reason=finish_reason,
+                chars=generated_chars,
+                first_token_ms=round(first_token_ms, 1) if first_token_ms is not None else None,
+                total_ms=round((time.perf_counter() - started_at) * 1000.0, 1),
+                **self._trace_fields(trace),
+            )
 
             # Parse accumulated tool calls
             if _tool_call_accum:
@@ -775,11 +963,183 @@ class OpenAILLMAdapter(LLMComponent):
         except aiohttp.ClientError as e:
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
 
+    def _attach_tools(self, payload: Dict[str, Any], merged: Dict[str, Any]) -> None:
+        """Add the allowlisted tools' schemas to a Chat Completions payload.
+
+        Shared by the streamed turn and the warm-up so both advertise the same
+        tools: on an endpoint with prefix caching the schemas are part of the
+        cached prompt, and a warm-up without them would warm a different one.
+        """
+        tools_list = merged.get("tools")
+        tool_schemas = []
+        call_tool_registry = self.tool_registry_or(tool_registry)
+        if tools_list and isinstance(tools_list, list):
+            for tool_name in tools_list:
+                tool = call_tool_registry.get(tool_name)
+                if tool:
+                    tool_schemas.append(tool.definition.to_openai_schema())
+        if tool_schemas:
+            payload["tools"] = tool_schemas
+            payload["tool_choice"] = "auto"
+
+    # The warm-up's last message is never spoken or stored; it only has to be
+    # a user turn every endpoint accepts, so the cached prefix ends exactly
+    # where the caller's first words will begin.
+    WARM_UP_USER_MESSAGE = "."
+
+    async def warm_up(
+        self,
+        call_id: str,
+        context: Dict[str, Any],
+        options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Send the call's prompt once, ahead of the caller's first words.
+
+        One ``max_tokens: 1`` Chat Completions request carrying the same
+        system prompt, prior messages (the greeting), tools and vendor fields
+        the first turn will carry, through this adapter's own session. It
+        leaves the connection open in the pool, so the next request logs
+        ``connection=reused`` instead of paying TCP+TLS, and on an endpoint
+        with prefix caching (vLLM, OpenAI, Mistral) it leaves the prompt
+        prefix cached, so the first turn prefills only the caller's words.
+        The reply is discarded. Nothing here raises: a failed warm-up costs
+        the call nothing but a log line.
+        """
+        merged = self._compose_options(options)
+        if not merged["api_key"]:
+            logger.debug("LLM prompt warm-up skipped: no API key", call_id=call_id)
+            return {"status": "skipped", "reason": "no_api_key"}
+        if bool(merged.get("use_realtime")):
+            logger.debug("LLM prompt warm-up skipped: Realtime transport", call_id=call_id)
+            return {"status": "skipped", "reason": "realtime"}
+
+        await self._ensure_session()
+        assert self._session
+        payload = self._build_chat_payload(self.WARM_UP_USER_MESSAGE, context, merged)
+        payload["max_tokens"] = 1
+        self._attach_tools(payload, merged)
+        headers = _make_http_headers(merged)
+        url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
+
+        started_at = time.perf_counter()
+        trace = HttpTrace()
+        try:
+            async with self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                **self._request_kwargs(merged["timeout_sec"], trace),
+            ) as response:
+                body = await response.text()
+                total_ms = round((time.perf_counter() - started_at) * 1000.0, 1)
+                if response.status >= 400:
+                    logger.warning(
+                        "LLM prompt warm-up failed",
+                        call_id=call_id,
+                        model=payload.get("model"),
+                        status=response.status,
+                        body_preview=body[:128],
+                        total_ms=total_ms,
+                        **self._trace_fields(trace),
+                    )
+                    return {"status": "error", "http_status": response.status, "total_ms": total_ms}
+                usage = self._usage_of(body)
+                fields = {
+                    "total_ms": total_ms,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "cached_tokens": usage.get("cached_tokens"),
+                    **self._trace_fields(trace),
+                }
+                logger.info(
+                    "LLM prompt warm-up completed",
+                    call_id=call_id,
+                    model=payload.get("model"),
+                    messages_count=len(payload.get("messages", [])),
+                    tools_count=len(payload.get("tools", [])),
+                    **fields,
+                )
+                return {"status": "ok", **fields}
+        except Exception as exc:
+            logger.warning(
+                "LLM prompt warm-up failed",
+                call_id=call_id,
+                model=payload.get("model"),
+                error=str(exc),
+                total_ms=round((time.perf_counter() - started_at) * 1000.0, 1),
+                **self._trace_fields(trace),
+            )
+            return {"status": "error", "error": str(exc)}
+
+    @staticmethod
+    def _usage_of(body: str) -> Dict[str, Any]:
+        """Prompt token counts from a completion body; ``cached_tokens`` as OpenAI and vLLM report it."""
+        try:
+            usage = json.loads(body).get("usage") or {}
+        except Exception:
+            return {}
+        details = usage.get("prompt_tokens_details") or {}
+        return {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "cached_tokens": details.get("cached_tokens") if isinstance(details, dict) else None,
+        }
+
+    @staticmethod
+    def _note_finish_reason(
+        call_id: str, finish_reason: Optional[str], payload: Dict[str, Any], chars: int
+    ) -> None:
+        """Make a reply the endpoint cut short visible.
+
+        A reply that stops on ``max_tokens`` is spoken to the caller as it
+        is, ending mid-sentence or mid-word, and nothing else in the call
+        distinguishes that from a deliberate short answer. It is the only
+        finish reason worth a warning: a natural stop and a tool call are
+        the normal outcomes.
+        """
+        if finish_reason == "length":
+            logger.warning(
+                "LLM reply cut by max_tokens",
+                call_id=call_id,
+                model=payload.get("model"),
+                max_tokens=payload.get("max_tokens"),
+                chars=chars,
+                hint="raise max_tokens in the pipeline's LLM options or the provider block, or ask the prompt for shorter replies",
+            )
+            return
+        if finish_reason not in (None, "stop", "tool_calls", "function_call"):
+            logger.info(
+                "LLM reply ended early",
+                call_id=call_id,
+                finish_reason=finish_reason,
+                chars=chars,
+            )
+
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
             return
-        factory = self._session_factory or aiohttp.ClientSession
-        self._session = factory()
+        if self._session_factory is not None:
+            self._session = self._session_factory()
+            self._trace_enabled = False
+            return
+        # keepalive_timeout_sec stands on its own: an idle window that outlasts
+        # a caller's turn saves the next request a TCP+TLS handshake whether or
+        # not a proxy is in the path. trust_env stays off, as everywhere in the
+        # engine, so only the configured proxy is ever used.
+        connector = (
+            aiohttp.TCPConnector(keepalive_timeout=self._keepalive_timeout_sec)
+            if self._keepalive_timeout_sec is not None
+            else None
+        )
+        self._session = aiohttp.ClientSession(
+            connector=connector, trace_configs=[build_trace_config()]
+        )
+        self._trace_enabled = True
+        logger.info(
+            "OpenAI-compatible LLM transport ready",
+            component=self.component_key,
+            proxy=self._proxy_url,
+            proxy_authenticated=self._proxy_headers is not None,
+            keepalive_timeout_sec=self._keepalive_timeout_sec,
+        )
 
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         runtime_options = runtime_options or {}
@@ -828,6 +1188,13 @@ class OpenAILLMAdapter(LLMComponent):
                 "api_version",
                 self._pipeline_defaults.get("api_version", getattr(self._provider_defaults, "api_version", "ga")),
             ),
+            # Shallow-merged so a pipeline can add or override a single vendor
+            # field without repeating the provider's whole block.
+            "extra_body": {
+                **_as_dict(getattr(self._provider_defaults, "extra_body", None)),
+                **_as_dict(self._pipeline_defaults.get("extra_body")),
+                **_as_dict(runtime_options.get("extra_body")),
+            },
         }
 
         # If a pipeline swap left provider-specific LLM settings behind (e.g., Groq base_url + llama model),
@@ -877,7 +1244,39 @@ class OpenAILLMAdapter(LLMComponent):
             payload["temperature"] = merged["temperature"]
         if merged.get("max_tokens") is not None:
             payload["max_tokens"] = merged["max_tokens"]
+        self._apply_extra_body(payload, merged)
         return payload
+
+    def _apply_extra_body(self, payload: Dict[str, Any], merged: Dict[str, Any]) -> None:
+        """Forward operator-configured vendor fields into the request body.
+
+        Key names are logged on every request that carries them: what an
+        endpoint receives beyond the engine's own fields should never be
+        invisible to the operator who configured it. Values are not logged —
+        they are operator data and may be long.
+        """
+        extra = _as_dict(merged.get("extra_body"))
+        if not extra:
+            return
+
+        forwarded = []
+        for key, value in extra.items():
+            if key in _ENGINE_OWNED_PAYLOAD_KEYS:
+                logger.warning(
+                    "Ignoring extra_body key owned by the engine",
+                    component=self.component_key,
+                    key=key,
+                )
+                continue
+            payload[key] = value
+            forwarded.append(key)
+
+        if forwarded:
+            logger.info(
+                "Forwarding extra_body fields to the LLM",
+                component=self.component_key,
+                keys=sorted(forwarded),
+            )
 
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:
         messages = context.get("messages")
@@ -967,11 +1366,17 @@ class OpenAITTSAdapter(TTSComponent):
         if not api_key:
             raise RuntimeError("OpenAI TTS requires an API key")
 
+        url = merged["tts_base_url"]
+        # The model and voice enums below are OpenAI's. A self-hosted endpoint
+        # (vLLM-Omni, ...) names its models `org/name` and its voices freely,
+        # so the fallbacks only apply to OpenAI's own hosts.
+        openai_host = _is_openai_host(url)
+
         # OpenAI audio.speech expects a small enum set for model/voice/response_format. We avoid hard-failing
         # on unknown values (to reduce drift with upstream), but we keep "safe fallbacks" + retries for the
         # common case where a pipeline TTS provider is swapped and stale options remain (e.g., Groq model/voice).
         model = (merged.get("tts_model") or "").strip()
-        if not model or "/" in model:
+        if not model or (openai_host and "/" in model):
             fallback_model = (self._provider_defaults.tts_model or "tts-1").strip()
             logger.warning(
                 "OpenAI TTS model looks invalid for OpenAI; falling back",
@@ -982,7 +1387,7 @@ class OpenAITTSAdapter(TTSComponent):
             merged["tts_model"] = fallback_model
 
         voice = (merged.get("voice") or "").strip().lower()
-        if voice in {
+        if openai_host and voice in {
             "autumn",
             "diana",
             "hannah",
@@ -1014,15 +1419,39 @@ class OpenAITTSAdapter(TTSComponent):
             merged["response_format"] = response_format
 
         headers = _make_http_headers(merged)
-        url = merged["tts_base_url"]
+
+        text_prefix = merged.get("text_prefix") or ""
+        request_text = text if not text_prefix or text.startswith(text_prefix) else f"{text_prefix}{text}"
+        streaming = bool(merged.get("streaming"))
 
         # Per OpenAI API spec (/v1/audio/speech), request field is `response_format` (not `format`).
-        payload = {
+        payload: Dict[str, Any] = {
             "model": merged["tts_model"],
-            "input": text,
+            "input": request_text,
             "voice": merged["voice"],
             "response_format": response_format,
         }
+        if streaming:
+            payload["stream"] = True
+
+        extra_body = merged.get("extra_body") or {}
+        forwarded: list = []
+        for key, value in extra_body.items():
+            if key in _TTS_ENGINE_OWNED_PAYLOAD_KEYS:
+                logger.warning(
+                    "OpenAI TTS extra_body field is set by the engine; ignored",
+                    call_id=call_id,
+                    field=key,
+                )
+                continue
+            payload[key] = value
+            forwarded.append(key)
+        if forwarded:
+            logger.debug(
+                "Forwarding extra_body fields to the speech endpoint",
+                call_id=call_id,
+                fields=sorted(forwarded),
+            )
 
         logger.info(
             "OpenAI TTS synthesis started",
@@ -1030,7 +1459,13 @@ class OpenAITTSAdapter(TTSComponent):
             model=payload["model"],
             voice=payload["voice"],
             text_preview=text[:64],
+            streamed=streaming,
         )
+
+        if streaming:
+            async for frame in self._stream_frames(call_id, url, headers, payload, merged):
+                yield frame
+            return
 
         async def _post_tts(req_payload: Dict[str, Any]) -> tuple[int, bytes, str]:
             async with self._session.post(url, json=req_payload, headers=headers, timeout=merged["timeout_sec"]) as resp:
@@ -1095,6 +1530,7 @@ class OpenAITTSAdapter(TTSComponent):
             output_bytes=len(converted),
             target_encoding=merged["target_format"]["encoding"],
             target_sample_rate=merged["target_format"]["sample_rate"],
+            streamed=False,
         )
 
         chunk_ms = int(merged.get("chunk_size_ms", self._chunk_size_ms))
@@ -1106,6 +1542,131 @@ class OpenAITTSAdapter(TTSComponent):
         ):
             if chunk:
                 yield chunk
+
+    async def _stream_frames(
+        self,
+        call_id: str,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        merged: Dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """POST with ``stream: true`` and emit playback frames as the body arrives.
+
+        A ``pcm`` body is raw PCM16 at ``pcm_sample_rate_hz``; a ``wav`` body
+        starts with a header that names the rate and is followed by the same
+        raw samples. Each network chunk is brought to the call's rate by a
+        stateful resampler (no click at chunk boundaries, no drift) and to its
+        encoding, then cut into ``chunk_size_ms`` frames. The read timeout is
+        the time the endpoint may stay silent between two chunks; a whole
+        reply is not bounded, the engine drops a reply it no longer wants.
+        """
+        assert self._session
+        response_format = str(merged.get("response_format") or "wav").lower()
+        target_encoding = merged["target_format"]["encoding"]
+        target_rate = int(merged["target_format"]["sample_rate"])
+        chunk_ms = int(merged.get("chunk_size_ms", self._chunk_size_ms))
+        bytes_per_sample = _bytes_per_sample(target_encoding)
+        frame_bytes = max(bytes_per_sample, int(target_rate * (chunk_ms / 1000.0) * bytes_per_sample))
+        read_timeout = float(merged["timeout_sec"])
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=read_timeout, sock_read=read_timeout)
+
+        started_at = time.perf_counter()
+        first_audio_ms: Optional[float] = None
+        source_rate: Optional[int] = None if response_format == "wav" else int(merged["pcm_sample_rate_hz"])
+        resampler: Optional[StreamingResampler] = None
+        header = b""
+        partial_sample = b""
+        pending = b""
+        raw_bytes = 0
+        output_bytes = 0
+
+        def _to_frames(pcm: bytes) -> Iterable[bytes]:
+            nonlocal pending, output_bytes, first_audio_ms
+            if not pcm:
+                return
+            converted = convert_pcm16le_to_target_format(pcm, target_encoding)
+            if not converted:
+                return
+            if first_audio_ms is None:
+                first_audio_ms = (time.perf_counter() - started_at) * 1000.0
+                logger.info(
+                    "OpenAI TTS first audio chunk",
+                    call_id=call_id,
+                    first_audio_ms=round(first_audio_ms, 2),
+                    source_sample_rate=source_rate,
+                )
+            pending += converted
+            while len(pending) >= frame_bytes:
+                frame, pending = pending[:frame_bytes], pending[frame_bytes:]
+                output_bytes += len(frame)
+                yield frame
+
+        async with self._session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status >= 400:
+                body = (await resp.read()).decode("utf-8", errors="ignore")
+                logger.error(
+                    "OpenAI TTS synthesis failed",
+                    call_id=call_id,
+                    status=resp.status,
+                    body_preview=body[:128],
+                    streamed=True,
+                )
+                raise RuntimeError(
+                    f"OpenAI TTS request failed (status {resp.status}): {body[:256]}"
+                )
+
+            async for raw in resp.content.iter_any():
+                if not raw:
+                    continue
+                raw_bytes += len(raw)
+                if source_rate is None:
+                    # Still inside the WAV header.
+                    header += raw
+                    parsed = _parse_wav_header(header)
+                    if parsed is None:
+                        continue
+                    source_rate, data_offset = parsed
+                    raw = header[data_offset:]
+                    header = b""
+                    if not raw:
+                        continue
+                if resampler is None:
+                    resampler = StreamingResampler(source_rate, target_rate, merged["output_resampler"])
+                # A PCM16 sample can straddle a chunk boundary; hold the odd
+                # trailing byte back for the next chunk.
+                buffered = partial_sample + raw
+                aligned = len(buffered) - (len(buffered) % 2)
+                partial_sample = buffered[aligned:]
+                for frame in _to_frames(resampler.process(buffered[:aligned])):
+                    yield frame
+
+        if resampler is not None:
+            for frame in _to_frames(resampler.flush()):
+                yield frame
+        if pending:
+            output_bytes += len(pending)
+            yield pending
+
+        if output_bytes == 0:
+            logger.warning(
+                "OpenAI TTS stream produced no audio",
+                call_id=call_id,
+                raw_bytes=raw_bytes,
+                response_format=response_format,
+            )
+        logger.info(
+            "OpenAI TTS synthesis completed",
+            call_id=call_id,
+            output_bytes=output_bytes,
+            raw_bytes=raw_bytes,
+            first_audio_ms=round(first_audio_ms, 2) if first_audio_ms is not None else None,
+            total_ms=round((time.perf_counter() - started_at) * 1000.0, 2),
+            source_sample_rate=source_rate,
+            target_encoding=target_encoding,
+            target_sample_rate=target_rate,
+            streamed=True,
+        )
 
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
@@ -1168,6 +1729,33 @@ class OpenAITTSAdapter(TTSComponent):
                     "output_resampler", self._provider_defaults.output_resampler
                 ),
             ),
+            "streaming": bool(
+                runtime_options.get(
+                    "streaming",
+                    self._pipeline_defaults.get("streaming", self._provider_defaults.tts_streaming),
+                )
+            ),
+            "pcm_sample_rate_hz": int(
+                runtime_options.get(
+                    "pcm_sample_rate_hz",
+                    self._pipeline_defaults.get(
+                        "pcm_sample_rate_hz", self._provider_defaults.tts_pcm_sample_rate_hz
+                    ),
+                )
+            ),
+            "text_prefix": str(
+                runtime_options.get(
+                    "text_prefix",
+                    self._pipeline_defaults.get("text_prefix", self._provider_defaults.tts_text_prefix),
+                )
+                or ""
+            ),
+            # Provider block, then pipeline options, then per-call overrides.
+            "extra_body": {
+                **_as_dict(self._provider_defaults.tts_extra_body),
+                **_as_dict(self._pipeline_defaults.get("extra_body")),
+                **_as_dict(runtime_options.get("extra_body")),
+            },
         }
         merged["output_resampler"] = resolve_output_resampler_policy(
             provider_mode=merged.get("output_resampler")

@@ -764,3 +764,53 @@ class TestDefaultPayload:
         assert payload["call_duration"] == 60
         assert "transcript_json" in payload
         assert "tool_calls_json" in payload
+
+
+class TestCustomVarsPayloadVariables:
+    """Outbound lead custom_vars resolve as post-call payload placeholders."""
+
+    @pytest.fixture
+    def context(self):
+        return PostCallContext(
+            call_id="call_xyz",
+            caller_number="+1555123456",
+            custom_vars={"amo_lead_id": "29884104", "client_name": "Olga"},
+        )
+
+    def test_custom_vars_substitute_as_individual_placeholders(self, context):
+        config = WebhookConfig(
+            name="test",
+            payload_template='{"amo_lead_id": "{amo_lead_id}", "client": "{client_name}"}',
+        )
+        tool = GenericWebhookTool(config)
+
+        data = json.loads(tool._build_payload(context))
+
+        assert data["amo_lead_id"] == "29884104"
+        assert data["client"] == "Olga"
+
+    def test_custom_vars_do_not_override_builtins_or_pre_call(self, context):
+        context.custom_vars["caller_number"] = "999-SPOOF"
+        context.custom_vars["customer_name"] = "from-custom-vars"
+        context.pre_call_results = {"customer_name": "from-pre-call"}
+        config = WebhookConfig(
+            name="test",
+            payload_template='{"phone": "{caller_number}", "customer_name": "{customer_name}"}',
+        )
+        tool = GenericWebhookTool(config)
+
+        data = json.loads(tool._build_payload(context))
+
+        assert data["phone"] == "+1555123456"
+        assert data["customer_name"] == "from-pre-call"
+
+    def test_custom_vars_json_placeholder_keeps_raw_object(self, context):
+        config = WebhookConfig(
+            name="test",
+            payload_template='{"vars": {custom_vars_json}}',
+        )
+        tool = GenericWebhookTool(config)
+
+        data = json.loads(tool._build_payload(context))
+
+        assert data["vars"] == {"amo_lead_id": "29884104", "client_name": "Olga"}

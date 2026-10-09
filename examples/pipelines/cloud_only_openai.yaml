@@ -26,7 +26,7 @@ providers:
     tts_base_url: https://api.openai.com/v1/audio/speech
     tts_model: gpt-4o-mini-tts
     voice: alloy
-    response_format: wav
+    tts_response_format: wav
     target_encoding: mulaw
     target_sample_rate_hz: 8000
 

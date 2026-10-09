@@ -14,6 +14,7 @@ def detect_capabilities(config: LocalAIConfig) -> Dict[str, Any]:
         "faster_whisper": False,
         "whisper_cpp": False,
         "tone": False,
+        "onnx_asr": False,
         "piper": False,
         "kokoro": False,
         "melotts": False,
@@ -53,6 +54,12 @@ def detect_capabilities(config: LocalAIConfig) -> Dict[str, Any]:
     try:
         from tone.pipeline import StreamingCTCPipeline  # noqa: F401
         capabilities["tone"] = True
+    except ImportError:
+        pass
+
+    try:
+        import onnx_asr  # noqa: F401
+        capabilities["onnx_asr"] = True
     except ImportError:
         pass
 

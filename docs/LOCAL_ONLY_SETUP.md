@@ -154,11 +154,22 @@ The GPU compose file (`docker-compose.gpu.yml`) builds a CUDA-enabled `local_ai_
 > not currently implemented by the Docker deployment path; those hosts must use
 > CPU mode unless they maintain a custom inference server.
 
-The default llama.cpp build remains portable across supported NVIDIA GPUs. If a
-source build fails or you deliberately want to target one GPU generation, set
-`LLAMA_CUDA_ARCHITECTURES` before building (for example `70` for Tesla
-V100/V100S). This is a build-time CMake value, not the number of LLM layers, and
-changing it requires rebuilding `local_ai_server`.
+The image is built on the `nvidia/cuda` CUDA 13.2 / cuDNN 9 pair on Ubuntu 24.04 with
+Python 3.11, which gives the ONNX Runtime (onnx-asr), faster-whisper and llama.cpp
+backends native kernels for Blackwell GPUs (RTX 50xx, RTX PRO 6000, B200); the torch
+backends (Kokoro, MeloTTS, Silero) keep the pinned torch 2.5.1, which has none. Keep the CUDA version at or below the one `nvidia-smi` prints
+for the host driver: `LOCAL_AI_CUDA_VERSION` and `LOCAL_AI_UBUNTU_VERSION` in `.env`
+select another pair. CUDA 13 no longer compiles for Maxwell, Pascal and Volta GPUs
+(compute capability below 7.5, for example a Tesla V100): those hosts set
+`LOCAL_AI_CUDA_VERSION=12.9.1` and `LOCAL_AI_UBUNTU_VERSION=22.04`, and the build
+then installs the last `onnxruntime-gpu` published for CUDA 12.
+
+The default llama.cpp build remains portable across the GPUs the chosen CUDA
+supports. If a source build fails or you deliberately want to target one GPU
+generation, set `LLAMA_CUDA_ARCHITECTURES` before building (for example `120`
+for Blackwell, `75` for a T4, or `70` for a Tesla V100/V100S on the CUDA 12 base).
+This is a build-time CMake value, not the number of LLM layers, and changing it
+requires rebuilding `local_ai_server`.
 
 ```bash
 docker compose -p asterisk-ai-voice-agent \
@@ -216,6 +227,9 @@ LOCAL_WS_AUTH_TOKEN=<generate-a-strong-random-token>
 # STT/TTS/LLM config (same as Topology 2)
 LOCAL_STT_BACKEND=faster_whisper
 LOCAL_STT_MODEL_PATH=base
+# Russian on a GPU box: build with INCLUDE_ONNX_ASR=true and use
+#LOCAL_STT_BACKEND=onnx_asr
+#ONNX_ASR_MODEL=gigaam-v3-e2e-ctc
 LOCAL_TTS_BACKEND=kokoro
 KOKORO_MODE=hf
 KOKORO_VOICE=af_heart
@@ -573,12 +587,14 @@ Models are **not bundled** in Docker images. Download them via:
 - `sherpa-onnx-zipformer-ru-2024-09-18` (Russian follow-up after English passes)
 - Use with `SHERPA_MODEL_TYPE=offline`
 - Offline mode requires a non-streaming transducer model. Do not point offline mode at `sherpa-onnx-streaming-*` models.
-- Typical offline tuning knobs:
+- Typical offline tuning knobs (shared with the `onnx_asr` backend; all on the Env page under the backend's settings):
   - `SHERPA_VAD_MODEL_PATH=/app/models/vad/silero_vad.onnx`
   - `SHERPA_VAD_THRESHOLD=0.35`
   - `SHERPA_VAD_MIN_SILENCE_MS=700`
   - `SHERPA_VAD_MIN_SPEECH_MS=200`
-  - `SHERPA_OFFLINE_PREROLL_MS=350`
+  - `SHERPA_OFFLINE_PREROLL_MS=350` and `SHERPA_OFFLINE_POSTROLL_MS=300`: stream audio taken before the VAD's start and after its end of a phrase (see *Phrase segmenting* below)
+  - `SHERPA_OFFLINE_NORMALIZE_DBFS=-20` and `SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB=24`: loudness each phrase is brought to before decoding (`0` turns it off)
+  - `LOCAL_STT_RESAMPLER=fir`: how 8 kHz client audio is brought to 16 kHz (`ratecv` restores the linear interpolation)
   - `SHERPA_OFFLINE_DEBUG_SEGMENTS=true` for targeted diagnostics only
 - See [Sherpa-ONNX Models](https://github.com/k2-fsa/sherpa-onnx/releases)
 
@@ -591,6 +607,29 @@ Models are **not bundled** in Docker images. Download them via:
   - `TONE_KENLM_PATH=/app/models/stt/t-one/kenlm.bin` when using `beam_search`
 - T-one expects 8 kHz audio internally; `local_ai_server` handles 16 kHz to 8 kHz conversion and 300 ms chunk framing.
 - Recommended for Russian community validation when you want the upstream T-one path instead of Sherpa/Whisper.
+
+**GigaAM v3 / NeMo FastConformer RU via onnx-asr** (Russian, offline, VAD-gated; GPU recommended):
+- Requires rebuild: `docker compose build --build-arg INCLUDE_ONNX_ASR=true local_ai_server` (the GPU image, `docker-compose.gpu.yml`, installs `onnxruntime-gpu`; the CPU image installs the CPU runtime). `sherpa-onnx`, which provides the Silero VAD gate, is installed along with it, so `INCLUDE_SHERPA` may stay off.
+- Set `LOCAL_STT_BACKEND=onnx_asr` and pick the model with `ONNX_ASR_MODEL`:
+  - `gigaam-v3-e2e-ctc` (default; punctuation and number normalization built in, fastest), `gigaam-v3-e2e-rnnt` (slightly more accurate, slower)
+  - `gigaam-v3-ctc`, `gigaam-v3-rnnt` (plain lowercase text)
+  - `nemo-fastconformer-ru-ctc`, `nemo-fastconformer-ru-rnnt` (NVIDIA NeMo, punctuation and capitalization)
+  - any other name the [onnx-asr](https://github.com/istupakov/onnx-asr) package knows (for example `gigaam-multilingual-ctc`)
+- The model (about 1 GB in fp32) is downloaded from Hugging Face by the server on first start into `ONNX_ASR_CACHE_DIR` (`/app/models/stt/onnx-asr/<model>`, on the `./models` volume, so it is kept across restarts). To skip the download, place the files (`config.json`, the `.onnx`, the vocabulary) in a directory and set `ONNX_ASR_MODEL_PATH`.
+- `ONNX_ASR_DEVICE=auto` runs on CUDA when `onnxruntime-gpu` sees a GPU and on the CPU otherwise; `ONNX_ASR_QUANTIZATION=int8` takes a quarter of the memory and is faster on a CPU.
+- On a GPU the encoder is not what costs time. An RNNT model (`*-rnnt`) runs its decoder and joiner once per 40 ms of audio on tiny tensors, and through ONNX Runtime on CUDA each step is a kernel launch plus two copies, so a 3 s utterance spends 100–250 ms in that loop; on the CPU the same step is a fraction of a millisecond. `ONNX_ASR_DECODER_DEVICE=cpu` (the default) rebuilds those two sessions on the CPU while the encoder stays on CUDA; a CTC model has no such loop, which is why `gigaam-v3-e2e-ctc` decodes in one pass. `ONNX_ASR_PREPROCESSOR=cpu` (default) computes the mel spectrogram in NumPy instead of a CUDA session with a new shape per utterance. `ONNX_ASR_CUDNN_ALGO_SEARCH=HEURISTIC` (default) stops onnxruntime from benchmarking every convolution algorithm again for every new utterance length (its own default, `EXHAUSTIVE`, is what made the first utterance and every new length slow). `ONNX_ASR_WARMUP=true` (default) decodes 1, 3, 8 and 20 s of silence at start so the first real utterance pays nothing for lazy initialization. If the GPU is shared with a vLLM, its kernels and the recognizer's are time-sliced between the two processes; CUDA MPS on the host lets them overlap, and a smaller vLLM `--max-num-batched-tokens` keeps a prefill from holding the card for hundreds of milliseconds.
+- These models decode whole phrases: the caller's audio is cut into phrases by the same Silero VAD gate as Sherpa offline (`SHERPA_VAD_MODEL_PATH`, `SHERPA_VAD_THRESHOLD`, `SHERPA_VAD_MIN_SILENCE_MS`, `SHERPA_VAD_MIN_SPEECH_MS` apply; the VAD model is downloaded automatically), widened and normalized as described under *Phrase segmenting* below, and each phrase is recognized once the caller pauses. There are no partial results; the engine's own Silero VAD still decides the end of the caller's turn and barge-in. GigaAM v3 has no voice activity detection of its own.
+- With the engine's Silero VAD enabled, let the engine cut the utterances instead of the server (`vad.silero_stt_utterances: true`, VAD page → *Silero VAD* → *Recognizer gets whole utterances cut by Silero*): the moment Silero reports the caller quiet, the whole utterance goes to the server as one `stt_utterance` message and is decoded as it is, with no second VAD, no closing-silence gate and no finalize burst; the server's `SHERPA_VAD_*` and pre-/post-roll settings then apply only to clients that still stream. Pair it with `barge_in.pipeline_listen_during_playback` (Barge-In page) so what the caller says over a reply is transcribed whole, and with `streaming.pipeline_discard_unheard_reply` (on by default) so a turn released on a pause they only took to breathe costs no reply to half a sentence.
+- Short replies («да», «нет», a number) are where these models err most. Start from `SHERPA_VAD_THRESHOLD=0.28`, `SHERPA_VAD_MIN_SPEECH_MS=120`, keep `SHERPA_VAD_MIN_SILENCE_MS=700`, and compare `gigaam-v3-e2e-rnnt` against the default CTC model on the same calls; the `VAD segment[...]` log lines show each phrase's duration, the pre-/post-roll added, the gain applied and its level.
+
+**Phrase segmenting** (Sherpa offline and `onnx_asr`, clients that stream; a client that sends whole utterances skips all of it):
+- The Silero VAD opens a phrase about 64 ms before the first window it called speech and closes it where the closing silence began, so the phrase alone starts abruptly and ends before the last consonant has decayed. The server keeps the recent stream per session by absolute sample position and widens every phrase with the audio that really came before it (`SHERPA_OFFLINE_PREROLL_MS`, 350) and after it (`SHERPA_OFFLINE_POSTROLL_MS`, 300; at most the min-silence window is available, and a phrase flushed at the end of the stream is padded with silence). The VAD is recreated after every final; the stream memory is not, so the pre-roll of the next phrase is real audio.
+- Telephone audio often reaches the recognizer at −35…−45 dBFS. Each phrase is brought to `SHERPA_OFFLINE_NORMALIZE_DBFS` (−20 dBFS RMS, measured on the speech part; the gain applies to the whole widened phrase) with at most `SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB` (24) of boost and peaks kept below full scale. `0` turns the normalization off.
+- The engine's local provider brings the caller's 8 kHz audio to 16 kHz before sending it; it now uses a polyphase windowed-sinc FIR (`providers.<name>.stt_input_resampler: fir`, the default; `linear` restores the previous interpolation, which rolled the band off by 2–3 dB at 3 kHz and mirrored it above 4 kHz). A client that still sends 8 kHz to the server gets the same FIR there (`LOCAL_STT_RESAMPLER=fir`; `ratecv` keeps `audioop`'s interpolation).
+- Latency: about 100–300 ms per 5-second phrase on a GPU, 0.5–1.5 s on a CPU; both are added after the caller stops. Raise `pipelines.<name>.options.llm.end_of_turn_vad_final_wait_ms` on the engine so the turn waits for the recognizer's final on a CPU.
+- GPU memory: the model needs about 1 GB next to whatever else uses the GPU (a vLLM on the same card must leave that much free, for example `--gpu-memory-utilization 0.85`).
+- Status shows `onnx-asr (<model>, cuda|cpu)`; the log lines are tagged `ONNX-ASR`.
+- Keep the pipeline's `options.stt.streaming` at `true` (the default for `local_stt`). The buffered mode sends 160 ms chunks and waits for a final per chunk, which a phrase-level recognizer never gives; the engine detects `stt_backend: onnx_asr` (and `tone`) in the provider block, logs `Buffered STT ... is not supported by this recognizer; using streaming` and stays streaming.
 
 **Kroko Embedded** (optional, requires rebuild):
 - `docker compose build --build-arg INCLUDE_KROKO_EMBEDDED=true local_ai_server`

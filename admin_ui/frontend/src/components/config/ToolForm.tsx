@@ -38,6 +38,14 @@ const DEFAULT_ATTENDED_CALLER_CONNECTED_PROMPT = "Connecting you now.";
 const DEFAULT_ATTENDED_CALLER_DECLINED_PROMPT =
     "I’m not able to complete that transfer right now. Would you like me to take a message, or is there anything else I can help with?";
 const DEFAULT_HANGUP_POLICY_MODE = 'normal';
+// The built-in texts the LLM sees for hangup_call when no description is
+// configured; the second applies once the farewell_message parameter is off.
+const DEFAULT_HANGUP_TOOL_DESCRIPTION =
+    'End the current call. Call this when the caller says goodbye or thank you and is ready to hang up. Set farewell_message to your goodbye sentence.';
+const DEFAULT_HANGUP_TOOL_DESCRIPTION_NO_FAREWELL =
+    'End the current call. Call this when the caller says goodbye or thank you and is ready to hang up, in the same reply as your own goodbye: the call ends once your reply has been spoken.';
+const DEFAULT_HANGUP_FAREWELL_PARAMETER_DESCRIPTION =
+    'Farewell message to speak before hanging up. Should be warm and professional.';
 const DEFAULT_HANGUP_END_CALL_MARKERS = [
     "no transcript",
     "no transcript needed",
@@ -1856,13 +1864,55 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                     />
                     {config.hangup_call?.enabled !== false && (
                         <div className="mt-4 pl-4 border-l-2 border-border ml-2 space-y-4">
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <FormInput
-                                    label="Default Farewell Message"
-                                    value={config.hangup_call?.farewell_message || ''}
-                                    onChange={(e) => updateNestedConfig('hangup_call', 'farewell_message', e.target.value)}
-                                    tooltip="Used when the AI calls hangup_call without specifying a farewell. The AI typically provides its own message."
+                            <FormSwitch
+                                label="Farewell via farewell_message parameter"
+                                description="On: the LLM passes its goodbye in farewell_message and the engine speaks it after the tool runs. Off: the tool has no parameter, the LLM says goodbye in its reply and the call ends once that reply has been heard."
+                                checked={config.hangup_call?.farewell_message_enabled ?? true}
+                                onChange={(e) => updateNestedConfig('hangup_call', 'farewell_message_enabled', e.target.checked)}
+                                className="mb-0"
+                            />
+                            <div className="space-y-2">
+                                <FormLabel
+                                    htmlFor="hangup-tool-description"
+                                    tooltip="Sent to the LLM with every request as the description of the hangup_call function. Empty keeps the built-in English text shown as the placeholder. Write it in the language of your prompts and say when to end the call and where the goodbye sentence goes: with the parameter on, the engine speaks farewell_message itself after the tool runs, so a goodbye in the reply text as well is heard twice."
+                                >
+                                    Tool Description (what the LLM sees)
+                                </FormLabel>
+                                <textarea
+                                    id="hangup-tool-description"
+                                    className="w-full p-2 rounded border border-input bg-background text-sm min-h-[96px]"
+                                    placeholder={
+                                        (config.hangup_call?.farewell_message_enabled ?? true)
+                                            ? DEFAULT_HANGUP_TOOL_DESCRIPTION
+                                            : DEFAULT_HANGUP_TOOL_DESCRIPTION_NO_FAREWELL
+                                    }
+                                    value={config.hangup_call?.description || ''}
+                                    onChange={(e) => updateNestedConfig('hangup_call', 'description', e.target.value)}
                                 />
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {(config.hangup_call?.farewell_message_enabled ?? true) && (
+                                    <>
+                                        <FormInput
+                                            label="Default Farewell Message"
+                                            value={config.hangup_call?.farewell_message || ''}
+                                            onChange={(e) => updateNestedConfig('hangup_call', 'farewell_message', e.target.value)}
+                                            tooltip="Used when the AI calls hangup_call without specifying a farewell. The AI typically provides its own message."
+                                        />
+                                        <FormInput
+                                            label="farewell_message Parameter Description"
+                                            placeholder={DEFAULT_HANGUP_FAREWELL_PARAMETER_DESCRIPTION}
+                                            value={config.hangup_call?.parameter_descriptions?.farewell_message || ''}
+                                            onChange={(e) =>
+                                                updateNestedConfig('hangup_call', 'parameter_descriptions', {
+                                                    ...(config.hangup_call?.parameter_descriptions || {}),
+                                                    farewell_message: e.target.value,
+                                                })
+                                            }
+                                            tooltip="Description of the farewell_message parameter in the schema the LLM sees. Empty keeps the built-in English text shown as the placeholder."
+                                        />
+                                    </>
+                                )}
                                 <FormInput
                                     label="Farewell Hangup Delay (seconds)"
                                     type="number"

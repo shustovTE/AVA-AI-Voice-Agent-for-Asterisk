@@ -7,7 +7,7 @@ import { Save, Activity, AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { YamlErrorBanner, YamlErrorInfo } from '../../components/ui/YamlErrorBanner';
 import { ConfigSection } from '../../components/ui/ConfigSection';
 import { ConfigCard } from '../../components/ui/ConfigCard';
-import { FormInput, FormSwitch } from '../../components/ui/FormComponents';
+import { FormInput, FormSelect, FormSwitch } from '../../components/ui/FormComponents';
 import { sanitizeConfigForSave } from '../../utils/configSanitizers';
 import { getCachedConfig, loadConfigYaml } from '../../utils/configCache';
 import { useRestartRequired } from '../../hooks/useRestartRequired';
@@ -310,6 +310,251 @@ const VADPage = () => {
             </ConfigSection>
 
             <ConfigSection
+                title="Silero VAD (pipelines)"
+                description="A neural speech detector run in the engine on the caller's own frames. When enabled it drives barge-in, the inactivity watchdog and the end of the caller's turn for modular pipelines, and tells the recognizer to finalize the moment the caller stops."
+            >
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormSwitch
+                                label="Enable Silero VAD"
+                                description="Score every 32 ms of caller audio with Silero VAD v6 (ONNX, CPU)."
+                                tooltip="Replaces energy-based detection for pipeline calls: breathing, line noise and background sound no longer count as the caller. Needs onnxruntime in the engine image and the model file below. Asterisk TALK_DETECT may stay on for barge-in; the end of turn follows Silero unless a pipeline pins another source."
+                                checked={vadConfig.silero_enabled ?? false}
+                                onChange={(e) => updateVADConfig('silero_enabled', e.target.checked)}
+                            />
+                            <FormSwitch
+                                label="Silero Barge-In"
+                                description="Let Silero speech during agent playback interrupt the agent."
+                                tooltip="Uses the same echo protection and cooldown as Asterisk talk detection. Turn off to leave barge-in to TALK_DETECT while Silero still decides the end of turn."
+                                checked={vadConfig.silero_barge_in ?? true}
+                                onChange={(e) => updateVADConfig('silero_barge_in', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Model Path"
+                                type="text"
+                                value={vadConfig.silero_model_path ?? 'models/vad/silero_vad.onnx'}
+                                onChange={(e) => updateVADConfig('silero_model_path', e.target.value)}
+                                tooltip="Path of silero_vad.onnx inside the engine container; ./models is mounted at /app/models. scripts/fetch_silero_vad.sh downloads the pinned release there."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormSwitch
+                                label="Auto-Download Model"
+                                description="Fetch the pinned model on first start when the file is missing."
+                                tooltip="Downloads Silero VAD v6.2.1 (about 2 MB) from the project's GitHub release and verifies its SHA-256. Turn off on hosts without outbound access and run scripts/fetch_silero_vad.sh instead."
+                                checked={vadConfig.silero_auto_download ?? true}
+                                onChange={(e) => updateVADConfig('silero_auto_download', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Speech Threshold"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.silero_threshold ?? 0.5}
+                                onChange={(e) => updateVADConfig('silero_threshold', parseFloat(e.target.value))}
+                                tooltip="Speech probability at or above which a chunk counts as speech (0–1). 0.5 suits most lines; raise it on noisy trunks, lower it for quiet callers. Speech ends below threshold − 0.15 unless Stop Threshold is set."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Start (ms)"
+                                type="number"
+                                min="0"
+                                step="32"
+                                value={vadConfig.silero_start_ms ?? 96}
+                                onChange={(e) => updateVADConfig('silero_start_ms', parseInt(e.target.value))}
+                                tooltip="Sustained speech before the caller counts as talking; holds the turn and triggers barge-in. Whole chunks of 32 ms. Higher ignores short noises, lower reacts faster."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Stop (ms)"
+                                type="number"
+                                min="0"
+                                step="32"
+                                value={vadConfig.silero_stop_ms ?? 300}
+                                onChange={(e) => updateVADConfig('silero_stop_ms', parseInt(e.target.value))}
+                                tooltip="Silence after the caller's last speech before they count as quiet. This is the pause a caller may take mid-sentence; the answer follows it by the pipeline's grace plus the recognizer's finalization. 300 ms is snappy, 600–800 ms tolerates thinking aloud."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormSelect
+                                label="Scoring Rate"
+                                value={vadConfig.silero_sample_rate ? String(vadConfig.silero_sample_rate) : ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updateVADConfig('silero_sample_rate', raw === '' ? undefined : parseInt(raw));
+                                }}
+                                options={[
+                                    { value: '', label: "The line's own rate" },
+                                    { value: '16000', label: '16 kHz (upsample 8 kHz lines)' },
+                                    { value: '8000', label: '8 kHz' },
+                                ]}
+                                tooltip="The rate Silero scores the caller at. On 8 kHz telephone lines 16 kHz catches short answers after a silent line ('yes', 'hello') that the 8 kHz model leaves at the threshold; it costs about twice the CPU per chunk (still under half a millisecond) and makes barge-in as sensitive. Only Silero gets the converted audio; the recognizer, Smart Turn and the energy checks keep the line's own."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+
+                        <FormSwitch
+                            label="Recognizer gets whole utterances cut by Silero"
+                            description="The engine keeps the caller's audio and, the moment Silero reports them quiet, sends everything from a little before their speech to its end as one utterance. The recognizer decodes it as it is, without a voice activity detector of its own; nothing streams in between and no finalize silence is needed."
+                            tooltip="Local AI Server backends that decode whole phrases: GigaAM v3 / NeMo through onnx-asr, Sherpa offline, faster-whisper, whisper.cpp (the server reports whether it can; an older server or a streaming backend gets each utterance followed by a closing silence instead). Pair it with 'Keep listening while the agent speaks' on the Barge-In page so words spoken over a reply are transcribed whole."
+                            checked={vadConfig.silero_stt_utterances ?? false}
+                            onChange={(e) => updateVADConfig('silero_stt_utterances', e.target.checked)}
+                            disabled={!vadConfig.silero_enabled}
+                        />
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {vadConfig.silero_stt_utterances ? (
+                                <>
+                                    <FormInput
+                                        label="Utterance Pre-roll (ms)"
+                                        type="number"
+                                        min="0"
+                                        max="2000"
+                                        step="50"
+                                        value={vadConfig.silero_utterance_preroll_ms ?? 300}
+                                        onChange={(e) => updateVADConfig('silero_utterance_preroll_ms', parseInt(e.target.value))}
+                                        tooltip="Audio taken before the frame Silero called the start of speech: its Start (ms) of confirmation plus the onset consonant before it. 300 ms covers a 96 ms start comfortably."
+                                        disabled={!vadConfig.silero_enabled}
+                                    />
+                                    <FormInput
+                                        label="Max Utterance (ms)"
+                                        type="number"
+                                        min="2000"
+                                        max="60000"
+                                        step="1000"
+                                        value={vadConfig.silero_utterance_max_ms ?? 20000}
+                                        onChange={(e) => updateVADConfig('silero_utterance_max_ms', parseInt(e.target.value))}
+                                        tooltip="A caller who never pauses is sent in pieces of at most this length, cut at the newest quiet chunk in the second half of the piece. The turn stays open while Silero hears them, so the pieces still form one turn. Offline models are trained on short clips; 20 s is safe."
+                                        disabled={!vadConfig.silero_enabled}
+                                    />
+                                </>
+                            ) : (
+                                <FormInput
+                                    label="STT Finalize Silence (ms)"
+                                    type="number"
+                                    min="0"
+                                    step="100"
+                                    value={vadConfig.silero_stt_finalize_ms ?? 900}
+                                    onChange={(e) => updateVADConfig('silero_stt_finalize_ms', parseInt(e.target.value))}
+                                    tooltip="Silence fed to the recognizer the moment the caller is quiet, so a streaming recognizer closes the phrase at once instead of waiting out its own gate in real time (T-one holds 600 ms, at 300 ms chunk boundaries). 0 disables and the recognizer's own timing applies. Not used when the recognizer gets whole utterances."
+                                    disabled={!vadConfig.silero_enabled}
+                                />
+                            )}
+                            <FormInput
+                                label="Stop Threshold (optional)"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.silero_stop_threshold ?? ''}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updateVADConfig('silero_stop_threshold', raw === '' ? undefined : parseFloat(raw));
+                                }}
+                                placeholder="threshold − 0.15"
+                                tooltip="Probability below which speech ends. Leave empty for Silero's own margin of 0.15 below the speech threshold."
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                        </div>
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
+            <ConfigSection
+                title="Smart Turn (pipelines)"
+                description="The semantic layer above Silero VAD: when the caller goes quiet, Smart Turn v3 scores their audio for whether the turn is complete. An incomplete verdict holds the turn a while longer so a caller who is thinking is not answered mid-thought."
+            >
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormSwitch
+                                label="Enable Smart Turn"
+                                description="Judge every Silero stop with Smart Turn v3.2 (ONNX, CPU, about 50 ms)."
+                                tooltip="Needs Silero VAD enabled: it runs on Silero's stop events and on the caller audio Silero already sees. Audio-native (prosody and content, no transcript), 23 languages including Russian. Off, turns end on Silero alone."
+                                checked={vadConfig.smart_turn_enabled ?? false}
+                                onChange={(e) => updateVADConfig('smart_turn_enabled', e.target.checked)}
+                                disabled={!vadConfig.silero_enabled}
+                            />
+                            <FormInput
+                                label="Completion Threshold"
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={vadConfig.smart_turn_threshold ?? 0.5}
+                                onChange={(e) => updateVADConfig('smart_turn_threshold', parseFloat(e.target.value))}
+                                tooltip="Probability of completion at or above which the turn is released at once (0–1). Lower answers sooner and risks cutting a thinking caller; higher waits more often."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Model Path"
+                                type="text"
+                                value={vadConfig.smart_turn_model_path ?? 'models/turn/smart-turn-v3.2-cpu.onnx'}
+                                onChange={(e) => updateVADConfig('smart_turn_model_path', e.target.value)}
+                                tooltip="Path of the Smart Turn ONNX file inside the engine container; ./models is mounted at /app/models. scripts/fetch_smart_turn.sh downloads the pinned release there."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormSwitch
+                                label="Auto-Download Model"
+                                description="Fetch the pinned model on first start when the file is missing."
+                                tooltip="Downloads Smart Turn v3.2 (about 8 MB) from the pipecat-ai release on Hugging Face and verifies its SHA-256. Turn off on hosts without outbound access and run scripts/fetch_smart_turn.sh instead."
+                                checked={vadConfig.smart_turn_auto_download ?? true}
+                                onChange={(e) => updateVADConfig('smart_turn_auto_download', e.target.checked)}
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Incomplete Hold (ms)"
+                                type="number"
+                                min="0"
+                                step="250"
+                                value={vadConfig.smart_turn_incomplete_hold_ms ?? 3000}
+                                onChange={(e) => updateVADConfig('smart_turn_incomplete_hold_ms', parseInt(e.target.value))}
+                                tooltip="How long an incomplete verdict may hold the turn past the Silero stop. If the caller goes on, the next stop is judged again on the whole turn; if not, the turn is released when this runs out."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormInput
+                                label="Trailing Silence (ms)"
+                                type="number"
+                                min="0"
+                                step="50"
+                                value={vadConfig.smart_turn_trailing_silence_ms ?? 200}
+                                onChange={(e) => updateVADConfig('smart_turn_trailing_silence_ms', parseInt(e.target.value))}
+                                tooltip="How much of the silence after the caller's last speech the model is shown. The reference integration ends the audio about 200 ms after speech; the rest of the Silero stop window is trimmed."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                            <FormInput
+                                label="Verdict Timeout (ms)"
+                                type="number"
+                                min="0"
+                                step="50"
+                                value={vadConfig.smart_turn_timeout_ms ?? 500}
+                                onChange={(e) => updateVADConfig('smart_turn_timeout_ms', parseInt(e.target.value))}
+                                tooltip="How long the turn waits for a verdict at most. Inference takes tens of milliseconds; the bound only matters on an overloaded host."
+                                disabled={!vadConfig.smart_turn_enabled}
+                            />
+                        </div>
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
+            <ConfigSection
                 title="Caller Inactivity"
                 description="Check that a silent inbound caller is still present, then end abandoned calls cleanly."
             >
@@ -375,6 +620,32 @@ const VADPage = () => {
 
                         <p className="text-xs text-muted-foreground">
                             Outbound calls do not inherit this behavior automatically. Enable it explicitly in the outbound agent's settings.
+                        </p>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <FormInput
+                                label="Stall Timeout (seconds)"
+                                type="number"
+                                min="0"
+                                max="7200"
+                                value={noInputConfig.stall_timeout_sec ?? 0}
+                                onChange={(e) => updateNoInputConfig('stall_timeout_sec', parseFloat(e.target.value))}
+                                tooltip="Hang up once nothing has been exchanged for this long: no caller words reached the model and the agent did not finish an utterance. Unlike the check-ins it ignores the speech detectors, so hold music, noise or an IVR cannot keep the call open, and it applies to inbound and outbound calls alike. 0 disables it; 90-120 is a sensible value."
+                                disabled={!(noInputConfig.enabled ?? true)}
+                            />
+                            <FormInput
+                                label="Max Call Duration (seconds)"
+                                type="number"
+                                min="0"
+                                max="86400"
+                                value={noInputConfig.max_call_duration_sec ?? 0}
+                                onChange={(e) => updateNoInputConfig('max_call_duration_sec', parseFloat(e.target.value))}
+                                tooltip="Hard cap on a call's length, counted from its start: the engine hangs up when it is reached whatever the call is doing, even mid-sentence (a transfer in progress only delays it). Applies to inbound and outbound calls alike. 0 disables it."
+                                disabled={!(noInputConfig.enabled ?? true)}
+                            />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                            The stall timeout is the safety net for lines that carry sound but no conversation: it counts from the last exchange rather than from the last sound and ends the call without an announcement. The max call duration is a hard cap that nothing pauses. Both run for outbound calls too (only the switch above turns them off). A call ended by the cap is recorded as &quot;max duration&quot;, one ended by the stall timeout as &quot;no input timeout&quot;.
                         </p>
                     </div>
                 </ConfigCard>

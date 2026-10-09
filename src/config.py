@@ -149,6 +149,12 @@ class LocalProviderConfig(BaseModel):
     
     # STT Backend selection: vosk | kroko | sherpa
     stt_backend: str = Field(default="vosk")
+    # How 8 kHz caller audio is brought to the recognizer's 16 kHz before it is
+    # sent to the Local AI Server: "fir" (polyphase windowed-sinc interpolation,
+    # no spectral images, flat telephone band) or "linear" (the legacy
+    # interpolation, which mirrors a 3 kHz tone to 5 kHz at about -13 dB and
+    # rolls the band off by 2-3 dB).
+    stt_input_resampler: Literal["fir", "linear"] = Field(default="fir")
     # Vosk STT model path
     stt_model: Optional[str] = None
     # Kroko STT settings
@@ -259,6 +265,63 @@ class DeepgramProviderConfig(BaseModel):
         return self
 
 
+# Provider-block keys the engine consumes itself but that are not fields of
+# OpenAIProviderConfig: routing//identity metadata and legacy aliases the
+# adapters resolve. Everything here stays on this side of the wire.
+_OPENAI_ENGINE_ONLY_KEYS = frozenset(
+    {
+        "type",
+        "kind",
+        "name",
+        "display_name",
+        "customer",
+        "enabled",
+        "capabilities",
+        "base_url",
+        "model",
+        "timeout_sec",
+        "connect_timeout_sec",
+        "mid_call_reconnect_timeout_sec",
+        "ws_url",
+        "chunk_ms",
+        "stt_backend",
+        "tool_call_policy",
+        "tool_gateway_enabled",
+    }
+)
+
+# Markers of a credential. A provider block may name one anything, so match by
+# shape rather than by an exhaustive list. "token" is matched as a whole word
+# or suffix only: `max_tokens` is a request parameter, `auth_token` is not.
+_OPENAI_SECRET_KEY_MARKERS = ("api_key", "secret", "password", "credential")
+
+
+def _looks_like_credential(key: str) -> bool:
+    lowered = str(key).lower()
+    if any(marker in lowered for marker in _OPENAI_SECRET_KEY_MARKERS):
+        return True
+    return lowered == "token" or lowered.endswith("_token")
+
+
+def split_openai_passthrough_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the provider-block keys that belong in the API request body.
+
+    Anything the engine understands (a field of :class:`OpenAIProviderConfig`
+    or an engine-only key above) stays home; whatever is left is an endpoint
+    parameter the operator wrote for the vendor, and is forwarded verbatim.
+    Credentials are never forwarded, whatever they are called.
+    """
+    known = set(OpenAIProviderConfig.model_fields) | _OPENAI_ENGINE_ONLY_KEYS
+    passthrough: Dict[str, Any] = {}
+    for key, value in (raw or {}).items():
+        if key in known or value is None:
+            continue
+        if _looks_like_credential(key):
+            continue
+        passthrough[key] = value
+    return passthrough
+
+
 class OpenAIProviderConfig(BaseModel):
     """# Milestone7: Canonical defaults for OpenAI pipeline adapters."""
     api_key: Optional[str] = None
@@ -266,6 +329,22 @@ class OpenAIProviderConfig(BaseModel):
     api_key_env: Optional[str] = None
     organization: Optional[str] = None
     project: Optional[str] = None
+    # Vendor-specific Chat Completions fields forwarded verbatim in the request
+    # body (e.g. `prompt_cache_key` for OpenAI/Mistral prompt caching, or
+    # `chat_template_kwargs` for a vLLM chat template). The engine logs the key
+    # names it forwards, and never lets one override a field it owns itself
+    # (model, messages, stream, tools, tool_choice).
+    extra_body: Dict[str, Any] = Field(default_factory=dict)
+    # Transport settings for the Chat Completions adapter, resolved once per
+    # adapter (a pipeline's options.llm overrides them). Typed here so the
+    # vendor pass-through never sends them to the endpoint as body fields.
+    proxy: Optional[str] = None
+    keepalive_timeout_sec: Optional[float] = None
+    # Send one ``max_tokens: 1`` request with the call's prompt while the
+    # greeting plays, so the first real turn finds the connection open and the
+    # prompt prefix in the endpoint's cache. Off by default: on a metered API
+    # it bills one extra prompt per call.
+    warm_up: bool = Field(default=False)
     tools_enabled: bool = Field(default=True)
     # "ga" = GA Realtime API (no beta header, gpt-realtime model family) — DEFAULT
     # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
@@ -292,6 +371,28 @@ class OpenAIProviderConfig(BaseModel):
     tts_model: str = Field(default="tts-1")
     voice: str = Field(default="alloy")
     tts_response_format: str = Field(default="wav")
+    # A self-hosted OpenAI-compatible speech endpoint (vLLM-Omni serving Fish
+    # Speech S2-Pro, for one) is driven through the same adapter; the four keys
+    # below are what such a server needs beyond the OpenAI fields.
+    # `stream: true`: play the reply while it is still being generated. The
+    # engine already hands pipeline TTS one sentence at a time; with this the
+    # first sound waits for the first frames of the sentence, not for all of it.
+    # Only `pcm` and `wav` bodies are understood.
+    tts_streaming: bool = Field(default=False)
+    # Sample rate of a `pcm` body, which carries no header: OpenAI speaks
+    # 24 kHz, Fish Speech S2-Pro 44.1 kHz. A `wav` body is read from its header.
+    tts_pcm_sample_rate_hz: int = Field(default=24000)
+    # Put in front of the text of every request, e.g. the `<|speaker:0|>` tag
+    # that keeps Fish Speech on the reference voice.
+    tts_text_prefix: str = Field(default="")
+    # Request-body fields forwarded verbatim (`stream_format`, `extra_params`,
+    # `sample_rate`, ...). The fields the engine sets itself (`model`, `input`,
+    # `voice`, `response_format`, `stream`) cannot be overridden here.
+    tts_extra_body: Dict[str, Any] = Field(default_factory=dict)
+    # Directory, inside the engine container, that holds reference samples a
+    # self-hosted speech endpoint can register as voices (Providers page,
+    # *Reference voice*); the engine reads the file and uploads it.
+    tts_voices_dir: str = Field(default="/voices")
     default_modalities: List[str] = Field(default_factory=lambda: ["text"])
     input_encoding: str = Field(default="linear16")
     input_sample_rate_hz: int = Field(default=24000)
@@ -495,8 +596,14 @@ class ElevenLabsProviderConfig(BaseModel):
     model_id: str = Field(default="eleven_turbo_v2_5")  # Fast, high-quality
     base_url: str = Field(default="https://api.elevenlabs.io/v1")
     # Audio settings
-    output_format: str = Field(default="ulaw_8000")  # ulaw_8000, mp3_44100, pcm_16000, etc.
+    # Raw formats the adapter decodes: pcm_8000 .. pcm_48000, ulaw_8000,
+    # alaw_8000. mp3_* and opus_* are valid API values the engine cannot decode.
+    output_format: str = Field(default="ulaw_8000")
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    # Play audio as it arrives from /text-to-speech/{voice}/stream instead of
+    # waiting for the whole sentence. Ignored when the requested output_format
+    # needs resampling to the call's transport rate.
+    stream: bool = Field(default=True)
     # Voice settings
     stability: float = Field(default=0.5)
     similarity_boost: float = Field(default=0.75)
@@ -504,6 +611,19 @@ class ElevenLabsProviderConfig(BaseModel):
     use_speaker_boost: bool = Field(default=True)
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
+    # Optional HTTP proxy for ElevenLabs requests only, so one foreign leg can
+    # be routed out through a tunnel while every other component stays direct.
+    # Credentials may be written into the URL: http://user:pass@host:port
+    proxy: Optional[str] = None
+    # How long an idle upstream connection is kept for reuse. Through a proxy a
+    # dropped connection costs a full TLS handshake mid-conversation, so a
+    # window longer than aiohttp's 15 s default is usually worth it.
+    keepalive_timeout_sec: Optional[float] = None
+    # No audio for this long, before the first byte or between chunks, means a
+    # dead stream: the request is given up, retried once on fresh connections
+    # when nothing had arrived yet, and then fails the reply instead of holding
+    # the dialog until aiohttp's own five-minute limit. 0 turns the timeout off.
+    read_timeout_sec: float = Field(default=8.0, ge=0.0, le=120.0)
 
 
 class CambAiProviderConfig(BaseModel):
@@ -828,10 +948,24 @@ class BargeInConfig(BaseModel):
     # Minimum TTS elapsed time (ms) before TalkDetect barge-in is honoured.
     # Higher than initial_protection_ms to reject phone-echo triggering TALK_DETECT.
     talk_detect_initial_protection_ms: int = Field(default=1500)
+    # The window above never outlasts the reply: when the reply ends on its own
+    # while the caller is talking inside it, the window ends with the reply and
+    # what they said over its tail is theirs (Silero cuts the utterance whole,
+    # unmuted). False keeps the window running to its configured end, as
+    # before, for lines whose echo of a short reply outlasts the reply.
+    protection_ends_with_reply: bool = Field(default=True)
     # New: short guard window after TTS ends to avoid self-echo re-capture
     post_tts_end_protection_ms: int = Field(default=250)
     # Extra protection during the first greeting turn
     greeting_protection_ms: int = Field(default=0)
+    # Pipelines with Silero VAD: keep sending the caller's audio to the
+    # recognizer while the agent speaks instead of silence. The caller's words
+    # over a reply are then transcribed whether or not they interrupt it; the
+    # protection window above still decides when speech may interrupt. Off,
+    # the recognizer gets silence for the stretch in which the agent is
+    # audible, as before. Needs echo cancellation on the line or a caller
+    # whose phone does not return the agent's voice.
+    pipeline_listen_during_playback: bool = Field(default=False)
     # Provider-owned mode: local VAD fallback for providers whose server-side
     # interruption event may be disabled or unavailable for a given agent.
     provider_fallback_enabled: bool = Field(default=True)
@@ -920,6 +1054,71 @@ class VADConfig(BaseModel):
     upstream_squelch_min_speech_frames: int = 2
     upstream_squelch_end_silence_frames: int = 15
 
+    # Silero VAD: a neural caller-speech detector for modular pipelines, run in
+    # the engine on the frames that reach the recognizer. When enabled it drives
+    # barge-in and the inactivity watchdog, decides the end of the caller's turn
+    # (end_of_turn_source auto/vad) and tells the recognizer to finalize the
+    # moment the caller stops. The model file is fetched into silero_model_path
+    # on first start when silero_auto_download is true.
+    silero_enabled: bool = Field(default=False)
+    silero_model_path: str = Field(default="models/vad/silero_vad.onnx")
+    silero_auto_download: bool = Field(default=True)
+    # Speech probability at or above which a 32 ms chunk counts as speech.
+    silero_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Probability below which speech ends; defaults to silero_threshold - 0.15.
+    silero_stop_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    # Sustained speech before the caller counts as talking (barge-in and turn hold).
+    silero_start_ms: int = Field(default=96, ge=0)
+    # Silence after the last speech before the caller counts as quiet.
+    silero_stop_ms: int = Field(default=300, ge=0)
+    # The rate Silero scores the caller's audio at. Unset, the line's own rate
+    # (8 or 16 kHz; any other rate is converted to 16 kHz). 16000 scores 8 kHz
+    # telephone audio at 16 kHz, upsampled first: after a silent line Silero's
+    # 8 kHz model put short answers ("да", "алло") right at the threshold,
+    # its 16 kHz model well above it. 8000 scores wideband audio at 8 kHz.
+    # Only Silero gets the converted audio; the recognizer, Smart Turn and the
+    # energy checks keep the line's own.
+    silero_sample_rate: Optional[Literal[8000, 16000]] = Field(default=None)
+    # Silence fed to the recognizer once the caller is quiet so it finalizes at
+    # once instead of waiting out its own gate (T-one holds 600 ms); 0 disables.
+    silero_stt_finalize_ms: int = Field(default=900, ge=0)
+    # Let Silero speech during agent playback trigger barge-in.
+    silero_barge_in: bool = Field(default=True)
+    # The recognizer gets whole utterances cut by Silero instead of a
+    # continuous stream: the engine keeps the caller's audio, and the moment
+    # Silero reports them quiet it sends everything since a little before the
+    # start of their speech as one utterance, which the recognizer decodes
+    # without a voice activity detector of its own (Local AI Server: GigaAM v3
+    # / NeMo through onnx-asr, Sherpa offline, the Whisper family). Nothing is
+    # streamed in between and no finalize burst is needed.
+    silero_stt_utterances: bool = Field(default=False)
+    # Audio taken before the frame Silero called the start of speech (its
+    # start_ms of confirmation and the onset consonant before it).
+    silero_utterance_preroll_ms: int = Field(default=300, ge=0, le=2000)
+    # A caller who never pauses is cut into pieces of at most this length,
+    # at the newest quiet chunk in the second half of the piece.
+    silero_utterance_max_ms: int = Field(default=20000, ge=2000, le=60000)
+
+    # Smart Turn v3 (pipecat-ai/smart-turn): the semantic layer above Silero
+    # VAD. When Silero reports the caller quiet, the model scores the caller's
+    # own audio for whether the turn is complete; an incomplete verdict holds
+    # the turn up to smart_turn_incomplete_hold_ms in case the caller goes on.
+    # Needs vad.silero_enabled; the model is fetched into
+    # smart_turn_model_path on first start when smart_turn_auto_download is true.
+    smart_turn_enabled: bool = Field(default=False)
+    smart_turn_model_path: str = Field(default="models/turn/smart-turn-v3.2-cpu.onnx")
+    smart_turn_auto_download: bool = Field(default=True)
+    # Probability of completion at or above which the turn is released at once.
+    smart_turn_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # How long an incomplete verdict may hold the turn beyond the Silero stop.
+    smart_turn_incomplete_hold_ms: int = Field(default=3000, ge=0)
+    # How much of the trailing silence the model is shown after the last speech.
+    smart_turn_trailing_silence_ms: int = Field(default=200, ge=0)
+    # How long the turn waits for a verdict before proceeding without one.
+    smart_turn_timeout_ms: int = Field(default=500, ge=0)
+    # CPU threads for one inference; one is enough for a 50 ms model.
+    smart_turn_threads: int = Field(default=1, ge=1)
+
 
 class NoInputConfig(BaseModel):
     """Provider-independent caller inactivity policy.
@@ -940,6 +1139,17 @@ class NoInputConfig(BaseModel):
         min_length=1,
         max_length=500,
     )
+    # Hang up once nothing has been exchanged for this long: no caller words
+    # reached the model and the agent did not finish an utterance. Unlike the
+    # check-ins it ignores the caller-speech detectors, so hold music, noise
+    # or an IVR cannot keep the call open, and it applies to inbound and
+    # outbound calls alike (only `enabled` gates it). 0 disables it.
+    stall_timeout_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
+    # Hang up when the call has lasted this long, whatever it is doing: a hard
+    # cap counted from the call's start that nothing pauses (a transfer in
+    # progress only delays it). Inbound and outbound alike; only `enabled`
+    # gates it. 0 disables it.
+    max_call_duration_sec: float = Field(default=0.0, ge=0.0, le=86400.0)
 
     @field_validator("check_in_message", "final_message")
     @classmethod
@@ -949,6 +1159,15 @@ class NoInputConfig(BaseModel):
         if not normalized:
             raise ValueError("caller inactivity announcement messages must not be blank")
         return normalized
+
+
+# Asked of the model, in place of a caller turn, when the speech that cut a
+# pipeline reply off came to nothing (streaming.pipeline_continue_reply_prompt).
+DEFAULT_CONTINUE_REPLY_PROMPT = (
+    "(The caller interrupted you, but nothing intelligible was said. Continue your "
+    "previous reply from where it was cut off, without repeating what you already "
+    "said. If none of it was heard, say it again.)"
+)
 
 
 class StreamingConfig(BaseModel):
@@ -985,6 +1204,39 @@ class StreamingConfig(BaseModel):
     # Overlap LLM token streaming with TTS synthesis in modular pipelines.
     # Streams tokens → splits into sentences → synthesizes each sentence concurrently.
     pipeline_streaming_overlap: bool = Field(default=True)
+    # Interrupted pipeline replies: keep in the conversation history only what the
+    # caller could hear, estimated from the audio that had reached the transport when
+    # the barge-in cut the stream (whole sentences plus a proportional prefix of the
+    # cut one, marked with an ellipsis). Off: the whole reply (serial mode) or the
+    # sentences queued so far (overlap mode) stay in the history, as before.
+    pipeline_heard_reply_on_interrupt: bool = Field(default=True)
+    # Audio already sent to the transport but not yet heard when the caller spoke
+    # (transport latency and the caller's reaction); subtracted from the played position.
+    pipeline_heard_reply_lead_ms: int = Field(default=200, ge=0, le=5000)
+    # After the caller hangs up, how long the call's cleanup waits for the words
+    # still in the recognizer (a VAD-gated model returns a phrase only after its
+    # closing silence, which the cleanup feeds it) before the call record is
+    # written; the result is the caller's last turn, with no LLM reply. 0 = off.
+    pipeline_hangup_final_wait_ms: int = Field(default=1500, ge=0, le=10000)
+    # Pipelines with Silero VAD: when the caller goes on talking after their
+    # turn was released and before the first sound of the reply has reached
+    # them, that reply is discarded (the LLM request is cancelled, no TTS is
+    # requested, an unplayed stream is dropped) and their words are kept to be
+    # answered together with what they say next, as one turn. Off: discard
+    # caller input during generation and until the first sound, without
+    # queueing another turn. Audible replies retain normal barge-in protection.
+    pipeline_discard_unheard_reply: bool = Field(default=True)
+    # Pipelines: when the speech that cut a reply off (barge-in) comes back from
+    # the recognizer empty (a cough, noise, nothing intelligible), the reply is
+    # continued from where it stopped: the model is asked, with the heard part
+    # in front of it, to go on, and the continuation joins the heard part in the
+    # history. The request is not a caller turn and leaves no trace. Off: the
+    # reply stays cut off until the caller says something the recognizer
+    # understands.
+    pipeline_continue_reply_after_empty_interrupt: bool = Field(default=True)
+    # The request sent to the model in place of a caller turn; never stored.
+    # Blank falls back to DEFAULT_CONTINUE_REPLY_PROMPT.
+    pipeline_continue_reply_prompt: str = Field(default="")
     # Play a brief filler phrase (e.g. "One moment please.") via the pipeline TTS
     # adapter immediately when a user turn is detected, before LLM inference starts.
     pipeline_filler_enabled: bool = Field(default=False)

@@ -491,6 +491,8 @@ class ToolRuntimeGeneration:
         snapshot = copy.deepcopy(dict(config or {}))
         registry = ToolRegistry.isolated()
         registry.initialize_default_tools()
+        registry.configure_tools(snapshot.get("tools") or {})
+        registry.apply_definition_overrides(snapshot.get("tools") or {})
         registry.initialize_http_tools_from_config(snapshot.get("tools") or {})
         registry.initialize_in_call_http_tools_from_config(
             snapshot.get("in_call_tools") or {}, cache_key="global"

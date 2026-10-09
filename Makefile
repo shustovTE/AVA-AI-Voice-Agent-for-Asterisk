@@ -6,6 +6,9 @@ SERVER_HOST := your-server.example.com
 PROJECT_PATH := /root/Asterisk-Agent-Develop
 SERVICE ?= ai_engine
 provider ?= local
+DOCKER_COMPOSE ?= docker compose -p asterisk-ai-voice-agent
+# docker-compose.yml is the operator's local copy of the tracked template.
+COMPOSE_BASE := $(if $(wildcard docker-compose.yml),docker-compose.yml,docker-compose.example.yml)
 
 # ------------------------------------------------------------------------------
 # Localhost vs Remote operation
@@ -346,17 +349,17 @@ monitor-externalmedia-once:
 ## monitor-up: Start Prometheus +Grafana monitoring stack (host network)
 monitor-up:
 	@echo "--> Starting monitoring stack (Prometheus +Grafana) on host network..."
-	$(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.monitor.yml up -d prometheus grafana
+	$(DOCKER_COMPOSE) -f $(COMPOSE_BASE) -f docker-compose.monitor.yml up -d prometheus grafana
 
 ## monitor-down: Stop monitoring stack
 monitor-down:
 	@echo "--> Stopping monitoring stack..."
-	$(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.monitor.yml down
+	$(DOCKER_COMPOSE) -f $(COMPOSE_BASE) -f docker-compose.monitor.yml down
 
 ## monitor-logs: Tail monitoring stack logs
 monitor-logs:
 	@echo "--> Tailing Prometheus +Grafana logs... (Ctrl+C to exit)"
-	$(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.monitor.yml logs -f prometheus grafana
+	$(DOCKER_COMPOSE) -f $(COMPOSE_BASE) -f docker-compose.monitor.yml logs -f prometheus grafana
 
 ## capture-logs: Capture structured logs during test call (default: 40 seconds)
 capture-logs:

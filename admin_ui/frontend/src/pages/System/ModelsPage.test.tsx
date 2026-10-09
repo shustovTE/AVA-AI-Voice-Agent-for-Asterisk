@@ -165,6 +165,42 @@ describe('ModelsPage Local AI status', () => {
         expect(screen.getAllByText('en_US-lessac-medium.onnx').length).toBeGreaterThan(0);
     });
 
+    it('shows the onnx-asr device and quantization the server reports instead of the defaults', async () => {
+        liveStatusState.current.snapshot = {
+            ...liveStatusSnapshot(),
+            components: {
+                local_ai_server: {
+                    ...localAIComponent,
+                    details: {
+                        ...localAIComponent.details,
+                        models: {
+                            ...localAIComponent.details.models,
+                            stt: {
+                                backend: 'onnx_asr',
+                                path: 'gigaam-v3-e2e-ctc',
+                                loaded: true,
+                                display: 'onnx-asr (gigaam-v3-e2e-ctc, cuda)',
+                                onnx_asr_model: 'gigaam-v3-e2e-ctc',
+                                onnx_asr_device: 'cuda',
+                                onnx_asr_quantization: 'int8',
+                            },
+                        },
+                    },
+                },
+            },
+        };
+        mockModelsPageApis();
+
+        render(
+            <MemoryRouter>
+                <ModelsPage />
+            </MemoryRouter>
+        );
+
+        await waitFor(() => expect(screen.getByDisplayValue('int8')).toBeInTheDocument());
+        expect(screen.getByDisplayValue('CUDA')).toBeInTheDocument();
+    });
+
     it('falls back to legacy health status when pushed Local AI state is unknown', async () => {
         liveStatusState.current.snapshot = {
             ...liveStatusSnapshot(),

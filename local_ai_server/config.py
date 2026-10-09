@@ -34,6 +34,21 @@ def _parse_int(raw: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _parse_choice(raw: Optional[str], choices: tuple, default: str, *, upper: bool = False) -> str:
+    """One of ``choices`` (case-insensitive), else ``default``."""
+    value = (raw or "").strip()
+    value = value.upper() if upper else value.lower()
+    return value if value in choices else default
+
+
+def _parse_stt_resampler(raw: Optional[str]) -> str:
+    """``LOCAL_STT_RESAMPLER``: ``fir`` (polyphase windowed-sinc) unless ``ratecv`` is asked for."""
+    value = (raw or "").strip().lower()
+    if value in ("fir", "ratecv"):
+        return value
+    return "fir"
+
+
 def llama_chat_format_override(raw: Optional[str]) -> Optional[str]:
     """Return the explicit llama.cpp chat handler, if one was requested.
 
@@ -63,6 +78,27 @@ def _env_with_legacy_alias(primary: str, legacy: str, default: str) -> str:
     return default
 
 
+def normalize_onnx_asr_model(model: str, model_path: str = "") -> tuple[str, str]:
+    """Return (model name, model directory) for the onnx_asr backend.
+
+    A directory given where a model name belongs (``ONNX_ASR_MODEL=/app/models/stt/onnx-asr/gigaam-v3-e2e-ctc``)
+    would be read by onnx-asr as a Hugging Face repo id and fail; its last component is the model name instead
+    (``__`` stands for ``/`` in the cache layout). The directory becomes the model directory only when it holds
+    files; an empty or missing one leaves the name to be downloaded into the cache as usual. A Hugging Face
+    repo id such as ``t-tech/t-one`` is a name, not a path.
+    """
+    model = (model or "").strip()
+    model_path = (model_path or "").strip()
+    looks_like_dir = bool(model) and (os.path.isabs(model) or ("/" in model and os.path.isdir(model)))
+    if looks_like_dir:
+        directory = model.rstrip("/")
+        name = os.path.basename(directory).replace("__", "/")
+        if not model_path and os.path.isdir(directory) and os.listdir(directory):
+            model_path = directory
+        model = name
+    return model, model_path
+
+
 @dataclass(frozen=True)
 class LocalAIConfig:
     runtime_mode: str = "full"
@@ -83,9 +119,38 @@ class LocalAIConfig:
     sherpa_vad_min_silence_ms: int = 700
     sherpa_vad_min_speech_ms: int = 200
     sherpa_offline_preroll_ms: int = 350
+    # VAD-gated offline recognizers (Sherpa offline, onnx-asr): audio kept after a
+    # segment's end, the loudness a segment is brought to before decoding (RMS of
+    # its speech part in dBFS; 0 turns it off) with the largest boost allowed, and
+    # how 8 kHz client audio is brought to 16 kHz (fir | ratecv).
+    sherpa_offline_postroll_ms: int = 300
+    sherpa_offline_normalize_dbfs: float = -20.0
+    sherpa_offline_normalize_max_gain_db: float = 24.0
+    local_stt_resampler: str = "fir"
     tone_model_path: str = "/app/models/stt/t-one"
     tone_decoder_type: str = "beam_search"
     tone_kenlm_path: str = ""
+    # onnx-asr backend (GigaAM v3, NeMo FastConformer RU): model name (auto-downloaded
+    # from Hugging Face into cache_dir/<model>) or an explicit directory with the files.
+    onnx_asr_model: str = "gigaam-v3-e2e-ctc"
+    onnx_asr_model_path: str = ""
+    onnx_asr_cache_dir: str = "/app/models/stt/onnx-asr"
+    onnx_asr_quantization: str = ""
+    onnx_asr_device: str = "auto"
+    # Runtime placement of the pieces around the encoder. A transducer (RNNT)
+    # runs its decoder and joiner once per encoder frame on tiny tensors: on
+    # the CPU that is a fraction of a millisecond per step, on CUDA a launch
+    # plus two copies. The mel spectrogram is the same story. "cpu" keeps them
+    # on the CPU whatever the model's device; "model" follows the model.
+    onnx_asr_decoder_device: str = "cpu"
+    onnx_asr_preprocessor: str = "cpu"
+    # onnxruntime's cuDNN convolution algorithm search for the CUDA provider:
+    # EXHAUSTIVE (its default) benchmarks every algorithm again for every new
+    # input length, HEURISTIC picks one at once, DEFAULT is cuDNN's own choice.
+    onnx_asr_cudnn_algo_search: str = "HEURISTIC"
+    # Decode a few silent utterances at start so the first real one does not
+    # pay for lazy initialization and the arena growth.
+    onnx_asr_warmup: bool = True
     faster_whisper_model: str = "base"
     faster_whisper_device: str = "cpu"
     faster_whisper_compute: str = "int8"
@@ -255,6 +320,9 @@ class LocalAIConfig:
             or "5000"
         )
 
+        onnx_asr_model, onnx_asr_model_path = normalize_onnx_asr_model(
+            os.getenv("ONNX_ASR_MODEL", "gigaam-v3-e2e-ctc"), os.getenv("ONNX_ASR_MODEL_PATH", "")
+        )
         return cls(
             runtime_mode=runtime_mode,
             ws_host=os.getenv("LOCAL_WS_HOST", "127.0.0.1"),
@@ -273,9 +341,28 @@ class LocalAIConfig:
             sherpa_vad_min_silence_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SILENCE_MS"), 700),
             sherpa_vad_min_speech_ms=_parse_int(os.getenv("SHERPA_VAD_MIN_SPEECH_MS"), 200),
             sherpa_offline_preroll_ms=_parse_int(os.getenv("SHERPA_OFFLINE_PREROLL_MS"), 350),
+            sherpa_offline_postroll_ms=_parse_int(os.getenv("SHERPA_OFFLINE_POSTROLL_MS"), 300),
+            sherpa_offline_normalize_dbfs=_parse_float(os.getenv("SHERPA_OFFLINE_NORMALIZE_DBFS"), -20.0),
+            sherpa_offline_normalize_max_gain_db=_parse_float(
+                os.getenv("SHERPA_OFFLINE_NORMALIZE_MAX_GAIN_DB"), 24.0
+            ),
+            local_stt_resampler=_parse_stt_resampler(os.getenv("LOCAL_STT_RESAMPLER")),
             tone_model_path=os.getenv("TONE_MODEL_PATH", "/app/models/stt/t-one"),
             tone_decoder_type=(os.getenv("TONE_DECODER_TYPE", "beam_search") or "beam_search").strip().lower(),
             tone_kenlm_path=os.getenv("TONE_KENLM_PATH", ""),
+            onnx_asr_model=onnx_asr_model or "gigaam-v3-e2e-ctc",
+            onnx_asr_model_path=onnx_asr_model_path,
+            onnx_asr_cache_dir=(
+                os.getenv("ONNX_ASR_CACHE_DIR", "/app/models/stt/onnx-asr") or "/app/models/stt/onnx-asr"
+            ).strip(),
+            onnx_asr_quantization=(os.getenv("ONNX_ASR_QUANTIZATION", "") or "").strip().lower(),
+            onnx_asr_device=(os.getenv("ONNX_ASR_DEVICE", "auto") or "auto").strip().lower(),
+            onnx_asr_decoder_device=_parse_choice(os.getenv("ONNX_ASR_DECODER_DEVICE"), ("cpu", "model"), "cpu"),
+            onnx_asr_preprocessor=_parse_choice(os.getenv("ONNX_ASR_PREPROCESSOR"), ("cpu", "model"), "cpu"),
+            onnx_asr_cudnn_algo_search=_parse_choice(
+                os.getenv("ONNX_ASR_CUDNN_ALGO_SEARCH"), ("HEURISTIC", "DEFAULT", "EXHAUSTIVE"), "HEURISTIC", upper=True
+            ),
+            onnx_asr_warmup=_parse_bool(os.getenv("ONNX_ASR_WARMUP", "1")),
             faster_whisper_model=os.getenv("FASTER_WHISPER_MODEL", "base"),
             faster_whisper_device=os.getenv("FASTER_WHISPER_DEVICE", "cpu"),
             faster_whisper_compute=os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8"),

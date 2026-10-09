@@ -1,0 +1,58 @@
+# Fish Speech S2-Pro on a self-hosted vLLM-Omni server as the pipeline TTS, streamed.
+#
+# Server side (see docs/Configuration-Reference.md, "Self-hosted speech endpoints"):
+#   vllm serve fishaudio/s2-pro --omni --port 8091            # vLLM-Omni 0.30+, the DAC codec is built in
+#   curl -X POST http://localhost:8091/v1/audio/voices \      # register the reference voice once
+#       -F "audio_sample=@anna.wav" -F "name=anna" -F "ref_text=<exact transcript>" -F "consent=anna-2026"
+#
+# The STT and LLM components below are the cloud OpenAI ones from cloud_only_openai.yaml;
+# any other pipeline STT/LLM pair works the same way.
+
+providers:
+  openai_llm:
+    type: openai
+    api_key: ${OPENAI_API_KEY}
+    chat_base_url: https://api.openai.com/v1
+    chat_model: gpt-4o-mini
+    tools_enabled: true
+  openai_stt:
+    type: openai
+    api_key: ${OPENAI_API_KEY}
+    stt_base_url: https://api.openai.com/v1/audio/transcriptions
+    stt_model: whisper-1
+    response_format: json
+    temperature: 0
+  fish_tts:
+    type: openai
+    api_key: local                      # vLLM-Omni without --api-key ignores it; the adapter needs a value
+    tts_base_url: http://10.0.0.5:8091/v1/audio/speech
+    tts_model: fishaudio/s2-pro
+    voice: anna                         # registered via POST /v1/audio/voices, or from the Providers page
+    tts_response_format: pcm            # the request's response_format: pcm or wav
+    tts_streaming: true                 # frames are played while the sentence is still being generated
+    tts_pcm_sample_rate_hz: 44100       # S2-Pro speaks 44.1 kHz and vLLM-Omni cannot resample it
+    tts_text_prefix: "<|speaker:0|>"    # keeps the model on the reference voice
+    tts_extra_body:
+      stream_format: audio              # raw PCM chunks instead of server-sent events
+      extra_params:                     # Slow AR sampling; the deploy-config defaults are 0.8 / 0.9
+        top_p: 0.8
+        temperature: 0.7
+    target_encoding: mulaw
+    target_sample_rate_hz: 8000
+    output_resampler: bandlimited       # low-pass before 44.1 kHz is brought down to the call's rate
+    response_timeout_sec: 5             # the endpoint may stay silent this long between two chunks
+
+pipelines:
+  fish_s2_vllm_omni:
+    stt: openai_stt
+    llm: openai_llm
+    tts: fish_tts
+    options:
+      llm:
+        use_realtime: false
+      tts:
+        format:
+          encoding: mulaw
+          sample_rate: 8000
+
+active_pipeline: fish_s2_vllm_omni

@@ -41,6 +41,9 @@ DEFAULT_HANGUP_MARKERS: Dict[str, List[str]] = {
         "thank you for calling",
         "have a great day",
         "take care",
+        "до свидания",
+        "всего доброго",
+        "всего хорошего",
     ],
     "affirmative": [
         "yes",
@@ -77,6 +80,10 @@ DEFAULT_HANGUP_POLICY: Dict[str, Any] = {
     "mode": "normal",
     "enforce_transcript_offer": True,
     "block_during_contact_capture": True,
+    # Opt-in: terminate the call after the ASSISTANT speaks an
+    # assistant_farewell marker at the end of an utterance. Complements the
+    # hangup_call tool for providers whose platform-side agent never calls it.
+    "hangup_on_assistant_farewell": False,
     "markers": DEFAULT_HANGUP_MARKERS,
 }
 
@@ -163,6 +170,12 @@ def normalize_hangup_policy(policy: Any) -> Dict[str, Any]:
         "block_during_contact_capture": bool(
             policy.get("block_during_contact_capture", DEFAULT_HANGUP_POLICY["block_during_contact_capture"])
         ),
+        "hangup_on_assistant_farewell": bool(
+            policy.get(
+                "hangup_on_assistant_farewell",
+                DEFAULT_HANGUP_POLICY["hangup_on_assistant_farewell"],
+            )
+        ),
         "markers": markers,
     }
 
@@ -189,10 +202,18 @@ def normalize_agent_hangup_policy(value: Any) -> Dict[str, Any]:
 
     if any(not isinstance(key, str) for key in value):
         raise HangupPolicyConfigError("hangup policy field names must be strings")
-    unknown = sorted(set(value) - {"strategy", "end_call"})
+    unknown = sorted(
+        set(value) - {"strategy", "end_call", "assistant_farewell", "hangup_on_assistant_farewell"}
+    )
     if unknown:
         raise HangupPolicyConfigError(
             f"unsupported hangup policy field(s): {', '.join(unknown)}"
+        )
+
+    hangup_on_farewell: Any = value.get("hangup_on_assistant_farewell")
+    if hangup_on_farewell is not None and not isinstance(hangup_on_farewell, bool):
+        raise HangupPolicyConfigError(
+            "hangup_on_assistant_farewell must be a boolean"
         )
 
     strategy = str(value.get("strategy") or "inherit").strip().lower()
@@ -200,40 +221,60 @@ def normalize_agent_hangup_policy(value: Any) -> Dict[str, Any]:
         raise HangupPolicyConfigError(
             "hangup strategy must be inherit, extend, or replace"
         )
+
+    def _normalized_marker_list(field: str, raw: Any) -> List[str]:
+        if not isinstance(raw, list):
+            raise HangupPolicyConfigError(f"{field} must be an array")
+        if len(raw) > MAX_AGENT_END_CALL_MARKERS:
+            raise HangupPolicyConfigError(
+                f"{field} supports at most {MAX_AGENT_END_CALL_MARKERS} markers"
+            )
+        normalized: List[str] = []
+        seen = set()
+        for raw_marker in raw:
+            if not isinstance(raw_marker, str):
+                raise HangupPolicyConfigError(f"{field} entries must be strings")
+            marker = " ".join(raw_marker.strip().lower().split())
+            if not marker:
+                raise HangupPolicyConfigError(f"{field} entries must not be empty")
+            if len(marker) > MAX_AGENT_END_CALL_MARKER_LENGTH:
+                raise HangupPolicyConfigError(
+                    f"{field} entries must be at most {MAX_AGENT_END_CALL_MARKER_LENGTH} characters"
+                )
+            if marker not in seen:
+                normalized.append(marker)
+                seen.add(marker)
+        return normalized
+
     raw_markers = value.get("end_call")
+    raw_farewell = value.get("assistant_farewell")
     if strategy == "inherit":
         if raw_markers not in (None, []):
             raise HangupPolicyConfigError(
                 "end_call markers may only be set when strategy is extend or replace"
             )
+        if raw_farewell not in (None, []):
+            raise HangupPolicyConfigError(
+                "assistant_farewell markers may only be set when strategy is extend or replace"
+            )
+        if isinstance(hangup_on_farewell, bool):
+            return {"hangup_on_assistant_farewell": hangup_on_farewell}
         return {}
     if not isinstance(raw_markers, list):
         raise HangupPolicyConfigError("end_call must be an array")
-    if len(raw_markers) > MAX_AGENT_END_CALL_MARKERS:
-        raise HangupPolicyConfigError(
-            f"end_call supports at most {MAX_AGENT_END_CALL_MARKERS} markers"
-        )
-
-    markers: List[str] = []
-    seen = set()
-    for raw_marker in raw_markers:
-        if not isinstance(raw_marker, str):
-            raise HangupPolicyConfigError("end_call entries must be strings")
-        marker = " ".join(raw_marker.strip().lower().split())
-        if not marker:
-            raise HangupPolicyConfigError("end_call entries must not be empty")
-        if len(marker) > MAX_AGENT_END_CALL_MARKER_LENGTH:
-            raise HangupPolicyConfigError(
-                f"end_call entries must be at most {MAX_AGENT_END_CALL_MARKER_LENGTH} characters"
-            )
-        if marker not in seen:
-            markers.append(marker)
-            seen.add(marker)
+    markers = _normalized_marker_list("end_call", raw_markers)
     if not markers:
         raise HangupPolicyConfigError(
             f"{strategy} requires at least one end_call marker"
         )
-    return {"strategy": strategy, "end_call": markers}
+    result: Dict[str, Any] = {"strategy": strategy, "end_call": markers}
+    if raw_farewell not in (None, []):
+        result["assistant_farewell"] = _normalized_marker_list(
+            "assistant_farewell", raw_farewell
+        )
+    if isinstance(hangup_on_farewell, bool):
+        result["hangup_on_assistant_farewell"] = hangup_on_farewell
+    return result
 
 
 def dump_agent_hangup_policy(value: Any) -> str | None:
@@ -266,6 +307,18 @@ def resolve_effective_hangup_policy(
     elif strategy == "replace":
         policy["markers"]["end_call"] = list(override["end_call"])
         source = "agent_replace"
+    agent_farewell = override.get("assistant_farewell")
+    if agent_farewell:
+        if strategy == "extend":
+            policy["markers"]["assistant_farewell"] = _dedupe(
+                list(policy["markers"]["assistant_farewell"]) + list(agent_farewell)
+            )
+        elif strategy == "replace":
+            policy["markers"]["assistant_farewell"] = list(agent_farewell)
+    if "hangup_on_assistant_farewell" in override:
+        policy["hangup_on_assistant_farewell"] = bool(
+            override["hangup_on_assistant_farewell"]
+        )
 
     markers = list(policy["markers"]["end_call"])
     digest = hashlib.sha256(
@@ -334,6 +387,24 @@ def text_contains_end_call_intent(text: str, markers: Iterable[str]) -> bool:
         return True
     if normalized != _normalize_text(text):
         return text_contains_marker(_normalize_text(text), markers)
+    return False
+
+
+def text_ends_with_marker(text: str, markers: Iterable[str], window_chars: int = 48) -> bool:
+    """True when a marker occurs in the trailing window of the utterance.
+
+    Used for assistant-farewell hangup: the farewell must close the utterance
+    (allowing trailing punctuation or a short tail such as "Хорошего дня"), so
+    a marker mentioned mid-sentence cannot drop the call.
+    """
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    tail = normalized[-max(1, int(window_chars)):]
+    for raw_marker in markers or []:
+        marker = _normalize_text(str(raw_marker))
+        if marker and marker in tail:
+            return True
     return False
 
 

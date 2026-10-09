@@ -112,6 +112,7 @@ async def test_outbound_store_recovers_active_attempt_lead_context(tmp_path, mon
         "lead_name": "Alice",
         "custom_vars_valid": True,
         "custom_vars": {"task": "confirm"},
+        "caller_id_override": None,  # the lead's own Caller ID, for the identity the call is placed from
         "routing_method": "ai_agent",
     }
 
@@ -279,3 +280,113 @@ def test_outbound_schema_migration_marks_existing_selectors_as_ai_context(
 
     assert campaign_method == "ai_context"
     assert lead_method == "ai_context"
+
+
+@pytest.mark.asyncio
+async def test_update_lead_guards_states_and_validates_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("CALL_HISTORY_ENABLED", "true")
+    db_path = str(tmp_path / "call_history.db")
+
+    from src.core.outbound_store import OutboundStore
+
+    store = OutboundStore(db_path=db_path)
+    campaign = await store.create_campaign(
+        {
+            "name": "Test Campaign",
+            "timezone": "UTC",
+            "daily_window_start_local": "09:00",
+            "daily_window_end_local": "17:00",
+            "max_concurrent": 1,
+            "min_interval_seconds_between_calls": 0,
+            "default_context": "demo",
+            "voicemail_drop_mode": "upload",
+            "voicemail_drop_media_uri": "sound:ai-generated/test-vm",
+        }
+    )
+    campaign_id = campaign["id"]
+    csv_bytes = (
+        "phone_number,custom_vars\n"
+        '+15551230001,"{""task"":""old""}"\n'
+    ).encode("utf-8")
+    imported = await store.import_leads_csv(
+        campaign_id, csv_bytes, skip_existing=True, max_error_rows=20
+    )
+    assert imported["accepted"] == 1
+    lead_id = await store.get_lead_id_by_phone(campaign_id, "+1 (555) 123-0001")
+    assert lead_id
+
+    with pytest.raises(KeyError):
+        await store.update_lead("missing-lead", {"name": "x"})
+    with pytest.raises(ValueError):
+        await store.update_lead(lead_id, {"custom_vars": ["not", "a", "dict"]})
+    with pytest.raises(ValueError):
+        await store.update_lead(lead_id, {})
+
+    leased = await store.lease_pending_leads(campaign_id, limit=1, lease_seconds=60)
+    assert leased and leased[0]["id"] == lead_id
+    assert await store.update_lead(lead_id, {"name": "Nope"}) is None
+    assert await store.mark_lead_dialing(lead_id) is True
+    assert await store.update_lead(lead_id, {"name": "Nope"}) is None
+
+    await store.set_lead_state(lead_id, state="failed", last_outcome="error")
+    updated = await store.update_lead(lead_id, {"custom_vars": {"task": "retry"}})
+    assert updated["custom_vars"] == {"task": "retry"}
+    assert updated["state"] == "failed"
+
+    row = await store.get_lead(lead_id)
+    assert row["custom_vars"] == {"task": "retry"}
+    assert "custom_vars_json" not in row
+
+
+@pytest.mark.asyncio
+async def test_get_lead_detail_shows_a_lead_as_the_list_does(tmp_path, monkeypatch):
+    monkeypatch.setenv("CALL_HISTORY_ENABLED", "true")
+    from src.core.outbound_store import OutboundStore
+
+    store = OutboundStore(db_path=str(tmp_path / "call_history.db"))
+    campaign = await store.create_campaign(
+        {
+            "name": "Test Campaign",
+            "timezone": "UTC",
+            "daily_window_start_local": "09:00",
+            "daily_window_end_local": "17:00",
+            "max_concurrent": 1,
+            "min_interval_seconds_between_calls": 0,
+            "default_context": "demo",
+            "voicemail_drop_mode": "upload",
+            "voicemail_drop_media_uri": "sound:ai-generated/test-vm",
+        }
+    )
+    campaign_id = campaign["id"]
+    csv_bytes = ('phone_number,custom_vars\n+15551230001,"{""task"":""call back""}"\n').encode("utf-8")
+    assert (await store.import_leads_csv(campaign_id, csv_bytes, skip_existing=True, max_error_rows=20))["accepted"] == 1
+    lead_id = await store.get_lead_id_by_phone(campaign_id, "+15551230001")
+
+    # Never dialed: the lead's own fields, the attempt fields empty.
+    detail = await store.get_lead_detail(lead_id)
+    assert detail["id"] == lead_id
+    assert detail["phone_number"] == "+15551230001"
+    assert detail["custom_vars"] == {"task": "call back"}
+    assert "custom_vars_json" not in detail
+    assert detail["state"] == "pending"
+    assert detail["last_started_at_utc"] is None
+    assert detail["last_outcome_attempt"] is None
+
+    # After a dial attempt the most recent one rides along.
+    attempt_id = await store.create_attempt(campaign_id, lead_id, context="demo", provider="pipeline")
+    await store.finish_attempt(attempt_id, outcome="answered", amd_status="human", call_history_call_id="call-1")
+    detail = await store.get_lead_detail(lead_id)
+    assert detail["last_started_at_utc"]
+    assert detail["last_ended_at_utc"]
+    assert detail["last_outcome_attempt"] == "answered"
+    assert detail["last_amd_status"] == "human"
+    assert detail["last_context"] == "demo"
+    assert detail["last_provider"] == "pipeline"
+    assert detail["last_call_history_call_id"] == "call-1"
+
+    # Exactly what the campaign list shows for the same lead.
+    listed = (await store.list_leads(campaign_id))["leads"]
+    assert listed == [detail]
+
+    assert await store.get_lead_detail("no-such-lead") is None
+    assert await store.get_lead_detail("") is None

@@ -61,6 +61,16 @@ class SessionContext:
     # Sherpa-onnx session state
     sherpa_stream: Optional[Any] = None
     sherpa_offline_vad: Optional[Any] = None  # Per-session Silero VAD for offline mode
+    # onnx-asr (GigaAM v3 / NeMo) session state: its own Silero VAD gate and a
+    # lock so a trailing flush never races a decode running in a worker thread.
+    onnx_asr_vad: Optional[Any] = None
+    onnx_asr_lock: Optional[Any] = None
+    # VAD-gated offline STT (Sherpa offline, onnx-asr): the stream memory that
+    # widens a VAD segment with the audio really before and after it (kept for
+    # the whole session; only the VAD is recreated after a final) and the
+    # per-session 8 kHz -> 16 kHz FIR upsampler for clients that send 8 kHz.
+    stt_context: Optional[Any] = None
+    stt_upsampler: Optional[Any] = None
     # T-one session state
     tone_state: Optional[Any] = None
     tone_buffer_8k: bytes = b""
@@ -80,6 +90,11 @@ class SessionContext:
     # pipeline. None inherits the Local AI Server environment/default.
     stt_segment_energy_threshold: Optional[int] = None
     stt_segment_silence_ms: Optional[int] = None
+    # Who cuts the caller's utterances: "server" (the recognizer's own VAD on
+    # the audio stream) or "client" (the engine's VAD sends whole utterances
+    # as ``stt_utterance`` messages).
+    stt_segmenter: str = "server"
+    utterances_decoded: int = 0
     # Per-call TTS egress contract. Legacy clients omit these fields and retain
     # the historical μ-law/8 kHz behavior.
     tts_output_encoding: str = "mulaw"

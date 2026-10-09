@@ -44,7 +44,8 @@ class CallRecord:
     context_name: Optional[str]
     
     # Conversation
-    conversation_history: List[Dict]  # [{role, content, timestamp}]
+    conversation_history: List[Dict]  # [{role, content, timestamp, interrupted?, latency?}]
+                                      # latency: {asr_ms, wait_ms, llm_first_token_ms, llm_ms, tts_ms, turn_ms, response_ms} per reply
     
     # Outcome
     outcome: str                      # completed | transferred | error | abandoned

@@ -753,7 +753,7 @@ class _LegacyAudioProcessor:
 # Backends and audio processor are maintained in separate modules for easier development.
 from stt_backends import KrokoSTTBackend, SherpaONNXSTTBackend, ToneSTTBackend
 from tts_backends import KokoroTTSBackend
-from audio_processor import AudioProcessor, SynthesizedAudio
+from audio_processor import AudioProcessor, FirUpsampler, SynthesizedAudio
 
 
 class LocalAIServer:
@@ -796,6 +796,7 @@ class LocalAIServer:
             self.runtime_mode = "full"
         self.sherpa_backend: Optional[Any] = None  # SherpaONNXSTTBackend or SherpaOfflineSTTBackend
         self.tone_backend: Optional[ToneSTTBackend] = None
+        self.onnx_asr_backend: Optional[Any] = None  # OnnxAsrSTTBackend (GigaAM v3, NeMo)
         self.faster_whisper_backend: Optional["FasterWhisperSTTBackend"] = None
         self.whisper_cpp_backend: Optional["WhisperCppSTTBackend"] = None
         self.kokoro_backend: Optional[KokoroTTSBackend] = None
@@ -1050,9 +1051,18 @@ class LocalAIServer:
         self.sherpa_vad_min_silence_ms = config.sherpa_vad_min_silence_ms
         self.sherpa_vad_min_speech_ms = config.sherpa_vad_min_speech_ms
         self.sherpa_offline_preroll_ms = config.sherpa_offline_preroll_ms
+        self.sherpa_offline_postroll_ms = getattr(config, "sherpa_offline_postroll_ms", 0)
+        self.sherpa_offline_normalize_dbfs = getattr(config, "sherpa_offline_normalize_dbfs", 0.0)
+        self.sherpa_offline_normalize_max_gain_db = getattr(config, "sherpa_offline_normalize_max_gain_db", 24.0)
+        self.local_stt_resampler = getattr(config, "local_stt_resampler", "fir")
         self.tone_model_path = config.tone_model_path
         self.tone_decoder_type = config.tone_decoder_type
         self.tone_kenlm_path = config.tone_kenlm_path
+        self.onnx_asr_model = config.onnx_asr_model
+        self.onnx_asr_model_path = config.onnx_asr_model_path
+        self.onnx_asr_cache_dir = config.onnx_asr_cache_dir
+        self.onnx_asr_quantization = config.onnx_asr_quantization
+        self.onnx_asr_device = config.onnx_asr_device
         self.faster_whisper_model = config.faster_whisper_model
         self.faster_whisper_device = config.faster_whisper_device
         self.faster_whisper_compute = config.faster_whisper_compute
@@ -1275,12 +1285,22 @@ class LocalAIServer:
 
     async def _load_stt_model(self):
         """Load STT model based on configured backend."""
+        stale_onnx_asr = getattr(self, "onnx_asr_backend", None)
+        if self.stt_backend != "onnx_asr" and stale_onnx_asr is not None:
+            # Switched away from onnx-asr: release the model (and its GPU memory).
+            try:
+                stale_onnx_asr.shutdown()
+            except Exception:
+                logging.debug("onnx-asr backend shutdown failed", exc_info=True)
+            self.onnx_asr_backend = None
         if self.stt_backend == "kroko":
             await self._load_kroko_backend()
         elif self.stt_backend == "sherpa":
             await self._load_sherpa_backend()
         elif self.stt_backend == "tone":
             await self._load_tone_backend()
+        elif self.stt_backend == "onnx_asr":
+            await self._load_onnx_asr_backend()
         elif self.stt_backend == "faster_whisper":
             await self._load_faster_whisper_backend()
         elif self.stt_backend == "whisper_cpp":
@@ -1375,22 +1395,7 @@ class LocalAIServer:
             if model_type == "offline":
                 from stt_backends import SherpaOfflineSTTBackend
 
-                vad_path = getattr(self, "sherpa_vad_model_path", "") or ""
-                default_vad = "/app/models/vad/silero_vad.onnx"
-                if not vad_path:
-                    vad_path = default_vad
-                # Auto-download Silero VAD if missing
-                if not os.path.isfile(vad_path):
-                    vad_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
-                    vad_dir = os.path.dirname(vad_path)
-                    os.makedirs(vad_dir, exist_ok=True)
-                    logging.info("📥 SHERPA-OFFLINE - Downloading Silero VAD model to %s …", vad_path)
-                    try:
-                        import urllib.request
-                        await asyncio.to_thread(urllib.request.urlretrieve, vad_url, vad_path)
-                        logging.info("✅ SHERPA-OFFLINE - Silero VAD downloaded successfully (%d bytes)", os.path.getsize(vad_path))
-                    except Exception as dl_exc:
-                        logging.error("❌ SHERPA-OFFLINE - Failed to download Silero VAD: %s", dl_exc)
+                vad_path = await self._ensure_silero_vad_model(log_tag="SHERPA-OFFLINE")
                 logging.info(
                     "🎤 STT backend: Sherpa-onnx OFFLINE (VAD-gated, model=%s, vad=%s)",
                     self.sherpa_model_path,
@@ -1405,6 +1410,9 @@ class LocalAIServer:
                     vad_threshold=getattr(self.config, "sherpa_vad_threshold", 0.5),
                     vad_min_silence_ms=getattr(self.config, "sherpa_vad_min_silence_ms", 500),
                     vad_min_speech_ms=getattr(self.config, "sherpa_vad_min_speech_ms", 250),
+                    postroll_ms=getattr(self.config, "sherpa_offline_postroll_ms", 0),
+                    normalize_dbfs=getattr(self.config, "sherpa_offline_normalize_dbfs", 0.0),
+                    normalize_max_gain_db=getattr(self.config, "sherpa_offline_normalize_max_gain_db", 24.0),
                 )
             else:
                 logging.info("🎤 STT backend: Sherpa-onnx (local streaming ASR)")
@@ -1426,6 +1434,81 @@ class LocalAIServer:
         except Exception as exc:
             logging.error("❌ Failed to initialize Sherpa STT backend (%s): %s", model_type, exc)
             self.sherpa_backend = None
+            self.startup_errors["stt"] = str(exc)
+            if self.fail_fast:
+                raise
+
+    async def _ensure_silero_vad_model(self, *, log_tag: str) -> str:
+        """Resolve the Silero VAD model the VAD-gated offline backends share, downloading it when missing."""
+        vad_path = getattr(self, "sherpa_vad_model_path", "") or ""
+        if not vad_path:
+            vad_path = "/app/models/vad/silero_vad.onnx"
+        if not os.path.isfile(vad_path):
+            vad_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+            os.makedirs(os.path.dirname(vad_path), exist_ok=True)
+            logging.info("📥 %s - Downloading Silero VAD model to %s …", log_tag, vad_path)
+            try:
+                import urllib.request
+                await asyncio.to_thread(urllib.request.urlretrieve, vad_url, vad_path)
+                logging.info(
+                    "✅ %s - Silero VAD downloaded successfully (%d bytes)", log_tag, os.path.getsize(vad_path)
+                )
+            except Exception as dl_exc:
+                logging.error("❌ %s - Failed to download Silero VAD: %s", log_tag, dl_exc)
+        return vad_path
+
+    async def _load_onnx_asr_backend(self):
+        """Initialize the onnx-asr offline backend (GigaAM v3, NeMo FastConformer RU) behind the Silero VAD gate."""
+        try:
+            from stt_backends import OnnxAsrSTTBackend
+
+            vad_path = await self._ensure_silero_vad_model(log_tag="ONNX-ASR")
+            logging.info(
+                "🎤 STT backend: onnx-asr OFFLINE (VAD-gated, model=%s, device=%s, quantization=%s, vad=%s)",
+                self.onnx_asr_model,
+                self.onnx_asr_device,
+                self.onnx_asr_quantization or "fp32",
+                vad_path,
+            )
+            backend = OnnxAsrSTTBackend(
+                model=self.onnx_asr_model,
+                vad_model_path=vad_path,
+                model_path=self.onnx_asr_model_path,
+                cache_dir=self.onnx_asr_cache_dir,
+                quantization=self.onnx_asr_quantization,
+                device=self.onnx_asr_device,
+                decoder_device=getattr(self.config, "onnx_asr_decoder_device", "cpu"),
+                preprocessor=getattr(self.config, "onnx_asr_preprocessor", "cpu"),
+                cudnn_algo_search=getattr(self.config, "onnx_asr_cudnn_algo_search", "HEURISTIC"),
+                warmup=bool(getattr(self.config, "onnx_asr_warmup", True)),
+                sample_rate=PCM16_TARGET_RATE,
+                # The VAD gate is the one the Sherpa offline backend uses, with its tuning.
+                preroll_ms=getattr(self.config, "sherpa_offline_preroll_ms", 0),
+                vad_threshold=getattr(self.config, "sherpa_vad_threshold", 0.5),
+                vad_min_silence_ms=getattr(self.config, "sherpa_vad_min_silence_ms", 500),
+                vad_min_speech_ms=getattr(self.config, "sherpa_vad_min_speech_ms", 250),
+                postroll_ms=getattr(self.config, "sherpa_offline_postroll_ms", 0),
+                normalize_dbfs=getattr(self.config, "sherpa_offline_normalize_dbfs", 0.0),
+                normalize_max_gain_db=getattr(self.config, "sherpa_offline_normalize_max_gain_db", 24.0),
+            )
+            # The first start downloads the model; keep the event loop free meanwhile.
+            if not await asyncio.to_thread(backend.initialize):
+                raise RuntimeError(f"Failed to initialize onnx-asr backend for model {self.onnx_asr_model}")
+            previous = getattr(self, "onnx_asr_backend", None)
+            self.onnx_asr_backend = backend
+            if previous is not None and previous is not backend:
+                try:
+                    previous.shutdown()
+                except Exception:
+                    logging.debug("Previous onnx-asr backend shutdown failed", exc_info=True)
+            logging.info(
+                "✅ STT backend: onnx-asr initialized (model=%s, providers=%s)",
+                self.onnx_asr_model,
+                backend.providers,
+            )
+        except Exception as exc:
+            logging.error("❌ Failed to initialize onnx-asr STT backend: %s", exc)
+            self.onnx_asr_backend = None
             self.startup_errors["stt"] = str(exc)
             if self.fail_fast:
                 raise
@@ -2372,6 +2455,12 @@ class LocalAIServer:
             except Exception as exc:  # pragma: no cover
                 logging.debug("T-one backend shutdown failed: %s", exc, exc_info=True)
             self.tone_backend = None
+        if getattr(self, "onnx_asr_backend", None):
+            try:
+                self.onnx_asr_backend.shutdown()
+            except Exception as exc:  # pragma: no cover
+                logging.debug("onnx-asr backend shutdown failed: %s", exc, exc_info=True)
+            self.onnx_asr_backend = None
         if self.kokoro_backend:
             try:
                 self.kokoro_backend.shutdown()
@@ -3574,11 +3663,13 @@ class LocalAIServer:
             session.wcpp_audio_buffer = b""
         session.tone_buffer_8k = b""
         session.tone_state = None
-        # Sherpa offline: clear per-session VAD reference.
+        # Sherpa offline / onnx-asr: clear the per-session VAD reference.
         # The actual flush + emit should happen via the async
         # _flush_sherpa_offline_trailing() *before* calling this method
-        # whenever a websocket is available.
+        # whenever a websocket is available. ``session.stt_context`` (the
+        # stream memory behind the pre-roll of the next phrase) is kept.
         session.sherpa_offline_vad = None
+        session.onnx_asr_vad = None
         session.last_request_meta.clear()
         session.last_final_text = last_text
         session.last_final_norm = _normalize_text(last_text)
@@ -3599,7 +3690,7 @@ class LocalAIServer:
         if not hasattr(self.sherpa_backend, "finalize"):
             return
         try:
-            trailing = self.sherpa_backend.finalize(vad)
+            trailing = self.sherpa_backend.finalize(vad, session.stt_context)
             if not trailing:
                 return
             trailing_text = (trailing.get("text") or "").strip()
@@ -3626,6 +3717,46 @@ class LocalAIServer:
             )
         except Exception as exc:
             logging.debug("Sherpa offline trailing flush error: %s", exc)
+
+    async def _flush_onnx_asr_trailing(self, websocket, session: SessionContext) -> None:
+        """Flush the per-session onnx-asr VAD and emit any trailing speech.
+
+        Same contract as ``_flush_sherpa_offline_trailing``: call it before
+        ``_reset_stt_session()`` while the websocket may still be open.
+        """
+        backend = getattr(self, "onnx_asr_backend", None)
+        vad = getattr(session, "onnx_asr_vad", None)
+        if vad is None or backend is None:
+            return
+        try:
+            async with self._onnx_asr_session_lock(session):
+                trailing = await asyncio.to_thread(backend.finalize, vad, session.stt_context)
+            if not trailing:
+                return
+            trailing_text = (trailing.get("text") or "").strip()
+            if not trailing_text:
+                return
+            meta = session.last_request_meta or {}
+            mode = meta.get("mode", "stt")
+            request_id = meta.get("request_id")
+            logging.info(
+                "📝 ONNX-ASR - Emitting trailing speech: '%s' call_id=%s mode=%s",
+                trailing_text,
+                session.call_id,
+                mode,
+            )
+            await self._emit_stt_result(
+                websocket,
+                trailing_text,
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+            )
+        except Exception as exc:
+            logging.debug("onnx-asr trailing flush error: %s", exc)
 
     async def _flush_tone_trailing(self, websocket, session: SessionContext) -> None:
         """Flush pending T-one audio/state into final transcript events."""
@@ -3719,6 +3850,186 @@ class LocalAIServer:
             session.partial_emitted = False
         return session.recognizer
 
+    def _stt_is_vad_gated_offline(self) -> bool:
+        """Sherpa offline and onnx-asr decode VAD-cut phrases; they share the Whisper-style echo guard."""
+        if self.stt_backend == "onnx_asr":
+            return True
+        return self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
+
+    def _stt_supports_utterances(self) -> bool:
+        """Whether the active recognizer decodes a whole utterance the client's VAD cut (``stt_utterance``)."""
+        if self.mock_models:
+            return True
+        if self.stt_backend == "onnx_asr":
+            return getattr(self, "onnx_asr_backend", None) is not None
+        if self.stt_backend == "sherpa":
+            return (
+                getattr(self, "sherpa_model_type", "online") == "offline"
+                and getattr(self, "sherpa_backend", None) is not None
+            )
+        if self.stt_backend == "faster_whisper":
+            return getattr(self, "faster_whisper_backend", None) is not None
+        if self.stt_backend == "whisper_cpp":
+            return getattr(self, "whisper_cpp_backend", None) is not None
+        return False
+
+    async def _transcribe_utterance_pcm16(self, session: SessionContext, pcm16: bytes) -> Optional[str]:
+        """Decode one whole 16 kHz utterance with the active recognizer; None when it cannot."""
+        if self.mock_models:
+            return ""
+        backend_name = self.stt_backend
+        if backend_name == "onnx_asr":
+            backend = getattr(self, "onnx_asr_backend", None)
+            if backend is None:
+                return None
+            async with self._onnx_asr_session_lock(session):
+                result = await asyncio.to_thread(backend.transcribe_utterance, pcm16)
+            return None if result is None else str(result.get("text") or "")
+        if backend_name == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline":
+            backend = getattr(self, "sherpa_backend", None)
+            if backend is None or not hasattr(backend, "transcribe_utterance"):
+                return None
+            result = await asyncio.to_thread(backend.transcribe_utterance, pcm16)
+            return None if result is None else str(result.get("text") or "")
+        if backend_name in {"faster_whisper", "whisper_cpp"}:
+            backend = getattr(self, f"{backend_name}_backend", None)
+            if backend is None or not hasattr(backend, "transcribe_pcm16"):
+                return None
+            text = await asyncio.to_thread(backend.transcribe_pcm16, pcm16)
+            return str(text or "")
+        return None
+
+    async def _handle_stt_utterance(
+        self,
+        websocket,
+        session: SessionContext,
+        data: Dict[str, Any],
+    ) -> None:
+        """Decode one whole caller utterance the client's VAD cut and answer with one final.
+
+        The utterance arrives complete (pre-roll and closing silence
+        included), so no voice activity detection, no idle finalizer and no
+        echo guard apply: the client decided that this is speech to decode.
+        Exactly one ``stt_result`` answers each message, carrying the
+        ``utterance_id`` back, empty when nothing was recognized, with an
+        ``error`` when the active recognizer cannot decode utterances.
+        """
+        mode = self._normalize_mode(data.get("mode"), session)
+        request_id = data.get("request_id")
+        call_id = data.get("call_id")
+        utterance_id = data.get("utterance_id")
+        self._bind_session_call_id(session, call_id)
+        extra: Dict[str, Any] = {}
+        if utterance_id:
+            extra["utterance_id"] = str(utterance_id)
+
+        encoded_audio = data.get("data", "")
+        if not encoded_audio:
+            logging.warning("stt_utterance missing 'data' call_id=%s", session.call_id)
+            return
+        try:
+            audio_bytes = base64.b64decode(encoded_audio)
+        except Exception as exc:
+            logging.warning("Failed to decode base64 stt_utterance payload: %s", exc)
+            return
+        if not audio_bytes:
+            return
+
+        if not self._stt_supports_utterances():
+            logging.warning(
+                "🎙️ STT UTTERANCE - backend %s decodes no whole utterances call_id=%s",
+                self.stt_backend,
+                session.call_id,
+            )
+            await self._emit_stt_result(
+                websocket,
+                "",
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra={**extra, "error": "utterances_unsupported", "stt_utterances": False},
+            )
+            return
+
+        input_rate = int(data.get("rate", PCM16_TARGET_RATE))
+        if input_rate != PCM16_TARGET_RATE:
+            audio_bytes = await asyncio.to_thread(
+                self.audio_processor.resample_audio,
+                audio_bytes,
+                input_rate,
+                PCM16_TARGET_RATE,
+                "raw",
+                "raw",
+            )
+        session.stt_segmenter = "client"
+        session.last_request_meta = {"mode": mode, "request_id": request_id}
+        try:
+            session.last_audio_at = asyncio.get_running_loop().time()
+        except RuntimeError:
+            session.last_audio_at = 0.0
+        audio_ms = int(len(audio_bytes) / 2 * 1000 / PCM16_TARGET_RATE)
+
+        started = monotonic()
+        text = await self._transcribe_utterance_pcm16(session, audio_bytes)
+        if text is None:
+            logging.error(
+                "🎙️ STT UTTERANCE - decode failed call_id=%s utterance_id=%s",
+                session.call_id,
+                utterance_id,
+            )
+            await self._emit_stt_result(
+                websocket,
+                "",
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra={**extra, "error": "utterance_decode_failed"},
+            )
+            return
+        clean_text = (text or "").strip()
+        if clean_text and not any(ch.isalnum() for ch in clean_text):
+            # Punctuation alone is what a recognizer makes of noise.
+            clean_text = ""
+        session.utterances_decoded += 1
+        logging.info(
+            "📝 STT UTTERANCE - '%s' (audio=%dms took=%dms call_id=%s utterance_id=%s)",
+            clean_text,
+            audio_ms,
+            int((monotonic() - started) * 1000),
+            session.call_id,
+            utterance_id,
+        )
+        if mode == "stt":
+            sent = await self._emit_stt_result(
+                websocket,
+                clean_text,
+                session,
+                request_id,
+                source_mode=mode,
+                is_final=True,
+                is_partial=False,
+                confidence=None,
+                extra=extra,
+            )
+            if sent:
+                self._reset_stt_session(session, clean_text)
+            return
+        await self._handle_final_transcript(
+            websocket,
+            session,
+            request_id,
+            mode=mode,
+            text=clean_text,
+            confidence=None,
+            idle_promoted=False,
+        )
+
     def _stt_is_available(self) -> bool:
         if self.mock_models:
             return True
@@ -3728,6 +4039,8 @@ class LocalAIServer:
             return self.sherpa_backend is not None
         if self.stt_backend == "tone":
             return self.tone_backend is not None
+        if self.stt_backend == "onnx_asr":
+            return getattr(self, "onnx_asr_backend", None) is not None
         if self.stt_backend == "faster_whisper":
             return self.faster_whisper_backend is not None
         if self.stt_backend == "whisper_cpp":
@@ -3749,6 +4062,8 @@ class LocalAIServer:
             return await self._process_stt_stream_sherpa(session, audio_data, input_rate)
         elif self.stt_backend == "tone":
             return await self._process_stt_stream_tone(session, audio_data, input_rate)
+        elif self.stt_backend == "onnx_asr":
+            return await self._process_stt_stream_onnx_asr(session, audio_data, input_rate)
         elif self.stt_backend == "faster_whisper":
             return await self._process_stt_stream_faster_whisper(session, audio_data, input_rate)
         elif self.stt_backend == "whisper_cpp":
@@ -4032,8 +4347,14 @@ class LocalAIServer:
             logging.error("Sherpa backend not initialized")
             return []
 
+        # Offline backend uses per-session VAD + process_audio(vad, bytes, context);
+        # online uses stream-based API.
+        is_offline = hasattr(self.sherpa_backend, "create_session_vad")
+
         # Resample to 16kHz if needed
-        if input_rate != PCM16_TARGET_RATE:
+        if is_offline:
+            audio_bytes = await self._offline_stt_ingress(session, audio_data, input_rate)
+        elif input_rate != PCM16_TARGET_RATE:
             audio_bytes = await asyncio.to_thread(
                 self.audio_processor.resample_audio,
                 audio_data,
@@ -4052,24 +4373,15 @@ class LocalAIServer:
         except RuntimeError:
             session.last_audio_at = 0.0
 
-        # Offline backend uses per-session VAD + process_audio(vad, bytes);
-        # online uses stream-based API.
-        is_offline = hasattr(self.sherpa_backend, "create_session_vad")
-
         if is_offline:
-            preroll_max = int(
-                PCM16_TARGET_RATE * 2 * (max(getattr(self.config, "sherpa_offline_preroll_ms", 0), 0) / 1000.0)
-            )
-            if preroll_max > 0:
-                session.stt_segment_preroll = (session.stt_segment_preroll + audio_bytes)[-preroll_max:]
-            else:
-                session.stt_segment_preroll = b""
-
+            context = self._offline_stt_context(session, self.sherpa_backend)
             if session.sherpa_offline_vad is None:
                 session.sherpa_offline_vad = self.sherpa_backend.create_session_vad()
                 if session.sherpa_offline_vad is None:
                     logging.error("❌ SHERPA-OFFLINE - Failed to create session VAD")
                     return []
+                if context is not None:
+                    context.bind_vad()
                 logging.info(
                     "🔍 SHERPA-OFFLINE - New session VAD created call_id=%s",
                     session.call_id,
@@ -4077,7 +4389,7 @@ class LocalAIServer:
             result = self.sherpa_backend.process_audio(
                 session.sherpa_offline_vad,
                 audio_bytes,
-                preroll_pcm16=session.stt_segment_preroll,
+                context,
             )
         else:
             # Ensure sherpa stream exists for this session
@@ -4096,7 +4408,6 @@ class LocalAIServer:
 
             if result_type == "final":
                 logging.info("📝 STT RESULT - Sherpa final transcript: '%s'", text)
-                session.stt_segment_preroll = b""
                 updates.append({
                     "text": text,
                     "is_final": True,
@@ -4115,6 +4426,111 @@ class LocalAIServer:
                         "confidence": None,
                     })
 
+        return updates
+
+    async def _offline_stt_ingress(self, session: SessionContext, audio_data: bytes, input_rate: int) -> bytes:
+        """Bring client audio to the recognizer's 16 kHz for the VAD-gated offline backends.
+
+        A client that sends 8 kHz gets a per-session polyphase FIR upsampler
+        (``LOCAL_STT_RESAMPLER=fir``: no spectral images, flat telephone band)
+        or the legacy ``audioop.ratecv`` interpolation (``ratecv``).
+        """
+        if input_rate == PCM16_TARGET_RATE:
+            return audio_data
+        mode = str(getattr(self.config, "local_stt_resampler", "fir") or "fir").strip().lower()
+        if mode != "ratecv" and PCM16_TARGET_RATE > input_rate and PCM16_TARGET_RATE % input_rate == 0:
+            upsampler = session.stt_upsampler
+            if upsampler is None or getattr(upsampler, "input_rate", None) != input_rate:
+                upsampler = FirUpsampler(input_rate, PCM16_TARGET_RATE)
+                session.stt_upsampler = upsampler
+            return upsampler.process(audio_data)
+        return await asyncio.to_thread(
+            self.audio_processor.resample_audio,
+            audio_data,
+            input_rate,
+            PCM16_TARGET_RATE,
+            "raw",
+            "raw",
+        )
+
+    @staticmethod
+    def _offline_stt_context(session: SessionContext, backend: Any) -> Optional[Any]:
+        """The session's stream memory for pre-/post-roll, created on first use and kept across finals."""
+        context = session.stt_context
+        if context is None and hasattr(backend, "create_session_context"):
+            context = backend.create_session_context()
+            session.stt_context = context
+        return context
+
+    @staticmethod
+    def _onnx_asr_session_lock(session: SessionContext) -> asyncio.Lock:
+        lock = getattr(session, "onnx_asr_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            session.onnx_asr_lock = lock
+        return lock
+
+    async def _process_stt_stream_onnx_asr(
+        self,
+        session: SessionContext,
+        audio_data: bytes,
+        input_rate: int,
+    ) -> List[Dict[str, Any]]:
+        """Feed audio through the onnx-asr backend's per-session VAD gate and return final transcripts.
+
+        The model decodes whole phrases, so there are no partials: a result
+        arrives once the VAD closes a phrase. Decoding takes tens of
+        milliseconds on a GPU and up to seconds on a CPU, so it runs in a
+        worker thread to keep the event loop (and the other sessions) free.
+        """
+        backend = getattr(self, "onnx_asr_backend", None)
+        if not backend:
+            logging.error("onnx-asr backend not initialized")
+            return []
+
+        audio_bytes = await self._offline_stt_ingress(session, audio_data, input_rate)
+
+        try:
+            session.last_audio_at = asyncio.get_running_loop().time()
+        except RuntimeError:
+            session.last_audio_at = 0.0
+
+        context = self._offline_stt_context(session, backend)
+        if session.onnx_asr_vad is None:
+            session.onnx_asr_vad = backend.create_session_vad()
+            if session.onnx_asr_vad is None:
+                logging.error("❌ ONNX-ASR - Failed to create session VAD")
+                return []
+            if context is not None:
+                context.bind_vad()
+            logging.info("🔍 ONNX-ASR - New session VAD created call_id=%s", session.call_id)
+
+        started = monotonic()
+        async with self._onnx_asr_session_lock(session):
+            result = await asyncio.to_thread(
+                backend.process_audio,
+                session.onnx_asr_vad,
+                audio_bytes,
+                context,
+            )
+
+        updates: List[Dict[str, Any]] = []
+        if result and result.get("type") == "final":
+            text = (result.get("text") or "").strip()
+            logging.info(
+                "📝 STT RESULT - onnx-asr final transcript: '%s' (took=%dms call_id=%s)",
+                text,
+                int((monotonic() - started) * 1000),
+                session.call_id,
+            )
+            session.last_partial = ""
+            if text:
+                updates.append({
+                    "text": text,
+                    "is_final": True,
+                    "is_partial": False,
+                    "confidence": None,
+                })
         return updates
 
     async def _process_stt_stream_tone(
@@ -4441,6 +4857,7 @@ class LocalAIServer:
         is_final: bool,
         is_partial: bool,
         confidence: Optional[float],
+        extra: Optional[Dict[str, Any]] = None,
     ) -> bool:
         payload = {
             "type": "stt_result",
@@ -4455,6 +4872,8 @@ class LocalAIServer:
             payload["confidence"] = confidence
         if request_id:
             payload["request_id"] = request_id
+        if extra:
+            payload.update(extra)
         return await self._send_json(websocket, payload)
 
     def _strip_tool_calls_for_tts(self, text: str) -> str:
@@ -5527,6 +5946,7 @@ class LocalAIServer:
             return
         # Sherpa offline: flush any trailing speech before we suppress STT.
         await self._flush_sherpa_offline_trailing(websocket, session)
+        await self._flush_onnx_asr_trailing(websocket, session)
         await self._flush_tone_trailing(websocket, session)
         if not self._output_generation_active(session, generation):
             self._log_stale_output_drop(session, output_type="tts_audio_flush", generation=generation)
@@ -5579,7 +5999,7 @@ class LocalAIServer:
         encoding: str = "mulaw",
         sample_rate_hz: int = ULAW_SAMPLE_RATE,
     ) -> None:
-        _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
+        _sherpa_offline = self._stt_is_vad_gated_offline()
         if self.stt_backend not in {"faster_whisper", "whisper_cpp"} and not _sherpa_offline:
             return
         if not audio_bytes:
@@ -5612,7 +6032,7 @@ class LocalAIServer:
         )
 
     def _clear_whisper_stt_suppression(self, session: SessionContext, *, reason: str) -> None:
-        _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
+        _sherpa_offline = self._stt_is_vad_gated_offline()
         if self.stt_backend not in {"faster_whisper", "whisper_cpp"} and not _sherpa_offline:
             return
         current_until = float(getattr(session, "stt_suppress_until", 0.0) or 0.0)
@@ -6323,7 +6743,7 @@ class LocalAIServer:
         stt_modes = {"stt", "llm", "full"}
         if mode in stt_modes:
             _suppress_backends = {"faster_whisper", "whisper_cpp"}
-            _sherpa_offline = self.stt_backend == "sherpa" and getattr(self, "sherpa_model_type", "online") == "offline"
+            _sherpa_offline = self._stt_is_vad_gated_offline()
             if (self.stt_backend in _suppress_backends or _sherpa_offline) and monotonic() < (session.stt_suppress_until or 0.0):
                 if DEBUG_AUDIO_FLOW:
                     remaining = max(0.0, float(session.stt_suppress_until - monotonic()))

@@ -215,7 +215,10 @@ class Component(ABC):
         # This prevents local_llm from being validated against OpenAI when pipeline
         # options contain base_url for cloud providers
         if component_key.startswith("local_"):
-            base_url = options.get("ws_url") or "ws://127.0.0.1:8765/ws"
+            # Last resort only: local adapters merge their provider block before
+            # calling this, so a real deployment never reaches this literal. It
+            # tracks _DEFAULT_WS_URL in pipelines/local.py, which has no path.
+            base_url = options.get("ws_url") or "ws://127.0.0.1:8765"
             return await self._test_websocket_connection(base_url, api_key=None)
         
         # 1. Extract base URL from options for non-local components
@@ -275,6 +278,10 @@ class Component(ABC):
             return {"healthy": False, "error": f"Unknown protocol in URL: {base_url}", "details": {"url": base_url}}
 
 
+class TTSUnavailable(RuntimeError):
+    """The TTS service produced no audio in time; the reply cannot be spoken now."""
+
+
 class STTComponent(Component):
     """Speech-to-text component."""
 
@@ -282,6 +289,12 @@ class STTComponent(Component):
     # from incidental method names because buffered-only adapters share this
     # base class.
     supports_streaming: bool = False
+    # Adapters that can take one whole caller utterance (cut by the engine's
+    # own VAD) through ``send_utterance(call_id, pcm16, *, sample_rate_hz,
+    # utterance_id, fmt)`` and report whether the far end decodes it through
+    # ``utterances_supported(call_id)`` (None until known). The engine streams
+    # each utterance with a closing silence to every other adapter.
+    supports_utterances: bool = False
 
     @abstractmethod
     async def transcribe(

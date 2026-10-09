@@ -21,7 +21,7 @@ This feature adds a simple, AI-native outbound dialer inspired by Vicidial-style
 ## Key Assumptions
 
 - Your **outbound trunk(s)** and **outbound routes** are already configured in Asterisk/FreePBX.
-- AAVA originates outbound calls using your configured **outbound identity extension** (default `6789`), so FreePBX routing and caller-ID rules apply consistently.
+- AAVA originates outbound calls using your configured **outbound identity extension** (default `6789`), so FreePBX routing and caller-ID rules apply consistently. A lead's **Caller ID override** (CSV column `caller_id`, the manual-lead form, or `caller_id` on `PATCH /api/outbound/leads/{lead_id}`) replaces that identity for the lead's own calls: it becomes `CALLERID(num)` and, on FreePBX, `AMPUSER`/`FROMEXTEN` too, so the call is placed as that extension with its outbound CID, trunk and route permissions, and one campaign can dial different leads from different extensions. The log line `Outbound originate` reports `caller_identity` and whether it came from the `lead` or the `global` setting. On FreePBX, an outbound route with **Override Extension** enabled applies the route's CID regardless of the extension.
 - This is a **single-node** design.
 
 ## Architecture (High Level)
@@ -81,23 +81,85 @@ See `docs/Configuration-Reference.md` for the full list and semantics. The most 
 
 ### Per-lead context (`custom_vars`)
 
-- `custom_vars` must be a JSON object. AAVA serializes it canonically and limits
-  the complete serialized value to 8,192 bytes before dialing.
-- Nonempty values are delivered to the selected Agent as a read-only
-  `## Lead Context` JSON block. The Agent prompt may describe how fields such as
-  `task` or `account_id` should be used, but lead data does not override the
-  Agent's higher-priority safety and tool policies.
+- `custom_vars` must be a JSON object. It never travels through Asterisk
+  channel variables: the engine keeps it in attempt metadata and the durable
+  SQLite store and re-reads it by attempt id when the answered call returns to
+  Stasis, so there is **no size limit** on values.
+- Every `custom_vars` key is available as a `{var}` template placeholder in the
+  selected Agent's prompt and greeting (e.g. a lead with
+  `{"task": "confirm the visit"}` renders `Your task: {task}` as
+  `Your task: confirm the visit`). Built-in variables such as `{caller_name}`
+  and pre-call enrichment keep priority over same-named keys, values are used
+  verbatim without truncation, and built-in placeholders inside a custom value
+  resolve as well.
+- Post-call webhooks can reference the same keys: each `custom_vars` key is a
+  `{placeholder}` in the webhook `payload_template` (plus `{custom_vars_json}`
+  for the raw object), so a correlation id such as `{amo_lead_id}` travels
+  back to the automation that scheduled the call. `{caller_id}` is the
+  extension the call was placed from (the lead's Caller ID override or the
+  global identity) and `{caller_id_source}` says which (`lead` or `global`).
+- Nonempty values are additionally delivered to the selected Agent as a
+  read-only `## Lead Context` JSON block (untruncated). The Agent editor's
+  **Lead Context block** toggle turns this off per Agent — e.g. when the prompt
+  already renders the same values via `{var}` placeholders and the block would
+  only duplicate them. Lead data does not override the Agent's higher-priority
+  safety and tool policies.
 - Do not store credentials, authentication tokens, or other secrets in
-  `custom_vars`. The value is carried through an Asterisk channel variable and
-  is sent to the configured AI provider as prompt context.
-- AAVA verifies nonempty context again after answer and before the AMD hop. If
-  the exact value cannot be confirmed, the attempt fails closed with outcome
-  `error`, the lead moves to `failed`, and no AI session is started.
+  `custom_vars`. The value is sent to the configured AI provider as prompt
+  context, and the **Call Scheduling** leads table shows it in the
+  **Variables** column.
+- The call's session is seeded from the attempt metadata the engine keeps in
+  memory since the originate (attempt, campaign and lead ids, the lead's number
+  as `called_number`, `custom_vars`, the campaign's Agent and its pipeline)
+  before the session is first saved, so a call the far end drops during setup
+  is still recorded and reported with the lead's data. Channel variables are
+  read only when that metadata is not in memory.
 - If an engine restart clears in-memory state while a call is still ringing,
   AAVA reloads the unfinished attempt and lead from SQLite. An answered call is
-  rejected if that authoritative metadata cannot be recovered.
-- Oversized or non-serializable context also fails before ARI origination. AAVA
-  records an actionable error without logging the context value.
+  rejected (fail closed, outcome `error`, lead `failed`, no AI session) if that
+  authoritative metadata cannot be recovered or its stored custom_vars JSON is
+  corrupt.
+
+### Reading a lead (`GET /api/outbound/leads/{lead_id}`)
+
+- `GET /api/outbound/leads/{lead_id}` returns one lead exactly as
+  `GET /api/outbound/campaigns/{campaign_id}/leads` lists it: the lead's own
+  fields (`id`, `campaign_id`, `phone_number`, `name`, `lead_timezone`,
+  `context_override`, `agent_routing_method`, `caller_id_override`,
+  `custom_vars` as an object, `state`, `attempt_count`, `last_outcome`,
+  `last_attempt_at_utc`, `leased_until_utc`, `created_at_utc`,
+  `updated_at_utc`) plus its most recent dial attempt as `last_started_at_utc`,
+  `last_ended_at_utc`, `last_duration_seconds`, `last_outcome_attempt`,
+  `last_amd_status`, `last_amd_cause`, `last_consent_dtmf`,
+  `last_consent_result`, `last_context`, `last_provider`,
+  `last_call_history_call_id` and `last_error_message` (all `null` until the
+  lead has been dialed). `404` for an unknown id. The response schema is
+  declared in the OpenAPI document, so an automation tool that imports it
+  sees the fields.
+
+### Updating a lead (`PATCH /api/outbound/leads/{lead_id}`)
+
+- `PATCH /api/outbound/leads/{lead_id}` updates `name`, `agent`, `timezone`,
+  `caller_id` (the extension or number the lead is dialed from; see *Key
+  Assumptions*), and `custom_vars` (replaced as a whole, not merged). Only
+  fields present in the request change; an explicit `null` clears the override
+  back to the campaign default. Returns `409` while the lead is actively being
+  dialed (`leased`/`dialing`/`amd_pending`/`in_progress`); state and attempt
+  counters are untouched — chain `POST /api/outbound/leads/{lead_id}/recycle`
+  to queue a new call.
+- Manual add (`POST /api/outbound/campaigns/{campaign_id}/leads`) reports an
+  existing number as `"duplicates": 1` and also returns
+  `"duplicate_lead_id"` — the existing lead's id. An automation re-dialing the
+  same number should PATCH the fresh `custom_vars` onto that id first, then
+  recycle it.
+
+### Post-call webhooks for every attempt
+
+Every outbound attempt is reported to the post-call webhooks once it is finished, whether or not the agent ever spoke: an answered call reports through its normal cleanup, and an unanswered or failed dial (rejected originate, ring-out, busy, congestion, channel unavailable, answering machine, consent declined or timed out) the moment the attempt is finalized. The same webhooks, the same `payload_template` and the same variables apply. `{call_outcome}` carries the attempt outcome shown in Call Scheduling, `{error_message}` the originate error or hangup cause, `{attempt_id}` the attempt, and `{lead_id}`, `{campaign_id}` and the lead's `custom_vars` identify the lead as for an answered call; transcript and summary are empty and `{call_duration}` is `0`. A webhook that should only see conversations sets `send_on_failed_dial: false`. See *Outbound Dials That Never Became a Call* in `docs/TOOL_CALLING_GUIDE.md`.
+
+### Call History for an attempt that never became a conversation
+
+A dial that was never answered (busy, no answer, congestion, channel unavailable, answering machine, consent declined) is recorded on the attempt only: it appears in Call Scheduling with its outcome and error, and leaves no Call History row. A call that the far end drops right after answering, before the agent session exists (the callee answers, AMD says HUMAN, the line clears a second later), does get a Call History row, because the callee was reached: the lead's number on both sides, the lead's name (or `Outbound <number>`), the campaign's context and routing, the provider, a duration counted from the answer, outcome `abandoned` with no transcript, and `external_metadata` carrying the attempt, campaign and lead ids, the attempt's own outcome, the hangup cause and the AMD verdict (`ended_before_session: true`). The attempt links to that row, so the lead's **Call History** button opens it. An ordinary abandoned call, where the caller hung up during the greeting, is recorded the same way by the session's own cleanup.
 
 ## Testing Checklist (New User)
 
@@ -106,12 +168,12 @@ Use a local extension (e.g., `2765`) and an external number (E.164) to validate:
 - Consent enabled: press `1` to accept → AI connects; press `2` → call ends; no input → `consent_timeout`.
 - Voicemail enabled: let it ring out or go to voicemail → voicemail drop plays; attempt outcome recorded.
 - HUMAN path: correct Agent/provider chosen; tools (e.g., `hangup_call`) work.
+- Post-call webhook: let a dial ring out (or dial a busy number) → the webhook receives `call_outcome` `no_answer` (or `busy`) with the lead id, `error_message` and an empty transcript; an answered call arrives with its transcript as before.
 - Lead context: add a distinctive non-sensitive value such as
-  `"validation_token":"issue613-7f3a"`, ask the Agent to repeat that field,
-  and compare the returned value exactly with the supplied token rather than
-  accepting a general behavior change as proof. Also confirm the attempt fails
-  rather than calling without context when `AAVA_CUSTOM_VARS_JSON` cannot be
-  restored.
+  `"validation_token":"issue613-7f3a"`, reference it in the Agent prompt as
+  `{validation_token}` (or ask the Agent to repeat the field from the Lead
+  Context block), and compare the returned value exactly with the supplied
+  token rather than accepting a general behavior change as proof.
 
 ## Where to Look When Something Breaks
 

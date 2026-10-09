@@ -57,7 +57,8 @@ CREATE TABLE agents (
     is_operator_managed INTEGER NOT NULL DEFAULT 1,
     is_active INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0,
     source_file TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    notes TEXT, email_recipient TEXT, email_from TEXT, email_enabled INTEGER
+    notes TEXT, email_recipient TEXT, email_from TEXT, email_enabled INTEGER,
+    lead_context_enabled INTEGER
 );
 CREATE INDEX idx_agents_slug ON agents(slug);
 CREATE INDEX idx_agents_mgmt ON agents(is_operator_managed);

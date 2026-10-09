@@ -14,7 +14,7 @@ from structlog import get_logger
 
 import audioop
 from ..config import LocalProviderConfig
-from ..audio.resampler import resample_audio
+from ..audio.resampler import resample_audio, resolve_stt_input_resampler
 from .base import AIProviderInterface, ProviderCapabilities, ProviderCapabilitiesMixin
 from ..config.audio_baselines import provider_audio_capabilities
 from ..tools.parser import parse_response_with_tools, validate_tool_call, has_tool_intent_markers
@@ -65,6 +65,11 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
         # Track if server port is unavailable (not running at all)
         self._server_unavailable: bool = False
         self._resample_state_stt: Optional[tuple] = None
+        # 8 kHz -> 16 kHz upsampler for the STT ingress: "fir" (alias-safe
+        # polyphase interpolation) unless the provider asks for "linear".
+        self._stt_input_resampler: str = resolve_stt_input_resampler(
+            getattr(config, "stt_input_resampler", None)
+        )
         # Parse host/port from ws_url for port checking
         self._server_host, self._server_port = self._parse_ws_url(self.ws_url)
         # Track if we were previously connected (for background reconnect on disconnect)
@@ -1704,11 +1709,15 @@ class LocalProvider(AIProviderInterface, ProviderCapabilitiesMixin):
                 elif self.input_mode == 'pcm16_8k':
                     # 8kHz PCM, resample to 16kHz
                     pcm8k = b"".join(batch)
-                    pcm16k, self._resample_state_stt = resample_audio(pcm8k, 8000, 16000, state=self._resample_state_stt)
+                    pcm16k, self._resample_state_stt = resample_audio(
+                        pcm8k, 8000, 16000, state=self._resample_state_stt, mode=self._stt_input_resampler
+                    )
                 else:
                     # µ-law 8kHz, convert to PCM then resample
                     pcm8k = b"".join(audioop.ulaw2lin(b, 2) for b in batch)
-                    pcm16k, self._resample_state_stt = resample_audio(pcm8k, 8000, 16000, state=self._resample_state_stt)
+                    pcm16k, self._resample_state_stt = resample_audio(
+                        pcm8k, 8000, 16000, state=self._resample_state_stt, mode=self._stt_input_resampler
+                    )
                 
                 # Process audio batch for STT
                 total_bytes = sum(len(b) for b in batch)

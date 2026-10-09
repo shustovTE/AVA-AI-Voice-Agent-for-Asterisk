@@ -24,6 +24,8 @@ export interface AgentToolState {
     noInput: Record<string, unknown>; // extra.no_input per-agent policy overrides
     hangupMarkerStrategy: 'inherit' | 'extend' | 'replace';
     hangupEndCallMarkers: string[];
+    hangupFarewellMarkers: string[];       // hangup_policy.assistant_farewell (extend/replace only)
+    hangupOnAssistantFarewell: boolean;    // hangup_policy.hangup_on_assistant_farewell
     extraPassthrough: Record<string, unknown>; // extra keys we do not own (+ object-form in_call_http_tools)
     mcpJsonRaw: string;               // mcp_json preserved verbatim — NOTE: no runtime effect, MCP is configured globally not per-agent (audit LOW-T2)
     transferDestinationPolicy: ResourcePolicy;
@@ -58,7 +60,7 @@ const sanitizeNoInputOverrides = (raw: Record<string, unknown>): Record<string, 
     const knownKeys = new Set([
         'enabled', 'inbound_enabled', 'outbound_enabled',
         'initial_timeout_sec', 'grace_timeout_sec', 'max_check_ins',
-        'check_in_message', 'final_message',
+        'check_in_message', 'final_message', 'stall_timeout_sec', 'max_call_duration_sec',
     ]);
     const unsafePassthroughKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -77,6 +79,14 @@ const sanitizeNoInputOverrides = (raw: Record<string, unknown>): Record<string, 
     const attempts = raw['max_check_ins'];
     if (typeof attempts === 'number' && Number.isInteger(attempts) && attempts >= 0 && attempts <= 10) {
         sanitized['max_check_ins'] = attempts;
+    }
+    const stall = raw['stall_timeout_sec'];
+    if (typeof stall === 'number' && Number.isFinite(stall) && stall >= 0 && stall <= 7200) {
+        sanitized['stall_timeout_sec'] = stall;
+    }
+    const maxDuration = raw['max_call_duration_sec'];
+    if (typeof maxDuration === 'number' && Number.isFinite(maxDuration) && maxDuration >= 0 && maxDuration <= 86400) {
+        sanitized['max_call_duration_sec'] = maxDuration;
     }
     for (const key of ['check_in_message', 'final_message']) {
         const value = raw[key];
@@ -158,6 +168,9 @@ export function parseAgentConfig(agent: AgentLike | null | undefined): AgentTool
         hangupMarkerStrategy,
         hangupEndCallMarkers: hangupMarkerStrategy === 'inherit'
             ? [] : asStrArray(hangupPolicy['end_call']),
+        hangupFarewellMarkers: hangupMarkerStrategy === 'inherit'
+            ? [] : asStrArray(hangupPolicy['assistant_farewell']),
+        hangupOnAssistantFarewell: hangupPolicy['hangup_on_assistant_farewell'] === true,
         extraPassthrough: passthrough,
         mcpJsonRaw: agent?.mcp_json || '',
         transferDestinationPolicy,
@@ -242,11 +255,21 @@ export function serializeAgentConfig(state: AgentToolState): SerializedAgentConf
         mcp_json: state.mcpJsonRaw.trim() || null,
         extra_json: Object.keys(extra).length ? JSON.stringify(extra) : null,
         tool_configs_json: Object.keys(toolConfigs).length ? JSON.stringify(toolConfigs) : null,
-        hangup_policy_json: state.hangupMarkerStrategy === 'inherit' ? null : JSON.stringify({
-            strategy: state.hangupMarkerStrategy,
-            end_call: [...new Set(state.hangupEndCallMarkers.map((marker) => marker.trim()).filter(Boolean))],
-        }),
+        hangup_policy_json: buildHangupPolicyJson(state),
     };
+}
+
+function buildHangupPolicyJson(state: AgentToolState): string | null {
+    const policy: Record<string, unknown> = {};
+    if (state.hangupMarkerStrategy !== 'inherit') {
+        policy.strategy = state.hangupMarkerStrategy;
+        policy.end_call = [...new Set(state.hangupEndCallMarkers.map((m) => m.trim()).filter(Boolean))];
+        const farewell = [...new Set(state.hangupFarewellMarkers.map((m) => m.trim()).filter(Boolean))];
+        if (farewell.length) policy.assistant_farewell = farewell;
+    }
+    // Stored only when enabled; absent means "inherit the global default (off)".
+    if (state.hangupOnAssistantFarewell) policy.hangup_on_assistant_farewell = true;
+    return Object.keys(policy).length ? JSON.stringify(policy) : null;
 }
 
 type PhaseKey = 'pre_call' | 'in_call' | 'post_call';

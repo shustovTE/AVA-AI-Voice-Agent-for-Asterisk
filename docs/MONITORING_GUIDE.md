@@ -5,7 +5,7 @@ Production observability guide for Asterisk AI Voice Agent `v6.0+`.
 > **Note**: Prometheus and Grafana are **not shipped** with AAVA. This guide provides reference configurations for operators who bring their own monitoring stack. For per-call debugging, use **Admin UI → Call History**.
 
 > **Important (v4.5.3+)**: Prometheus metrics are intentionally **low-cardinality** and **do not include per-call labels** (e.g., no `call_id`).  
-> Use **Admin UI → Call History** for per-call debugging, and use Prometheus/Grafana for aggregate health/latency/quality trends and alerting.
+> Use **Admin UI → Call History** for per-call debugging (each pipeline reply carries its ASR, LLM, TTS and turn latencies), and use Prometheus/Grafana for aggregate health/latency/quality trends and alerting.
 
 ## Overview
 

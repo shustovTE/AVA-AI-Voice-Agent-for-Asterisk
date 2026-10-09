@@ -190,7 +190,7 @@ def test_runtime_data_and_secrets_are_excluded_from_root_build_context():
 
 
 def test_admin_image_packages_shared_config_apply_policy():
-    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    compose = (PROJECT_ROOT / "docker-compose.example.yml").read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "admin_ui" / "Dockerfile").read_text(
         encoding="utf-8"
     )
@@ -201,6 +201,7 @@ def test_admin_image_packages_shared_config_apply_policy():
 
 
 def test_recovery_uses_previous_gpu_topology(tmp_path):
+    (tmp_path / "docker-compose.yml").touch()
     (tmp_path / "docker-compose.gpu.yml").touch()
 
     flags = system._compose_files_flags_for_recovery(
@@ -213,6 +214,7 @@ def test_recovery_uses_previous_gpu_topology(tmp_path):
 
 
 def test_recovery_does_not_use_new_gpu_setting_for_previous_cpu_service(tmp_path):
+    (tmp_path / "docker-compose.yml").touch()
     (tmp_path / "docker-compose.gpu.yml").touch()
 
     flags = system._compose_files_flags_for_recovery(
@@ -222,3 +224,20 @@ def test_recovery_does_not_use_new_gpu_setting_for_previous_cpu_service(tmp_path
     )
 
     assert flags == "-f docker-compose.yml"
+
+
+def test_recovery_falls_back_to_the_compose_template_without_a_local_copy(tmp_path):
+    """docker-compose.yml is the operator's untracked copy; a checkout without it still runs from the template."""
+    (tmp_path / "docker-compose.example.yml").touch()
+    (tmp_path / "docker-compose.gpu.yml").touch()
+
+    assert system._compose_files_flags_for_recovery("ai_engine", [], str(tmp_path)) == "-f docker-compose.example.yml"
+    assert (
+        system._compose_files_flags_for_recovery("local_ai_server", ["GPU_AVAILABLE=true"], str(tmp_path))
+        == "-f docker-compose.example.yml -f docker-compose.gpu.yml"
+    )
+    assert system._base_compose_flags(str(tmp_path)) == ["-f", "docker-compose.example.yml"]
+
+    (tmp_path / "docker-compose.yml").touch()
+    assert system._base_compose_flags(str(tmp_path)) == []
+    assert system._compose_files_flags_for_recovery("ai_engine", [], str(tmp_path)) == "-f docker-compose.yml"

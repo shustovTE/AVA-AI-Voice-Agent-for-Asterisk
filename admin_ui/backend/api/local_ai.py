@@ -153,6 +153,11 @@ class SwitchModelRequest(BaseModel):
     tone_model_path: Optional[str] = None
     tone_decoder_type: Optional[str] = None  # beam_search | greedy
     tone_kenlm_path: Optional[str] = None
+    # onnx-asr (GigaAM v3 / NeMo FastConformer RU): model name, optional local directory, runtime knobs
+    onnx_asr_model: Optional[str] = None
+    onnx_asr_model_path: Optional[str] = None
+    onnx_asr_quantization: Optional[str] = None  # "" (fp32) | int8
+    onnx_asr_device: Optional[str] = None  # auto | cpu | cuda
     # Kroko embedded tuning (optional)
     kroko_embedded: Optional[bool] = None
     kroko_port: Optional[int] = None
@@ -233,6 +238,16 @@ def _normalize_switch_request(request: SwitchModelRequest) -> SwitchModelRequest
     return request
 
 
+
+def _onnx_asr_model_name(value: Optional[str]) -> str:
+    """The onnx-asr model name from a UI value; a container directory such as
+    /app/models/stt/onnx-asr/gigaam-v3-e2e-ctc yields its last component (``__`` stands for ``/``)."""
+    text = (value or "").strip()
+    if text.startswith("/"):
+        text = os.path.basename(text.rstrip("/")).replace("__", "/")
+    return text
+
+
 def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[Dict[str, str], Dict[str, Any]]:
     """
     Pure mapping from SwitchModelRequest -> env_updates/yaml_updates.
@@ -309,6 +324,20 @@ def _build_local_ai_env_and_yaml_updates(request: SwitchModelRequest) -> tuple[D
                 if request.tone_kenlm_path:
                     env_updates["TONE_KENLM_PATH"] = request.tone_kenlm_path
                     yaml_updates["tone_kenlm_path"] = request.tone_kenlm_path
+            elif request.backend == "onnx_asr":
+                onnx_model = _onnx_asr_model_name(request.onnx_asr_model or request.model_path)
+                if onnx_model:
+                    env_updates["ONNX_ASR_MODEL"] = onnx_model
+                    yaml_updates["onnx_asr_model"] = onnx_model
+                if request.onnx_asr_model_path is not None:
+                    env_updates["ONNX_ASR_MODEL_PATH"] = request.onnx_asr_model_path.strip()
+                    yaml_updates["onnx_asr_model_path"] = request.onnx_asr_model_path.strip()
+                if request.onnx_asr_quantization is not None:
+                    env_updates["ONNX_ASR_QUANTIZATION"] = request.onnx_asr_quantization.strip().lower()
+                    yaml_updates["onnx_asr_quantization"] = request.onnx_asr_quantization.strip().lower()
+                if request.onnx_asr_device:
+                    env_updates["ONNX_ASR_DEVICE"] = request.onnx_asr_device.strip().lower()
+                    yaml_updates["onnx_asr_device"] = request.onnx_asr_device.strip().lower()
             elif request.backend == "faster_whisper":
                 if request.model_path:
                     env_updates["FASTER_WHISPER_MODEL"] = request.model_path
@@ -440,6 +469,16 @@ def _build_local_ai_ws_switch_payload(request: SwitchModelRequest) -> Optional[D
                 payload["tone_decoder_type"] = request.tone_decoder_type
             if request.tone_kenlm_path:
                 payload["tone_kenlm_path"] = request.tone_kenlm_path
+        if request.backend == "onnx_asr":
+            onnx_model = _onnx_asr_model_name(request.onnx_asr_model or request.model_path)
+            if onnx_model:
+                payload["onnx_asr_model"] = onnx_model
+            if request.onnx_asr_model_path is not None:
+                payload["onnx_asr_model_path"] = request.onnx_asr_model_path.strip()
+            if request.onnx_asr_quantization is not None:
+                payload["onnx_asr_quantization"] = request.onnx_asr_quantization.strip().lower()
+            if request.onnx_asr_device:
+                payload["onnx_asr_device"] = request.onnx_asr_device.strip().lower()
         if request.backend == "faster_whisper":
             stt_config: Dict[str, Any] = {}
             if request.model_path:
@@ -558,6 +597,7 @@ async def list_available_models():
         "sherpa": [],
         "kroko": [],
         "tone": [],
+        "onnx_asr": [],
         "faster_whisper": [],
         "whisper_cpp": [],
     }
@@ -603,6 +643,24 @@ async def list_available_models():
                         backend="tone",
                         size_mb=get_dir_size_mb(item_path)
                     ))
+                elif item.lower() == "onnx-asr":
+                    # onnx-asr downloads each model into its own directory named after the
+                    # model; the "path" of such a model is the model name the server expects.
+                    for cached in sorted(os.listdir(item_path)):
+                        cached_path = os.path.join(item_path, cached)
+                        if not os.path.isdir(cached_path) or not os.listdir(cached_path):
+                            continue
+                        model_name = cached.replace("__", "/")
+                        if model_name.startswith("/"):
+                            continue  # a cache directory named after a path, not a model
+                        stt_models["onnx_asr"].append(ModelInfo(
+                            id=f"onnx_asr_{cached}",
+                            name=f"{model_name} (downloaded)",
+                            path=model_name,
+                            type="stt",
+                            backend="onnx_asr",
+                            size_mb=get_dir_size_mb(cached_path)
+                        ))
                 elif "kroko" in item.lower():
                     stt_models["kroko"].append(ModelInfo(
                         id="kroko_embedded",
@@ -769,6 +827,7 @@ async def get_backend_capabilities():
             "kroko_embedded": {"available": False, "reason": ""},
             "kroko_cloud": {"available": True, "reason": "Cloud API (requires KROKO_API_KEY)"},
             "tone": {"available": False, "reason": ""},
+            "onnx_asr": {"available": False, "reason": ""},
             "faster_whisper": {"available": False, "reason": ""},
             "whisper_cpp": {"available": False, "reason": ""},
         },
@@ -816,6 +875,10 @@ async def get_backend_capabilities():
                     capabilities["stt"]["tone"] = {"available": True, "reason": "T-one installed"}
                 else:
                     capabilities["stt"]["tone"]["reason"] = "Rebuild with INCLUDE_TONE=true"
+                if server_caps.get("onnx_asr"):
+                    capabilities["stt"]["onnx_asr"] = {"available": True, "reason": "onnx-asr installed"}
+                else:
+                    capabilities["stt"]["onnx_asr"]["reason"] = "Rebuild with INCLUDE_ONNX_ASR=true"
                 if server_caps.get("faster_whisper"):
                     capabilities["stt"]["faster_whisper"] = {"available": True, "reason": "Faster-Whisper installed"}
                 else:
@@ -1488,6 +1551,7 @@ class RebuildRequest(BaseModel):
     include_melotts: bool = False
     include_kroko_embedded: bool = False
     include_tone: bool = False
+    include_onnx_asr: bool = False
     include_silero: Optional[bool] = None
     # STT/TTS config to apply after rebuild
     stt_backend: Optional[str] = None
@@ -1542,6 +1606,9 @@ async def rebuild_local_ai_server(request: RebuildRequest):
     if request.include_tone:
         build_args.append("--build-arg")
         build_args.append("INCLUDE_TONE=true")
+    if request.include_onnx_asr:
+        build_args.append("--build-arg")
+        build_args.append("INCLUDE_ONNX_ASR=true")
     if request.include_silero:
         build_args.append("--build-arg")
         build_args.append("INCLUDE_SILERO=true")
@@ -1576,6 +1643,8 @@ async def rebuild_local_ai_server(request: RebuildRequest):
         env_updates["INCLUDE_KROKO_EMBEDDED"] = "true"
     if request.include_tone:
         env_updates["INCLUDE_TONE"] = "true"
+    if request.include_onnx_asr:
+        env_updates["INCLUDE_ONNX_ASR"] = "true"
     if request.include_silero:
         env_updates["INCLUDE_SILERO"] = "true"
 
@@ -1593,6 +1662,8 @@ async def rebuild_local_ai_server(request: RebuildRequest):
                 env_updates["SHERPA_MODEL_PATH"] = request.stt_model
             elif request.stt_backend == "tone":
                 env_updates["TONE_MODEL_PATH"] = request.stt_model
+            elif request.stt_backend == "onnx_asr":
+                env_updates["ONNX_ASR_MODEL"] = _onnx_asr_model_name(request.stt_model)
             elif request.stt_backend == "vosk":
                 env_updates["LOCAL_STT_MODEL_PATH"] = request.stt_model
 
@@ -1692,6 +1763,10 @@ async def rebuild_local_ai_server(request: RebuildRequest):
             backends_enabled.append("MeloTTS")
         if request.include_kroko_embedded:
             backends_enabled.append("Kroko Embedded")
+        if request.include_tone:
+            backends_enabled.append("T-one")
+        if request.include_onnx_asr:
+            backends_enabled.append("onnx-asr (GigaAM v3 / NeMo)")
         
         warning_suffix = f" (Warning: {warn_or_err})" if warn_or_err else ""
         return RebuildResponse(

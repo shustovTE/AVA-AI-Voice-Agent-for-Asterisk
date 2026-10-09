@@ -294,10 +294,24 @@ class PostCallContext:
     # Tool execution data
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # In-call tool executions
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # Data from pre-call tools
-    
+
     # Outbound-specific
     campaign_id: Optional[str] = None
     lead_id: Optional[str] = None
+    custom_vars: Dict[str, Any] = field(default_factory=dict)  # Outbound lead custom_vars
+    # The identity an outbound call was placed from: the lead's Caller ID
+    # override or the global outbound extension (what became CALLERID(num)),
+    # and which of the two it was ("lead" or "global"). Empty for inbound calls.
+    caller_id: Optional[str] = None
+    caller_id_source: Optional[str] = None
+    # The dial attempt the call belongs to. An outbound attempt that never
+    # became a call (rejected originate, ring-out, busy, answering machine,
+    # consent declined) is still reported to the post-call tools that opt in:
+    # call_id is then the channel id when there was one, else this id.
+    attempt_id: Optional[str] = None
+    # Why the call, or the dial attempt, failed: the session's error, the
+    # originate error or the hangup cause. Empty when nothing failed.
+    error_message: Optional[str] = None
     
     # System access
     config: Any = None
@@ -323,6 +337,7 @@ class PostCallContext:
             "call_direction": self.call_direction,
             "call_duration": self.call_duration_seconds,
             "call_outcome": self.call_outcome,
+            "error_message": self.error_message or "",
             "call_start_time": self.call_start_time or "",
             "call_end_time": self.call_end_time or "",
             "transcript_json": json.dumps(self.conversation_history),
@@ -331,12 +346,21 @@ class PostCallContext:
             "pre_call_results_json": json.dumps(self.pre_call_results),
             "campaign_id": self.campaign_id or "",
             "lead_id": self.lead_id or "",
+            "attempt_id": self.attempt_id or "",
+            "custom_vars_json": json.dumps(self.custom_vars),
+            "caller_id": self.caller_id or "",
+            "caller_id_source": self.caller_id_source or "",
         }
         # Flatten pre-call enrichment variables into individual placeholders
         # (e.g. {customer_name}) so post-call webhook bodies can reference them
         # directly, mirroring how the prompt and in-call paths expose them.
         # Built-in keys always win; a pre-call variable never clobbers them.
         for key, value in (self.pre_call_results or {}).items():
+            if key not in payload:
+                payload[key] = str(value) if value else ""
+        # Same for outbound lead custom_vars (e.g. {amo_lead_id} from a CRM):
+        # built-ins and pre-call enrichment keep priority over same-named keys.
+        for key, value in (self.custom_vars or {}).items():
             if key not in payload:
                 payload[key] = str(value) if value else ""
         return payload

@@ -19,7 +19,7 @@ import sqlite3
 from collections import deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import TYPE_CHECKING, Dict, Any, Optional, List, Set, Tuple, Callable
+from typing import TYPE_CHECKING, AsyncIterator, Dict, Any, Optional, List, Set, Tuple, Callable
 
 # Simple audio capture system removed - not used in production
 
@@ -77,6 +77,27 @@ from .providers.elevenlabs_agent import ElevenLabsAgentProvider
 from .providers.elevenlabs_config import ElevenLabsAgentConfig
 from .core import SessionStore, PlaybackManager, ConversationCoordinator
 from .core.vad_manager import EnhancedVADManager, VADResult
+from .core.silero_vad import (
+    DEFAULT_MODEL_PATH as SILERO_DEFAULT_MODEL_PATH,
+    SILERO_VAD_VERSION,
+    SUPPORTED_SAMPLE_RATES as SILERO_SAMPLE_RATES,
+    SileroCallerTracker,
+    SileroVadError,
+    SileroVadModel,
+    ensure_model_file as ensure_silero_model_file,
+    load_model as load_silero_model,
+)
+from .core.smart_turn import (
+    DEFAULT_MODEL_PATH as SMART_TURN_DEFAULT_MODEL_PATH,
+    SMART_TURN_VERSION,
+    SmartTurnError,
+    SmartTurnModel,
+    TurnAudioBuffer,
+    ensure_model_file as ensure_smart_turn_model_file,
+    load_model as load_smart_turn_model,
+)
+from .core.heard_reply import SpokenReply
+from .core.utterances import SttUtterance, UtteranceCutter
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
@@ -86,12 +107,13 @@ from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
 from .utils.diagnostic_paths import DEFAULT_DIAGNOSTIC_CAPTURE_DIR
 from .utils.voice_catalog import known_voice_map
-from src.pipelines.base import LLMResponse
+from src.pipelines.base import LLMResponse, TTSUnavailable
 from src.tools.telephony.hangup_policy import (
     DEFAULT_HANGUP_MARKERS,
     resolve_effective_hangup_policy,
     resolve_hangup_policy,
     text_contains_end_call_intent,
+    text_ends_with_marker,
     text_is_short_polite_closing,
     normalize_marker_list,
 )
@@ -142,19 +164,28 @@ logger = get_logger(__name__)
 class _PipelinePlaybackInterrupted(RuntimeError):
     """The caller interrupted a pipeline stream while its producer was backpressured."""
 
+
+# The caller went on before the reply's first sound: the reply was discarded.
+_REPLY_SUPERSEDED = object()
+
 # Modular STT uses one canonical, headerless audio bus. Transport-specific
 # audio is converted to this format before it enters the pipeline queue.
 PIPELINE_STT_SAMPLE_RATE_HZ = 16000
+# A pipeline greeting is synthesized before the recognizer path and the
+# inactivity watchdog start for the call; nothing on the way may hold them
+# longer than this, whatever the TTS endpoint does.
+PIPELINE_GREETING_TIMEOUT_SEC = 120.0
 PIPELINE_STT_STREAM_FORMAT = "pcm16_16k"
 PIPELINE_STT_ENCODING = "linear16"
 PIPELINE_STT_CHANNELS = 1
 PIPELINE_STT_BYTES_PER_SAMPLE = 2
+# While the caller's audio is gated the engine feeds the recognizer silence
+# rather than dropping frames, so a word straddling the gap is not spliced.
+# Past this much the caller has long stopped talking and a splice is harmless,
+# so the budget caps the extra inference an agent turn costs.
+PIPELINE_GATED_SILENCE_MS_DEFAULT = 3000
 CONNECTION_AUDIO_HANDOFF_TIMEOUT_SECONDS = 10.0
 OUTBOUND_ATTEMPT_STALE_SECONDS_DEFAULT = 120.0
-# Keep lead context comfortably below practical ARI/dialplan payload limits.
-# The same canonical JSON is used for originate, post-answer confirmation, and
-# prompt hydration so the fail-closed comparison is deterministic.
-OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES = 8192
 # A human-first AMD preset. In particular, Asterisk's stock max-word default
 # of 3 classified the observed four-word human greeting as MACHINE.
 OUTBOUND_AMD_HUMAN_FIRST_DEFAULTS: Dict[str, int] = {
@@ -187,6 +218,188 @@ def _resolve_pipeline_streaming_overlap(
     if isinstance(tts_options, dict) and type(tts_options.get("streaming_overlap")) is bool:
         return tts_options["streaming_overlap"], "pipeline"
     return global_enabled, "global"
+
+
+class EndOfTurnPolicy:
+    """Decide when accumulated STT results become one LLM turn.
+
+    Streaming STT returns a result at every phrase boundary, so phrase count is
+    no signal at all about whether the caller has finished. The turn ends on
+    silence and nothing else: every new result restarts the window, and the turn
+    starts once the caller has been quiet for ``end_of_turn_silence_ms``. A bare
+    "yes" is therefore answered as promptly as a paragraph.
+
+    A streaming recognizer only emits a result after its own silence gate, so a
+    window measured from the result can never bridge a caller who pauses and
+    goes on: the continuation's result arrives only after they pause again.
+    With ``end_of_turn_source`` set to ``talk_detect`` (the default ``auto``
+    picks it whenever Asterisk TALK_DETECT is enabled for the pipeline) the turn
+    is instead held while Asterisk reports the caller talking and released a
+    short grace after it reports them quiet, so the silence that ends a turn is
+    measured from the caller's last sound by the same detector that drives
+    barge-in. ``pipelines.<name>`` then tunes it through
+    ``barge_in.pipeline_talk_detect_silence_ms``.
+
+    With Silero VAD enabled (``vad.silero_enabled``) the engine's own neural
+    detector plays that role instead: ``auto`` prefers it over talk detection,
+    ``vad`` pins it, and the same grace and hold apply to its start and stop.
+    Because the engine also tells the recognizer to finalize the moment Silero
+    reports the caller quiet, the turn additionally waits up to
+    ``end_of_turn_vad_final_wait_ms`` for that result to arrive.
+
+    The superseded ``aggregation_*`` options are still read so deployed configs
+    keep working: the two window options are converted from seconds, and the
+    word/character thresholds are reported in :attr:`ignored_options` for the
+    caller to log, since length no longer decides anything.
+    """
+
+    DEFAULT_SILENCE_MS = 700
+    DEFAULT_TALK_DETECT_GRACE_MS = 250
+    DEFAULT_TALK_DETECT_HOLD_MS = 8000
+    DEFAULT_VAD_FINAL_WAIT_MS = 1000
+    SOURCES = ("auto", "vad", "talk_detect", "final")
+    # Superseded: a silence window in seconds, most recent first.
+    LEGACY_SILENCE_KEYS = ("aggregation_silence_sec", "aggregation_timeout_sec")
+    LEGACY_MAX_WAIT_KEYS = ("aggregation_max_wait_sec",)
+    # Superseded and no longer consulted at all.
+    RETIRED_KEYS = (
+        "aggregation_min_words",
+        "aggregation_min_chars",
+        "aggregation_wait_for_silence",
+    )
+
+    __slots__ = (
+        "silence_ms",
+        "max_wait_ms",
+        "source",
+        "talk_detect_grace_ms",
+        "talk_detect_hold_ms",
+        "vad_final_wait_ms",
+        "ignored_options",
+        "legacy_options",
+    )
+
+    def __init__(self, options: Any = None) -> None:
+        opts = options if isinstance(options, dict) else {}
+        legacy: List[str] = []
+
+        silence_ms = self._as_float(opts.get("end_of_turn_silence_ms"), None)
+        if silence_ms is None:
+            silence_ms = self._legacy_ms(opts, self.LEGACY_SILENCE_KEYS, legacy)
+        if silence_ms is None:
+            silence_ms = float(self.DEFAULT_SILENCE_MS)
+        self.silence_ms = max(0.0, silence_ms)
+
+        # 0 disables the cap, which is the default: cutting a monologue short is
+        # the very behaviour the silence window exists to prevent.
+        max_wait_ms = self._as_float(opts.get("end_of_turn_max_wait_ms"), None)
+        if max_wait_ms is None:
+            max_wait_ms = self._legacy_ms(opts, self.LEGACY_MAX_WAIT_KEYS, legacy)
+        self.max_wait_ms = max(0.0, max_wait_ms or 0.0)
+
+        source = str(opts.get("end_of_turn_source") or "auto").strip().lower()
+        self.source = source if source in self.SOURCES else "auto"
+        # Grace after Asterisk reports the caller quiet (or after a result that
+        # lands while they already are), long enough for a result that is about
+        # to arrive to join the turn, short enough not to be felt.
+        grace_ms = self._as_float(opts.get("end_of_turn_talk_detect_grace_ms"), None)
+        if grace_ms is None:
+            grace_ms = float(self.DEFAULT_TALK_DETECT_GRACE_MS)
+        self.talk_detect_grace_ms = max(0.0, grace_ms)
+        # How long a pending result is held while Asterisk keeps reporting
+        # speech without any newer result. A ChannelTalkingFinished is not
+        # guaranteed to arrive, and a caller still talking produces results
+        # every phrase, so a long quiet hold means the end event was lost.
+        hold_ms = self._as_float(opts.get("end_of_turn_talk_detect_hold_ms"), None)
+        if hold_ms is None:
+            hold_ms = float(self.DEFAULT_TALK_DETECT_HOLD_MS)
+        self.talk_detect_hold_ms = max(0.0, hold_ms)
+        # How long a turn waits for the result the recognizer was told to
+        # produce when Silero reported the caller quiet. The result normally
+        # lands well inside this; the bound only matters when it never comes.
+        final_wait_ms = self._as_float(opts.get("end_of_turn_vad_final_wait_ms"), None)
+        if final_wait_ms is None:
+            final_wait_ms = float(self.DEFAULT_VAD_FINAL_WAIT_MS)
+        self.vad_final_wait_ms = max(0.0, final_wait_ms)
+
+        self.legacy_options = tuple(legacy)
+        self.ignored_options = tuple(
+            key for key in self.RETIRED_KEYS if opts.get(key) is not None
+        )
+
+    @classmethod
+    def _legacy_ms(
+        cls, opts: Dict[str, Any], keys: Tuple[str, ...], seen: List[str]
+    ) -> Optional[float]:
+        """Read the first present legacy key, converting seconds to ms."""
+        for key in keys:
+            seconds = cls._as_float(opts.get(key), None)
+            if seconds is None:
+                continue
+            seen.append(key)
+            return seconds * 1000.0
+        return None
+
+    @staticmethod
+    def _as_float(value: Any, default: Optional[float]) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @property
+    def silence_sec(self) -> float:
+        return self.silence_ms / 1000.0
+
+    @property
+    def max_wait_sec(self) -> float:
+        return self.max_wait_ms / 1000.0
+
+    @property
+    def talk_detect_grace_sec(self) -> float:
+        return self.talk_detect_grace_ms / 1000.0
+
+    @property
+    def talk_detect_hold_sec(self) -> float:
+        return self.talk_detect_hold_ms / 1000.0
+
+    @property
+    def vad_final_wait_sec(self) -> float:
+        return self.vad_final_wait_ms / 1000.0
+
+    def resolve_source(self, talk_detect_enabled: bool, vad_enabled: bool = False) -> str:
+        """Name the detector that decides the end of turn for a call.
+
+        ``vad`` is Silero VAD tracking the call, ``talk_detect`` Asterisk talk
+        detection, ``final`` the silence window after each result. ``auto``
+        takes the first that is available in that order; a pinned ``vad``
+        without Silero falls back the same way, while a pinned ``talk_detect``
+        is honoured as configured.
+        """
+        if self.source == "final":
+            return "final"
+        if self.source == "talk_detect":
+            return "talk_detect"
+        if vad_enabled:
+            return "vad"
+        return "talk_detect" if talk_detect_enabled else "final"
+
+    def uses_talk_detect(self, talk_detect_enabled: bool) -> bool:
+        """Report whether Asterisk talk detection decides the end of turn."""
+        return self.resolve_source(talk_detect_enabled, False) == "talk_detect"
+
+    def flush_delay(self, elapsed: Optional[float] = None) -> float:
+        """Return how long to wait for another result before running the turn.
+
+        ``elapsed`` is the time in seconds since the caller's first pending
+        result, used only to honour ``end_of_turn_max_wait_ms``.
+        """
+        delay = self.silence_sec
+        if self.max_wait_ms > 0 and elapsed is not None:
+            delay = min(delay, self.max_wait_sec - elapsed)
+        return max(0.0, delay)
 
 
 def _outbound_attempt_stale_seconds() -> float:
@@ -330,6 +543,13 @@ _call_start_times = {}  # call_id -> timestamp
 # In-memory set to prevent duplicate cleanup (race condition guard)
 _cleanup_in_progress: set = set()  # call_ids currently being cleaned up
 _cleanup_completed_at: dict = {}  # call_id -> epoch seconds (best-effort dedupe for repeated StasisEnd/Destroyed)
+# Terminal hangups that are a guess about the conversation rather than an explicit
+# decision: the pipeline's farewell-without-tool fallback and the assistant-farewell
+# marker. A caller who interrupts the farewell shows the guess was wrong, so a
+# barge-in cancels them; the hangup_call tool's own hangup is left alone.
+_BARGE_IN_CANCELLABLE_TERMINAL_REASONS = frozenset(
+    {"pipeline_farewell_without_tool", "assistant_farewell_marker"}
+)
 _cleanup_lock = asyncio.Lock()  # Lock to make cleanup guard atomic (AAVA-148)
 
 
@@ -343,6 +563,46 @@ def _ts_msg(role: str, content, **extra) -> dict:
 
 # Keys that LLM chat-completion APIs accept in message objects.
 _LLM_MSG_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id"}
+
+# How long a watchdog announcement waits, once it has played, for the caller's
+# speech over it to end and its recognizer result to reach the dialog, so the
+# watchdog's decision right after it counts that answer.
+NO_INPUT_ANSWER_WAIT_SEC = 6.0
+
+
+def _ms_since(started_at: float) -> int:
+    """Whole milliseconds elapsed since a ``time.monotonic()`` reading."""
+    return max(0, int(round((time.monotonic() - started_at) * 1000.0)))
+
+
+def _latency_extra(timing: Optional[Dict[str, int]]) -> Dict[str, Any]:
+    """The ``latency`` field of a history entry, when its turn measured anything.
+
+    A pipeline turn keeps its stage latencies on its assistant entry: ``asr_ms``
+    (the recognizer's time for the caller's last phrase), ``wait_ms`` (the end
+    of the turn: the caller's last word, as the VAD saw it, to their words being
+    handed to the model), ``llm_first_token_ms`` and ``llm_ms`` (the model's time
+    to its first token and to the text the TTS started on), ``tts_ms`` (the
+    TTS's time to its first audio), ``turn_ms`` (the words being handed to the
+    model to the reply's first audio: LLM and TTS together, the figure the call's
+    average and maximum are made of) and ``response_ms`` (the caller's last word
+    to the reply's first audio: ``wait_ms`` plus ``turn_ms``). The dict is kept
+    by reference, so a stage that completes after the entry was appended (the
+    serial path records the reply before its TTS starts) still lands on it.
+    ``_sanitize_for_llm`` strips the field before a model sees the history.
+    """
+    return {"latency": timing} if timing else {}
+
+
+def _note_first_audio(timing: Dict[str, int], tts_started: Optional[float], turn_latency_ms: float) -> None:
+    """The reply's first audio: the TTS's share, the turn, and the caller's whole wait."""
+    if tts_started is not None:
+        timing.setdefault("tts_ms", _ms_since(tts_started))
+    turn_ms = max(0, int(round(float(turn_latency_ms))))
+    timing.setdefault("turn_ms", turn_ms)
+    wait_ms = timing.get("wait_ms")
+    if wait_ms is not None:
+        timing.setdefault("response_ms", int(wait_ms) + turn_ms)
 
 
 def _sanitize_for_llm(history: list) -> list:
@@ -424,6 +684,9 @@ class Engine:
         self._outbound_scheduler_task: Optional[asyncio.Task] = None
         self._vicidial_action_retry_task: Optional[asyncio.Task] = None
         self._retention_cleanup_task: Optional[asyncio.Task] = None
+        self._session_reconcile_task: Optional[asyncio.Task] = None
+        self._orphan_first_seen: Dict[str, float] = {}
+        self._destroyed_channel_ts: Dict[str, float] = {}
         # Warm/probe task for a local default provider (breaks the readiness
         # deadlock: LocalProvider opens its WS lazily on the first call, so
         # without this /ready -> is_connected() would never flip True until a
@@ -603,6 +866,75 @@ class Engine:
         self._resample_state_provider_out: Dict[str, Optional[tuple]] = {}
         # Forced pipeline PCM16@16k path (per-call)
         self._resample_state_pipeline16k: Dict[str, Optional[tuple]] = {}
+        # Silence budget per call while gated, and how much of it is spent.
+        self._pipeline_gated_silence_ms: Dict[str, float] = {}
+        # Per call: the pipeline reply currently on the playback stream and what the
+        # caller heard of it when a barge-in cut it (streaming.pipeline_heard_reply_on_interrupt).
+        self._spoken_replies: Dict[str, SpokenReply] = {}
+        self._pipeline_gated_silence_used_ms: Dict[str, float] = {}
+        # Asterisk talk-detect state per pipeline call, and the event that wakes
+        # the dialog worker when it changes, so the end of a turn is decided by
+        # the caller's last sound rather than by the recognizer's last result.
+        self._pipeline_caller_talking: Dict[str, bool] = {}
+        self._pipeline_caller_talk_changed_at: Dict[str, float] = {}
+        self._pipeline_turn_wakeup: Dict[str, asyncio.Event] = {}
+        # The detector the dialog worker resolved for each call ("vad",
+        # "talk_detect" or "final"), so talking reports from any other
+        # detector cannot compete with it.
+        self._pipeline_turn_source: Dict[str, str] = {}
+        # When the recognizer was last told to finalize after the caller
+        # stopped, and when its last result arrived, so the worker can wait
+        # for a result that is on its way before releasing the turn.
+        self._pipeline_stt_final_expected_at: Dict[str, float] = {}
+        self._pipeline_last_final_at: Dict[str, float] = {}
+        # The recognizer's latency for the last result of each call, taken by
+        # the turn that result starts and recorded on the turn's history entry.
+        self._pipeline_pending_asr_ms: Dict[str, int] = {}
+        # When the caller's last word of a turn was heard (monotonic), set as
+        # the turn is dispatched and taken by the turn for its wait figure.
+        self._pipeline_turn_speech_ended_at: Dict[str, float] = {}
+        # Silero VAD: the shared model (loaded in start()) and one tracker per
+        # pipeline call, plus resample state for wire rates it does not take.
+        self._silero_model: Optional[SileroVadModel] = None
+        self._silero_trackers: Dict[str, SileroCallerTracker] = {}
+        # Calls whose caller started talking inside the barge-in protection
+        # window: when it ends and they are still talking, they interrupt.
+        self._silero_deferred_barge_in: Dict[str, float] = {}
+        self._resample_state_silero16k: Dict[str, Optional[tuple]] = {}
+        # Per-call state of the conversion to vad.silero_sample_rate.
+        self._resample_state_silero_vad: Dict[str, Optional[tuple]] = {}
+        self._silero_settings: Dict[str, Any] = self._read_silero_settings(config)
+        # Silero cuts the caller's utterances for the recognizer
+        # (vad.silero_stt_utterances): one cutter per pipeline call, its
+        # resample state for wire rates other than the recognizer's, the start
+        # times of the utterances sent (FIFO, matched to the results that
+        # come back) and the calls warned that their recognizer takes only a
+        # stream.
+        self._utterance_cutters: Dict[str, UtteranceCutter] = {}
+        self._resample_state_utterance16k: Dict[str, Optional[tuple]] = {}
+        self._pipeline_utterance_starts: Dict[str, deque] = {}
+        # The calls whose caller is speaking over a watchdog announcement right
+        # now: their utterance is kept whole (logged once per utterance).
+        self._pipeline_speech_over_announcement: Set[str] = set()
+        self._pipeline_utterance_fallback_warned: Set[str] = set()
+        # The reply a pipeline turn is producing right now, so the caller
+        # going on before its first sound can discard it, and the event that
+        # tells the turn they went on (streaming.pipeline_discard_unheard_reply).
+        self._pipeline_reply_inflight: Dict[str, Dict[str, Any]] = {}
+        self._pipeline_caller_resumed: Dict[str, asyncio.Event] = {}
+        # How many continuations of a cut-off reply in a row came to nothing
+        # themselves (streaming.pipeline_continue_reply_after_empty_interrupt).
+        self._pipeline_continue_streak: Dict[str, int] = {}
+        # Smart Turn: the shared model (loaded in start()), the caller's
+        # recent audio per pipeline call, and per call the verdict for the
+        # current stop or the analysis still running for it.
+        self._smart_turn_model: Optional[SmartTurnModel] = None
+        self._turn_audio: Dict[str, TurnAudioBuffer] = {}
+        self._pipeline_turn_verdict: Dict[str, Dict[str, Any]] = {}
+        self._pipeline_turn_verdict_pending: Dict[str, Dict[str, Any]] = {}
+        self._smart_turn_settings: Dict[str, Any] = self._read_smart_turn_settings(config)
+        # LLM warm-up requests in flight, one per call, cancelled at cleanup.
+        self._pipeline_llm_warm_ups: Dict[str, asyncio.Task] = {}
         # Enhanced VAD normalization to 8 kHz (per-call)
         self._resample_state_vad8k: Dict[str, Optional[tuple]] = {}
         self.pending_channel_for_bind: Optional[str] = None
@@ -632,6 +964,16 @@ class Engine:
         self._terminal_hangup_locks: Dict[str, asyncio.Lock] = {}
         self._terminal_hangup_started: Set[str] = set()
         self._terminal_fallback_tasks: Dict[str, asyncio.Task] = {}
+        # Why each pending terminal hangup (and fallback timer) was started, and
+        # the calls whose pending hangup a barge-in cancelled: a heuristic
+        # farewell hangup yields to a caller who interrupts the farewell.
+        self._terminal_hangup_reasons: Dict[str, str] = {}
+        self._terminal_fallback_reasons: Dict[str, str] = {}
+        self._terminal_hangup_cancelled: Set[str] = set()
+        # Calls whose record is already in the call history: the transcript
+        # of such a record is synced again when the conversation grows later
+        # in the cleanup (the caller's last words after a hangup).
+        self._call_history_persisted: Set[str] = set()
         # A rejected VICIdial leg may survive a failed ARI DELETE after the
         # call session is cleaned up. Keep an independent owner retrying that
         # exact channel until Asterisk accepts the hangup or reports it gone.
@@ -900,14 +1242,23 @@ class Engine:
             self._tool_generation = None
         # 1) Load providers first (low risk)
         await self._load_providers()
+
+        # Silero VAD and Smart Turn, when enabled, before the first call can need them.
+        await self._init_silero_vad()
+        await self._init_smart_turn()
         
         # Initialize tool calling system
         try:
             from src.tools.registry import tool_registry
             tool_registry.clear()
             tool_registry.initialize_default_tools()
-            # Initialize HTTP tools from config (Milestone 24)
             tools_config = getattr(self.config, 'tools', None)
+            # Operator wording for built-in tools (tools.<name>.description and
+            # parameter_descriptions) applies before any schema is built.
+            if tools_config:
+                tool_registry.configure_tools(tools_config)
+                tool_registry.apply_definition_overrides(tools_config)
+            # Initialize HTTP tools from config (Milestone 24)
             if tools_config:
                 tool_registry.initialize_http_tools_from_config(tools_config)
             # Initialize in-call HTTP tools from config
@@ -1213,6 +1564,12 @@ class Engine:
                 self._retention_cleanup_task = asyncio.create_task(self._retention_cleanup_loop())
         except Exception:
             logger.debug("Failed to start retention cleanup task", exc_info=True)
+        # Session reconciliation: drop sessions whose channel is gone from Asterisk.
+        try:
+            if not self._session_reconcile_task:
+                self._session_reconcile_task = asyncio.create_task(self._session_reconcile_loop())
+        except Exception:
+            logger.debug("Failed to start session reconciliation task", exc_info=True)
         # Local default-provider warm/probe: connect proactively so /ready can
         # become true without a prior call (no-op for non-local defaults).
         try:
@@ -1320,10 +1677,19 @@ class Engine:
                 "is_outbound": bool(getattr(session, "is_outbound", False)),
             }
             await self._save_session(session)
+            # The hard duration cap counts from the call's start, not from
+            # this registration (an outbound call has already been through
+            # the AMD hop by now).
+            elapsed_sec = 0.0
+            start_time = getattr(session, "start_time", None)
+            if isinstance(start_time, datetime):
+                started = start_time if start_time.tzinfo else start_time.replace(tzinfo=timezone.utc)
+                elapsed_sec = max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
             await watchdog.register(
                 session.call_id,
                 policy,
                 is_outbound=bool(getattr(session, "is_outbound", False)),
+                elapsed_sec=elapsed_sec,
             )
         except Exception:
             logger.error(
@@ -1631,6 +1997,17 @@ class Engine:
                 silence_ms = 0
                 if not speaking and speech_ms >= 120:
                     speaking = True
+                    state["sound_started_at"] = time.monotonic()
+                    # The detector is silent otherwise, and a line that beeps
+                    # or hums reads in the log as a watchdog that never fires.
+                    logger.info(
+                        "Caller sound reported to the inactivity watchdog",
+                        call_id=session.call_id,
+                        source=source,
+                        energy=energy,
+                        threshold=int(threshold),
+                        webrtc_vad=webrtc_positive,
+                    )
                     await watchdog.note_input_state(
                         session.call_id,
                         True,
@@ -1641,6 +2018,13 @@ class Engine:
                 speech_ms = 0
                 if speaking and silence_ms >= 300:
                     speaking = False
+                    started = state.get("sound_started_at")
+                    logger.info(
+                        "Caller sound ended",
+                        call_id=session.call_id,
+                        source=source,
+                        duration_ms=int((time.monotonic() - float(started)) * 1000) if started else None,
+                    )
                     await watchdog.note_input_state(
                         session.call_id,
                         False,
@@ -1806,71 +2190,115 @@ class Engine:
             if value:
                 setattr(session, attr, value)
 
-    @staticmethod
-    def _serialize_outbound_custom_vars(custom_vars: Any) -> str:
-        """Return bounded, canonical JSON for one lead's outbound context."""
-        if custom_vars is None:
-            custom_vars = {}
-        if not isinstance(custom_vars, dict):
-            raise ValueError("outbound custom_vars must be a JSON object")
-        try:
-            serialized = json.dumps(
-                custom_vars,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("outbound custom_vars must be JSON serializable") from exc
-        serialized_bytes = len(serialized.encode("utf-8"))
-        if serialized_bytes > OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES:
-            raise ValueError(
-                "outbound custom_vars exceed the "
-                f"{OUTBOUND_CUSTOM_VARS_MAX_SERIALIZED_BYTES}-byte serialized limit"
-            )
-        return serialized
+    async def _hydrate_outbound_custom_vars(self, session: CallSession) -> None:
+        """Populate session.outbound_custom_vars from attempt metadata.
 
-    async def _set_and_confirm_outbound_custom_vars(
-        self,
-        channel_id: str,
-        expected_json: str,
-    ) -> bool:
-        """Set and read back lead context without logging its sensitive value."""
-        try:
-            write_ok = await self.ari_client.set_channel_var(
-                channel_id,
-                "AAVA_CUSTOM_VARS_JSON",
-                expected_json,
-            )
-            response = await self.ari_client.send_command(
-                "GET",
-                f"channels/{channel_id}/variable",
-                params={"variable": "AAVA_CUSTOM_VARS_JSON"},
-                tolerate_statuses=[404],
-            )
-            actual = str(response.get("value") or "") if isinstance(response, dict) else ""
-            confirmed = actual == expected_json
-            if not confirmed:
+        Lead custom_vars never travel through Asterisk channel variables (no
+        size limits, no read-back dance): the in-memory attempt metadata is the
+        fast path, and the durable outbound store is the fallback for an engine
+        restart while the call was in the dialplan hop.
+        """
+        attempt_id = str(getattr(session, "outbound_attempt_id", "") or "").strip()
+        if not attempt_id:
+            return
+        meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+        custom_vars = meta.get("custom_vars") if isinstance(meta, dict) else None
+        if not isinstance(custom_vars, dict) or not custom_vars:
+            try:
+                runtime = await self.outbound_store.get_active_attempt_runtime_context(attempt_id)
+            except Exception:
                 logger.error(
-                    "Outbound custom_vars channel state could not be confirmed",
-                    channel_id=channel_id,
-                    write_confirmed=bool(write_ok),
-                    expected_bytes=len(expected_json.encode("utf-8")),
-                    observed_bytes=len(actual.encode("utf-8")),
+                    "Failed to hydrate outbound custom_vars from store",
+                    attempt_id=attempt_id,
+                    exc_info=True,
                 )
-            elif not write_ok:
-                logger.warning(
-                    "Outbound custom_vars write response was unsuccessful but read-back matched",
-                    channel_id=channel_id,
-                )
-            return confirmed
+                return
+            custom_vars = runtime.get("custom_vars") if isinstance(runtime, dict) else None
+        if isinstance(custom_vars, dict) and custom_vars:
+            session.outbound_custom_vars = custom_vars
+
+    def _outbound_attempt_meta_for_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """The in-memory attempt metadata of an outbound channel, if the engine still holds it."""
+        if not channel_id:
+            return None
+        by_channel = getattr(self, "_outbound_attempt_meta_by_channel_id", None) or {}
+        meta = by_channel.get(channel_id)
+        return meta if isinstance(meta, dict) else None
+
+    def _seed_outbound_session_from_attempt(self, session: CallSession, meta: Dict[str, Any]) -> bool:
+        """Give a new outbound session its identity from the attempt metadata in memory.
+
+        The attempt, campaign and lead ids, the lead's number and name, the
+        custom_vars, the campaign's Agent and routing are known to the engine
+        since the originate; reading them back from channel variables costs a
+        round trip per variable to the PBX and returns nothing once the far end
+        has dropped the channel, which left the session anonymous exactly when
+        cleanup raced setup. Returns True when the attempt id was applied.
+        """
+        session.is_outbound = True
+        attempt_id = str(meta.get("attempt_id") or "").strip()
+        if attempt_id:
+            session.outbound_attempt_id = attempt_id
+        campaign_id = str(meta.get("campaign_id") or "").strip()
+        if campaign_id:
+            session.outbound_campaign_id = campaign_id
+        lead_id = str(meta.get("lead_id") or "").strip()
+        if lead_id:
+            session.outbound_lead_id = lead_id
+        phone = str(meta.get("phone_number") or "").strip()
+        if phone:
+            session.caller_number = phone
+            session.called_number = phone
+        lead_name = str(meta.get("lead_name") or "").strip()
+        current_name = str(session.caller_name or "").strip()
+        if lead_name:
+            session.caller_name = lead_name
+        elif phone and current_name in ("", str(getattr(self, "_outbound_extension_identity", "") or "")):
+            session.caller_name = f"Outbound {phone}"
+        custom_vars = meta.get("custom_vars")
+        if isinstance(custom_vars, dict) and custom_vars:
+            session.outbound_custom_vars = dict(custom_vars)
+        caller_id = str(meta.get("caller_id") or "").strip()
+        if caller_id:
+            session.outbound_caller_id = caller_id
+            session.outbound_caller_id_source = str(meta.get("caller_id_source") or "").strip() or None
+        context = str(meta.get("context") or "").strip()
+        if context:
+            session.context_name = context
+            session.routing_method = str(meta.get("routing_method") or "ai_context")
+        return bool(attempt_id)
+
+    def _preassign_context_pipeline(self, session: CallSession) -> Optional[str]:
+        """Name the pipeline of the session's Agent before the session is first saved.
+
+        The pipeline is assigned for real in the last setup step; until then the
+        session carried the configured default full-agent provider, which is
+        what call history and the post-call tools reported for a call that
+        ended during setup. Returns the pipeline name when the Agent has one.
+        """
+        context_name = str(getattr(session, "context_name", "") or "").strip()
+        if not context_name:
+            return None
+        try:
+            orchestrator = getattr(self, "transport_orchestrator", None)
+            resolver = getattr(orchestrator, "get_context_config", None)
+            if not callable(resolver):
+                return None
+            ctx_config = resolver(context_name, getattr(session, "routing_method", None))
+            pipeline = str(getattr(ctx_config, "pipeline", "") or "").strip() if ctx_config else ""
+            if not pipeline:
+                return None
+            session.pipeline_name = pipeline
+            self._assign_session_provider(session, "pipeline")
+            return pipeline
         except Exception:
-            logger.error(
-                "Outbound custom_vars channel confirmation failed",
-                channel_id=channel_id,
+            logger.debug(
+                "Could not pre-assign the Agent's pipeline",
+                call_id=getattr(session, "call_id", None),
+                context=context_name,
                 exc_info=True,
             )
-            return False
+            return None
 
     async def _reject_outbound_answered_attempt(
         self,
@@ -1919,6 +2347,15 @@ class Engine:
                     lead_id=lead_id,
                     exc_info=True,
                 )
+        if attempt_id:
+            # ChannelDestroyed sees the fail-closed marker below and does not
+            # report this attempt a second time.
+            await self._outbound_post_call_tools_for_attempt(
+                {**(meta or {}), "attempt_id": attempt_id, "campaign_id": campaign_id, "lead_id": lead_id},
+                outcome="error",
+                error_message=error_message,
+                channel_id=channel_id,
+            )
         seen_outbound = getattr(self, "_seen_outbound_channels", None)
         if seen_outbound is not None:
             seen_outbound.add(channel_id)
@@ -2885,6 +3322,7 @@ class Engine:
                                 context=context_name,
                                 provider=resolved_context_provider,
                             )
+                            caller_id, caller_id_source = self._outbound_caller_identity(lead)
                             self._outbound_attempt_meta_by_attempt_id[attempt_id] = {
                                 "attempt_id": attempt_id,
                                 "campaign_id": campaign_id,
@@ -2895,6 +3333,9 @@ class Engine:
                                 "provider": resolved_context_provider,
                                 "lead_name": str(lead.get("name") or "").strip() or None,
                                 "custom_vars": lead.get("custom_vars") or {},
+                                # What the call is placed from, for the post-call tools.
+                                "caller_id": caller_id,
+                                "caller_id_source": caller_id_source,
                                 "created_at_ts": time.time(),
                             }
 
@@ -2905,7 +3346,11 @@ class Engine:
                                     outcome="canceled",
                                     error_message="Lead not leased (state transition failed)",
                                 )
-                                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+                                await self._outbound_post_call_tools_for_attempt(
+                                    self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                                    outcome="canceled",
+                                    error_message="Lead not leased (state transition failed)",
+                                )
                                 continue
 
                             await self._outbound_originate_attempt(campaign, lead, attempt_id)
@@ -2957,9 +3402,6 @@ class Engine:
             dial_phone = phone.lstrip("+").strip()
 
         context_name, routing_method = self._outbound_agent_selector(campaign, lead)
-        custom_vars = lead.get("custom_vars")
-        if custom_vars is None:
-            custom_vars = {}
         lead_name = str(lead.get("name") or "").strip() or None
 
         # If an Agent declares a monolithic provider (e.g., google_live), honor it by setting
@@ -3002,7 +3444,13 @@ class Engine:
             consent_timeout = 30
         consent_media_uri = str(campaign.get("consent_media_uri") or "").strip()
 
-        caller_id_num = self._outbound_extension_identity
+        caller_id_num, caller_identity_source = self._outbound_caller_identity(lead)
+        # The post-call tools report the identity the call was placed from,
+        # whether or not the originate succeeds.
+        attempt_meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+        if isinstance(attempt_meta, dict):
+            attempt_meta["caller_id"] = caller_id_num
+            attempt_meta["caller_id_source"] = caller_identity_source
         caller_id_name = str(os.getenv("AAVA_OUTBOUND_CALLERID_NAME", "Asterisk AI")).strip() or "Asterisk AI"
         caller_id_header = f"{caller_id_name} <{caller_id_num}>"
 
@@ -3037,42 +3485,10 @@ class Engine:
             channel_vars["AAVA_CONSENT_PLAYBACK"] = playback
         if amd_opts:
             channel_vars["AAVA_AMD_OPTS"] = amd_opts
-        try:
-            custom_vars_json = self._serialize_outbound_custom_vars(custom_vars)
-        except ValueError as exc:
-            error_message = str(exc)
-            logger.warning(
-                "Outbound originate rejected invalid custom_vars",
-                campaign_id=campaign_id,
-                lead_id=lead_id,
-                attempt_id=attempt_id,
-                error=error_message,
-            )
-            await self.outbound_store.finish_attempt(
-                attempt_id,
-                outcome="error",
-                error_message=error_message,
-            )
-            try:
-                await self.outbound_store.set_lead_state(
-                    lead_id,
-                    state="failed",
-                    last_outcome="error",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to persist invalid custom_vars lead state",
-                    campaign_id=campaign_id,
-                    lead_id=lead_id,
-                    attempt_id=attempt_id,
-                    exc_info=True,
-                )
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
-            return
-        channel_vars["AAVA_CUSTOM_VARS_JSON"] = custom_vars_json
-        meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
-        if isinstance(meta, dict):
-            meta["custom_vars_json"] = custom_vars_json
+        # Lead custom_vars deliberately stay OFF the channel: the engine already
+        # owns them (attempt metadata + durable outbound store) and re-reads
+        # them by attempt id when the call comes back to Stasis, so there is no
+        # size limit and nothing to confirm on the wire.
 
         # Local/ channels can create two halves (;1 / ;2). Ensure our outbound control vars
         # survive any Local channel boundary by also setting the inherited variants.
@@ -3091,7 +3507,6 @@ class Engine:
             "AAVA_CONSENT_TIMEOUT",
             "AAVA_CONSENT_PLAYBACK",
             "AAVA_AMD_OPTS",
-            "AAVA_CUSTOM_VARS_JSON",
             "AAVA_LEAD_NAME",
         ]
         for key in _inherit_keys:
@@ -3109,6 +3524,8 @@ class Engine:
             endpoint=endpoint,
             context=context_name,
             routing_method=routing_method,
+            caller_identity=caller_id_num,
+            caller_identity_source=caller_identity_source,
         )
 
         resp = await self.ari_client.originate_channel(
@@ -3128,7 +3545,11 @@ class Engine:
                 await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome="error")
             except Exception:
                 pass
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                outcome="error",
+                error_message=reason,
+            )
             return
 
         channel_id = resp.get("id") if isinstance(resp, dict) else None
@@ -3138,7 +3559,11 @@ class Engine:
                 await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome="error")
             except Exception:
                 pass
-            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None),
+                outcome="error",
+                error_message="originate returned no channel id",
+            )
             return
 
         await self.outbound_store.set_attempt_channel(attempt_id, str(channel_id))
@@ -3147,6 +3572,22 @@ class Engine:
         meta["originated_at_ts"] = time.time()
         self._outbound_attempt_meta_by_attempt_id[attempt_id] = meta
         self._outbound_attempt_meta_by_channel_id[str(channel_id)] = meta
+
+    def _outbound_caller_identity(self, lead: Dict[str, Any]) -> Tuple[str, str]:
+        """The identity an outbound call is placed from, and where it came from.
+
+        A lead's ``caller_id_override`` (CSV column ``caller_id``, the manual
+        lead form, ``PATCH /leads/{id}``) replaces the global
+        ``AAVA_OUTBOUND_EXTENSION_IDENTITY`` for that lead's calls. The value
+        becomes ``CALLERID(num)`` and, on FreePBX, ``AMPUSER``/``FROMEXTEN``
+        as well, so the PBX treats the call as placed from that extension and
+        applies its outbound CID, trunk and route permissions: one campaign
+        can dial its leads from different extensions.
+        """
+        override = str((lead or {}).get("caller_id_override") or "").strip()
+        if override:
+            return override, "lead"
+        return self._outbound_extension_identity, "global"
 
     async def _outbound_choose_endpoint(self, dial_phone: str) -> str:
         """
@@ -3295,6 +3736,12 @@ class Engine:
                 self._outbound_attempt_amd.pop(attempt_id, None)
                 if channel_id:
                     self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+                await self._outbound_post_call_tools_for_attempt(
+                    meta,
+                    outcome="no_answer",
+                    error_message="stale originate (no StasisStart)",
+                    channel_id=channel_id or None,
+                )
         except Exception:
             logger.debug("Outbound stale-attempt cleanup failed", exc_info=True)
 
@@ -3338,6 +3785,10 @@ class Engine:
                     campaign_id=str(meta.get("campaign_id") or ""),
                     lead_id=str(meta.get("lead_id") or ""),
                 )
+                if "caller_id_override" in meta and not str(meta.get("caller_id") or "").strip():
+                    # The durable row carries the lead's override: the identity
+                    # the call was placed from is the same function of it as at originate.
+                    meta["caller_id"], meta["caller_id_source"] = self._outbound_caller_identity(meta)
         if not meta:
             await self._reject_outbound_answered_attempt(
                 channel_id,
@@ -3359,6 +3810,12 @@ class Engine:
         previous_channel_id = str(meta.get("channel_id") or "")
         meta = dict(meta)
         meta["channel_id"] = channel_id
+        # The answer is the start of what the callee heard: a drop after it is
+        # recorded in call history with a duration measured from here.
+        if not meta.get("answered_at_ts"):
+            import time as _time
+
+            meta["answered_at_ts"] = _time.time()
         self._outbound_attempt_meta_by_attempt_id[attempt_id] = meta
         if previous_channel_id and previous_channel_id != channel_id:
             self._outbound_attempt_meta_by_channel_id.pop(
@@ -3387,37 +3844,6 @@ class Engine:
                 lead_id=str(meta.get("lead_id") or ""),
                 exc_info=True,
             )
-
-        # Lead context is mandatory when supplied. Keep this confirmation
-        # independent from the other best-effort safety-net writes below: a
-        # correlation write failure must never skip the fail-closed gate.
-        custom_vars = (meta.get("custom_vars") or {}) if meta else {}
-        if custom_vars:
-            try:
-                expected_custom_vars_json = str(
-                    meta.get("custom_vars_json")
-                    or self._serialize_outbound_custom_vars(custom_vars)
-                )
-            except ValueError:
-                expected_custom_vars_json = ""
-            confirmed = (
-                bool(expected_custom_vars_json)
-                and await self._set_and_confirm_outbound_custom_vars(
-                    channel_id,
-                    expected_custom_vars_json,
-                )
-            )
-            if not confirmed:
-                error_message = (
-                    "outbound custom_vars could not be confirmed after answer"
-                )
-                await self._reject_outbound_answered_attempt(
-                    channel_id,
-                    attempt_id,
-                    meta,
-                    error_message,
-                )
-                return
 
         # Ensure correlation vars exist for the dialplan hop (FreePBX/local channels can drop vars).
         try:
@@ -3626,6 +4052,11 @@ class Engine:
                     )
                 except Exception:
                     pass
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome="voicemail_dropped" if vm_enabled else "machine_detected",
+                channel_id=channel_id,
+            )
 
             # Cleanup mappings and hang up.
             if attempt_id:
@@ -3657,6 +4088,11 @@ class Engine:
                     )
                 except Exception:
                     pass
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome="consent_denied" if consent_result == "denied" else "consent_timeout",
+                channel_id=channel_id,
+            )
             if attempt_id:
                 self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
                 self._outbound_attempt_amd.pop(attempt_id, None)
@@ -3751,7 +4187,27 @@ class Engine:
                 # If we never reached AMD (so we never got an answer/StasisStart), treat as no_answer.
                 outcome = "no_answer"
 
+            hangup_cause = str(event.get("cause_txt") or cause_txt or cause or "") or None
+
+            # The callee answered and the line dropped before the agent session
+            # existed (the operator's side hangs up right after AMD): the call
+            # deserves the same history row an answered call gets, with the lead's
+            # number and name, the campaign and the hangup cause, not the empty
+            # "abandoned" stub of the no-session cleanup path. Written before the
+            # attempt is finished so the attempt links to it, as an answered call's does.
+            history_record_id: Optional[str] = None
+            if amd or (isinstance(meta, dict) and meta.get("answered_at_ts")):
+                history_record_id = await self._persist_outbound_attempt_history(
+                    meta,
+                    channel_id=channel_id,
+                    attempt_outcome=outcome,
+                    hangup_cause=hangup_cause,
+                    amd=amd,
+                )
             if attempt_id:
+                finish_kwargs: Dict[str, Any] = {}
+                if history_record_id:
+                    finish_kwargs["call_history_call_id"] = history_record_id
                 await self.outbound_store.finish_attempt(
                     attempt_id,
                     outcome=outcome,
@@ -3761,7 +4217,8 @@ class Engine:
                     consent_result=(amd or {}).get("consent_result"),
                     context=str((meta or {}).get("context") or "") or None,
                     provider=str((meta or {}).get("provider") or "") or None,
-                    error_message=str(event.get("cause_txt") or cause_txt or cause or "") or None,
+                    error_message=hangup_cause,
+                    **finish_kwargs,
                 )
             if lead_id:
                 try:
@@ -3773,8 +4230,218 @@ class Engine:
                 self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
                 self._outbound_attempt_amd.pop(attempt_id, None)
             self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+            await self._outbound_post_call_tools_for_attempt(
+                meta,
+                outcome=outcome,
+                error_message=hangup_cause,
+                channel_id=channel_id,
+            )
         except Exception:
             logger.debug("Outbound ChannelDestroyed handler failed", exc_info=True)
+
+    async def _persist_outbound_attempt_history(
+        self,
+        meta: Optional[Dict[str, Any]],
+        *,
+        channel_id: str,
+        attempt_outcome: str,
+        hangup_cause: Optional[str],
+        amd: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Write the call-history row for an outbound attempt that was answered but
+        never reached a CallSession; returns the row id for the attempt to link to.
+
+        Mirrors what ``_persist_call_history`` writes for a call that hung up
+        during the greeting: outcome ``abandoned``, the lead's number on both
+        sides, the lead's name or ``Outbound <number>``, the campaign context,
+        a duration measured from the answer. The attempt's own outcome, the
+        hangup cause and the AMD verdict go to ``external_metadata`` so the
+        row explains itself without being reported as an error.
+        """
+        try:
+            from src.core.call_history import CallRecord, get_call_history_store
+
+            store = get_call_history_store()
+            if store is None or not getattr(store, "_enabled", False):
+                return None
+            meta = dict(meta or {})
+            now = datetime.now(timezone.utc)
+            answered_ts = meta.get("answered_at_ts")
+            started_ts = answered_ts or meta.get("originated_at_ts") or meta.get("created_at_ts")
+            start_time = now
+            if started_ts:
+                try:
+                    start_time = datetime.fromtimestamp(float(started_ts), tz=timezone.utc)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    start_time = now
+            duration = max(0.0, (now - start_time).total_seconds()) if answered_ts else 0.0
+            phone = str(meta.get("phone_number") or "").strip() or None
+            lead_name = str(meta.get("lead_name") or "").strip()
+            context_name = str(meta.get("context") or "").strip() or None
+            provider = str(meta.get("provider") or "").strip() or str(
+                getattr(self.config, "default_provider", "") or ""
+            ) or "unknown"
+            external_metadata: Dict[str, Any] = {
+                "call_direction": "outbound",
+                "attempt_id": str(meta.get("attempt_id") or "") or None,
+                "campaign_id": str(meta.get("campaign_id") or "") or None,
+                "lead_id": str(meta.get("lead_id") or "") or None,
+                "attempt_outcome": attempt_outcome,
+                "hangup_cause": hangup_cause,
+                "ended_before_session": True,
+            }
+            if amd:
+                external_metadata["amd_status"] = (amd or {}).get("amd_status")
+                external_metadata["amd_cause"] = (amd or {}).get("amd_cause")
+            record = CallRecord(
+                call_id=channel_id,
+                caller_number=phone,
+                caller_name=lead_name or (f"Outbound {phone}" if phone else "Outbound"),
+                called_number=phone,
+                start_time=start_time,
+                end_time=now,
+                duration_seconds=round(duration, 3),
+                provider_name=provider,
+                context_name=context_name,
+                routing_method=str(meta.get("routing_method") or "") or None,
+                outcome="abandoned",
+                external_direction="outbound",
+                external_metadata={k: v for k, v in external_metadata.items() if v is not None},
+            )
+            saved = await store.save(record)
+            if not saved:
+                return None
+            logger.info(
+                "Persisted call record for an outbound attempt that ended before the agent session",
+                call_id=channel_id,
+                attempt_id=external_metadata.get("attempt_id"),
+                caller_number=phone,
+                duration_seconds=record.duration_seconds,
+                hangup_cause=hangup_cause,
+            )
+            # save() is dedupe-by-call_id: a row that already existed keeps its own id.
+            record_id = str(getattr(record, "id", "") or "") or None
+            try:
+                persisted = await store.get_by_call_id(channel_id)
+                if persisted is not None and getattr(persisted, "id", None):
+                    record_id = str(getattr(persisted, "id"))
+            except Exception:
+                pass
+            return record_id
+        except Exception:
+            logger.debug(
+                "Failed to persist call history for the outbound attempt",
+                channel_id=channel_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _outbound_post_call_tools_for_attempt(
+        self,
+        meta: Optional[Dict[str, Any]],
+        *,
+        outcome: str,
+        error_message: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Run the post-call tools for an outbound attempt that ended without a call.
+
+        A rejected originate, a ring-out, a busy line, an answering machine or
+        a declined consent never gets a CallSession, so ``_cleanup_call`` and
+        its post-call tools never run for it and a CRM would never hear how
+        the dial ended. Every finished attempt is reported once: a call that
+        reached the agent reports through ``_cleanup_call``, everything else
+        through here. The context is built from the attempt metadata (lead,
+        campaign, custom_vars, ``call_outcome``, ``error_message``,
+        ``attempt_id``; no transcript, duration 0) and only tools that opt in
+        through ``runs_on_failed_dial()`` run. Nothing is written to call
+        history: there is no call record to attach it to. An attempt whose
+        metadata is gone (finalized after an engine restart) is not reported.
+        """
+        from src.tools.context import PostCallContext
+
+        attempt_id = str((meta or {}).get("attempt_id") or "").strip()
+        if not attempt_id:
+            return
+        try:
+            meta = dict(meta or {})
+            context_name = str(meta.get("context") or "").strip() or None
+            routing_method = meta.get("routing_method")
+            tool_registry = self._tool_registry_for_session(None)
+            tools_to_run = [
+                tool
+                for tool in self._post_call_tools_for_context(tool_registry, context_name, routing_method)
+                if self._post_call_tool_runs_on_failed_dial(tool)
+            ]
+            if not tools_to_run:
+                logger.debug(
+                    "No post-call tools opted in for the outbound attempt",
+                    attempt_id=attempt_id,
+                    context=context_name,
+                    call_outcome=outcome,
+                )
+                return
+
+            channel_id = str(channel_id or meta.get("channel_id") or "").strip()
+            call_id = channel_id or attempt_id
+            phone = str(meta.get("phone_number") or "").strip()
+            started_ts = meta.get("originated_at_ts") or meta.get("created_at_ts")
+            call_start_time = None
+            if started_ts:
+                try:
+                    call_start_time = datetime.fromtimestamp(float(started_ts), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    call_start_time = None
+            custom_vars = meta.get("custom_vars")
+            error_text = str(error_message).strip() if error_message else ""
+
+            logger.info(
+                "Executing post-call tools for outbound attempt without a call",
+                call_id=call_id,
+                attempt_id=attempt_id,
+                campaign_id=str(meta.get("campaign_id") or "") or None,
+                lead_id=str(meta.get("lead_id") or "") or None,
+                context=context_name,
+                call_outcome=outcome,
+                error=error_text or None,
+                tools=[t.definition.name for t in tools_to_run],
+            )
+
+            # The same caller fields an answered outbound call's session carries
+            # (see _handle_outbound_amd_result): the lead's number on both
+            # sides, the lead's name or "Outbound <number>".
+            lead_name = str(meta.get("lead_name") or "").strip()
+            post_call_ctx = PostCallContext(
+                call_id=call_id,
+                caller_number=phone,
+                called_number=phone or None,
+                caller_name=lead_name or (f"Outbound {phone}" if phone else "Outbound"),
+                context_name=context_name or "",
+                provider=str(meta.get("provider") or "").strip()
+                or str(getattr(self.config, "default_provider", "") or ""),
+                call_direction="outbound",
+                call_duration_seconds=0,
+                call_outcome=outcome,
+                call_start_time=call_start_time,
+                call_end_time=datetime.now(timezone.utc).isoformat(),
+                campaign_id=str(meta.get("campaign_id") or "") or None,
+                lead_id=str(meta.get("lead_id") or "") or None,
+                custom_vars=dict(custom_vars) if isinstance(custom_vars, dict) else {},
+                caller_id=str(meta.get("caller_id") or "").strip() or None,
+                caller_id_source=str(meta.get("caller_id_source") or "").strip() or None,
+                attempt_id=attempt_id,
+                error_message=error_text or None,
+                config=self._tool_config_for_session(None),
+                summary_generator=self._post_call_summary_generator(),
+            )
+            await self._run_post_call_tools(call_id, tools_to_run, post_call_ctx, record_history=False)
+        except Exception:
+            logger.error(
+                "Post-call tools for the outbound attempt failed to start",
+                attempt_id=attempt_id,
+                call_outcome=outcome,
+                exc_info=True,
+            )
 
     async def stop(self, graceful_timeout: float = 30.0):
         """Disconnect from ARI and stop the engine.
@@ -3800,6 +4467,7 @@ class Engine:
             "_local_warm_task",
             "_pipeline_readiness_task",
             "_retention_cleanup_task",
+            "_session_reconcile_task",
             "_vicidial_action_retry_task",
         ):
             try:
@@ -5851,12 +6519,30 @@ class Engine:
         except Exception:
             is_outbound = False
         
+        outbound_meta = self._outbound_attempt_meta_for_channel(caller_channel_id)
+        if outbound_meta and not is_outbound:
+            # The channel variable could not be read (the far end may already have
+            # dropped the channel); the attempt metadata in memory is authoritative.
+            is_outbound = True
+
         # Check if call is already in progress
         existing_session = await self.session_store.get_by_call_id(caller_channel_id)
         if existing_session:
             logger.warning("🎯 HYBRID ARI - Caller already in progress", channel_id=caller_channel_id)
             return
-        
+
+        if self._call_setup_aborted(caller_channel_id):
+            # ChannelDestroyed already came through for this channel (the far end
+            # dropped right after answering): every ARI call below would fail with
+            # "Channel not found" and the bridge created on the way would leak.
+            logger.info(
+                "🎯 HYBRID ARI - Channel is already gone; skipping call setup",
+                channel_id=caller_channel_id,
+            )
+            return
+
+        bridge_id: Optional[str] = None
+        session_registered = False
         try:
             # Answer the caller (inbound) or skip (outbound already answered)
             if not is_outbound:
@@ -5886,6 +6572,22 @@ class Engine:
                        channel_id=caller_channel_id, 
                        bridge_id=bridge_id)
             self.bridges[caller_channel_id] = bridge_id
+
+            if self._call_setup_aborted(caller_channel_id):
+                # The caller hung up while the bridge was being built: its cleanup
+                # found no session and will not run again, so a session created now
+                # would never be removed.
+                logger.info(
+                    "🎯 HYBRID ARI - Call ended during setup; not creating a session",
+                    channel_id=caller_channel_id,
+                    bridge_id=bridge_id,
+                )
+                try:
+                    await self.ari_client.destroy_bridge(bridge_id)
+                except Exception:
+                    logger.debug("Bridge teardown after aborted setup failed", bridge_id=bridge_id, exc_info=True)
+                self.bridges.pop(caller_channel_id, None)
+                return
             
             # Create CallSession and store in SessionStore
             session = CallSession(
@@ -5903,6 +6605,20 @@ class Engine:
             session.tool_runtime_generation = getattr(self, "_tool_generation", None)
             self._resolve_session_tool_runtime(session)
             session.is_outbound = bool(is_outbound)
+            seeded_attempt = False
+            if outbound_meta:
+                seeded_attempt = self._seed_outbound_session_from_attempt(session, outbound_meta)
+                seeded_pipeline = self._preassign_context_pipeline(session)
+                logger.info(
+                    "Outbound session seeded from attempt metadata",
+                    call_id=caller_channel_id,
+                    attempt_id=session.outbound_attempt_id,
+                    campaign_id=session.outbound_campaign_id,
+                    lead_id=session.outbound_lead_id,
+                    context=session.context_name,
+                    pipeline=seeded_pipeline,
+                    custom_vars=len(session.outbound_custom_vars or {}),
+                )
             # Per-provider VAD decision: local VAD active only when appropriate for this provider
             use_local = self._should_use_local_vad(session.provider_name)
             session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
@@ -5914,12 +6630,17 @@ class Engine:
                     vad_mode=getattr(self, "_vad_mode", "auto"),
                 )
             await self._save_session(session, new=True)
+            session_registered = True
 
             # Read called_number: cache (from ChannelVarSet events) > GET request > "unknown"
             # The cache is populated from DIALED_NUMBER and __FROM_DID ChannelVarSet events
             # which fire early in dialplan, before StasisStart. GET requests may fail due to timing.
             called_number = self._called_number_cache.pop(caller_channel_id, None)
-            if called_number:
+            known_called_number = str(getattr(session, "called_number", "") or "").strip()
+            if known_called_number:
+                # An outbound call dialed the lead's number; nothing to read back.
+                called_number = known_called_number
+            elif called_number:
                 logger.debug("Called number resolved from cache",
                             call_id=caller_channel_id,
                             called_number=called_number)
@@ -5950,8 +6671,9 @@ class Engine:
                        call_id=caller_channel_id,
                        called_number=session.called_number)
 
-            # If outbound, pull outbound metadata from channel vars (set during origination).
-            if is_outbound:
+            # If outbound and the attempt metadata was not in memory (engine restarted
+            # during the call), pull outbound metadata from channel vars (set during origination).
+            if is_outbound and not seeded_attempt:
                 try:
                     # If we can resolve outbound attempt meta, set context_name immediately so
                     # downstream prompt/greeting resolution does not depend on channel vars.
@@ -6006,21 +6728,9 @@ class Engine:
                             if value:
                                 outbound_channel_vars[var_name] = value
                     self._apply_outbound_session_metadata(session, outbound_channel_vars)
-                    resp = await self.ari_client.send_command(
-                        "GET",
-                        f"channels/{caller_channel_id}/variable",
-                        params={"variable": "AAVA_CUSTOM_VARS_JSON"},
-                        tolerate_statuses=[404],
-                    )
-                    if isinstance(resp, dict):
-                        raw = (resp.get("value") or "").strip()
-                        if raw:
-                            try:
-                                data = json.loads(raw)
-                                if isinstance(data, dict):
-                                    session.outbound_custom_vars = data
-                            except Exception:
-                                pass
+                    # Lead custom_vars stay off the wire — hydrate them from the
+                    # attempt metadata / durable outbound store by attempt id.
+                    await self._hydrate_outbound_custom_vars(session)
                     # Improve call history readability: store outbound phone as caller_name too.
                     if session.caller_number and (session.caller_name or "").strip() in ("", self._outbound_extension_identity):
                         session.caller_name = f"Outbound {session.caller_number}"
@@ -6278,6 +6988,16 @@ class Engine:
                 )
             except Exception:
                 logger.debug("Failed to emit RCA_CALL_START", call_id=caller_channel_id, exc_info=True)
+
+            if self._call_setup_aborted(caller_channel_id):
+                # Cleanup is already tearing this call down (the caller hung up during
+                # setup); a media leg originated now would attach to nothing and its
+                # late session writes would resurrect the session after cleanup.
+                logger.info(
+                    "🎯 HYBRID ARI - Call ended during setup; not creating media legs",
+                    channel_id=caller_channel_id,
+                )
+                return
             
             # Step 5: Create ExternalMedia channel or originate Local channel
             if self.config.audio_transport == "externalmedia":
@@ -6344,6 +7064,19 @@ class Engine:
                         caller_channel_id=caller_channel_id, 
                         error=str(e), exc_info=True)
             await self._cleanup_call(caller_channel_id, force_caller_hangup=True)
+            # Before the session exists cleanup knows nothing of the bridge created
+            # above (a session's cleanup destroys its own bridge).
+            if bridge_id and not session_registered:
+                try:
+                    await self.ari_client.destroy_bridge(bridge_id)
+                    logger.info(
+                        "🎯 HYBRID ARI - Bridge of the failed setup destroyed",
+                        channel_id=caller_channel_id,
+                        bridge_id=bridge_id,
+                    )
+                except Exception:
+                    logger.debug("Bridge teardown after failed setup failed", bridge_id=bridge_id, exc_info=True)
+                self.bridges.pop(caller_channel_id, None)
 
     async def _handle_local_stasis_start_hybrid(self, local_channel_id: str, channel: dict):
         """Handle Local channel entering Stasis - Hybrid ARI approach."""
@@ -6488,6 +7221,15 @@ class Engine:
             await self._stop_connection_audio(
                 session,
                 reason="audiosocket-bridge-missing",
+            )
+            await self.ari_client.hangup_channel(audiosocket_channel_id)
+            return
+
+        if self._call_setup_aborted(caller_channel_id):
+            logger.info(
+                "🎯 HYBRID ARI - Call ended before the AudioSocket leg attached; hanging it up",
+                audiosocket_channel_id=audiosocket_channel_id,
+                caller_channel_id=caller_channel_id,
             )
             await self.ari_client.hangup_channel(audiosocket_channel_id)
             return
@@ -7089,10 +7831,21 @@ class Engine:
         finally:
             self._ari_playback_waiters.pop(playback_id, None)
 
-    def _append_outbound_custom_vars_to_prompt(self, prompt: str, custom_vars: Dict[str, Any]) -> str:
-        """Append lead custom_vars as a read-only JSON block (no inline templating)."""
+    def _append_outbound_custom_vars_to_prompt(
+        self,
+        prompt: str,
+        custom_vars: Dict[str, Any],
+        context_config: Any = None,
+    ) -> str:
+        """Append lead custom_vars as a read-only JSON block (no inline templating).
+
+        Per-agent opt-out: an Agent saved with lead_context_enabled=False skips
+        the block — e.g. when its prompt already renders the same values via
+        {var} template substitution and the JSON block would only duplicate
+        them. A missing flag (legacy row, YAML context) keeps the block on.
+        """
         base = str(prompt or "")
-        if not custom_vars:
+        if not custom_vars or getattr(context_config, "lead_context_enabled", None) is False:
             return base
         try:
             sanitized: Dict[str, Any] = {}
@@ -7100,9 +7853,9 @@ class Engine:
                 key = str(k)[:64]
                 if not key:
                     continue
-                val = str(v)
-                # Keep it small and avoid prompt bloat.
-                sanitized[key] = val[:500]
+                # Values are kept verbatim; truncation here would silently
+                # corrupt long lead payloads (e.g. a full per-call prompt).
+                sanitized[key] = str(v)
             if not sanitized:
                 return base
             blob = json.dumps(sanitized, indent=2, sort_keys=True)
@@ -7141,6 +7894,10 @@ class Engine:
         - {current_time}: Current time HH:MM (24h)
         - {current_datetime_iso}: Current UTC datetime in ISO form
         - {today}: Human-readable date, e.g. "Friday, April 24, 2026"
+        - Outbound lead custom_vars: every custom_vars key of the current
+          outbound lead is a placeholder too (e.g. {task}). Built-in variables
+          and pre-call enrichment keep priority over same-named keys; values
+          are used verbatim, without truncation.
 
         The date/time placeholders matter for any prompt that involves
         scheduling — without them, the LLM can't reliably map "tomorrow",
@@ -7227,12 +7984,24 @@ class Engine:
                 flags=re.IGNORECASE,
             )
 
+        # Outbound lead custom_vars are template variables too: {task} renders
+        # the lead's custom_vars["task"]. Built-ins and pre-call enrichment
+        # keep priority; values are used verbatim, untruncated.
+        custom_vars_merged = False
+        outbound_custom_vars = getattr(session, "outbound_custom_vars", None) or {}
+        if isinstance(outbound_custom_vars, dict):
+            for key, value in outbound_custom_vars.items():
+                k = str(key)
+                if k and k not in substitutions:
+                    substitutions[k] = "" if value is None else str(value)
+                    custom_vars_merged = True
+
         if isinstance(extra_substitutions, dict):
             for key, value in extra_substitutions.items():
                 if value is None:
                     continue
                 substitutions[str(key)] = str(value)
-        
+
         def replace_match(match):
             key = match.group(1)
             # Try exact match first
@@ -7246,7 +8015,14 @@ class Engine:
         
         try:
             # Match both {word} and {word.subword} patterns
-            return re.sub(r'\{([\w.]+)\}', replace_match, text)
+            result = re.sub(r'\{([\w.]+)\}', replace_match, text)
+            if custom_vars_merged and result != text:
+                # One bounded extra pass so built-in placeholders inside a
+                # custom_vars value (e.g. "{caller_name}" in a lead-provided
+                # prompt) resolve as well. A single fixed re-pass keeps this
+                # deliberately loop-free.
+                result = re.sub(r'\{([\w.]+)\}', replace_match, result)
+            return result
         except Exception as e:
             logger.debug(
                 "Prompt template substitution failed, leaving unchanged",
@@ -7600,6 +8376,56 @@ class Engine:
         farewell_mode, _timeout = self._resolve_local_farewell_settings(local_config)
         return farewell_mode != "asterisk"
 
+    async def _tts_chunks_while_wanted(
+        self, call_id: str, stream_id: Optional[str], chunks: Any
+    ) -> AsyncIterator[bytes]:
+        """Yield the chunks of a reply's synthesis while the reply is still wanted.
+
+        The wait for the next chunk ends the moment the caller goes on: a reply
+        superseded before its first sound, or a stream a barge-in stopped, is
+        given up at once instead of at the next chunk, so a synthesis that has
+        stalled cannot hold the turn. The synthesis generator is closed on the
+        way out, which cancels its HTTP request.
+        """
+        event = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        iterator = chunks.__aiter__()
+        next_task: Optional[asyncio.Task] = None
+        try:
+            while True:
+                if next_task is None:
+                    next_task = asyncio.ensure_future(iterator.__anext__())
+                waiters = {next_task}
+                wake_task = asyncio.ensure_future(event.wait()) if event is not None else None
+                if wake_task is not None:
+                    waiters.add(wake_task)
+                done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                if wake_task is not None and wake_task not in done:
+                    wake_task.cancel()
+                if next_task in done:
+                    task, next_task = next_task, None
+                    try:
+                        chunk = task.result()
+                    except StopAsyncIteration:
+                        return
+                    yield chunk
+                    continue
+                # The caller spoke while the next chunk was awaited.
+                if self._pipeline_reply_superseded(call_id):
+                    raise _PipelinePlaybackInterrupted("reply superseded while its audio was awaited")
+                if stream_id and not self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                    raise _PipelinePlaybackInterrupted(f"pipeline stream {stream_id} is no longer active")
+                if event is not None:
+                    event.clear()
+        finally:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await next_task
+            aclose = getattr(chunks, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
+
     async def _put_pipeline_stream_chunk(
         self,
         call_id: str,
@@ -7629,6 +8455,864 @@ class Engine:
                 # Re-check ownership/activity on every bounded wait. A healthy
                 # slow consumer keeps draining; a cancelled/replaced stream exits.
                 continue
+
+    # ── Interrupted pipeline replies: what the caller heard ──────────────────
+    def _heard_reply_enabled(self) -> bool:
+        cfg = getattr(self.config, "streaming", None)
+        return bool(getattr(cfg, "pipeline_heard_reply_on_interrupt", False)) if cfg else False
+
+    def _begin_spoken_reply(self, call_id: str, stream_id: Any, pipeline: Any) -> Optional[SpokenReply]:
+        """Start tracking the reply about to be synthesized onto ``stream_id``."""
+        if not self._heard_reply_enabled():
+            self._spoken_replies.pop(call_id, None)
+            return None
+        encoding, rate = self._pipeline_tts_source_format(pipeline)
+        narrow = str(encoding).lower() in {"mulaw", "ulaw", "g711_ulaw", "alaw", "g711_alaw"}
+        bytes_per_ms = max(1e-6, float(rate) * (1.0 if narrow else 2.0) / 1000.0)
+        cfg = getattr(self.config, "streaming", None)
+        try:
+            lead_ms = float(getattr(cfg, "pipeline_heard_reply_lead_ms", 200) or 0)
+        except (TypeError, ValueError):
+            lead_ms = 200.0
+        record = SpokenReply(
+            call_id=call_id,
+            stream_id=str(stream_id),
+            bytes_per_ms=bytes_per_ms,
+            lead_ms=lead_ms,
+        )
+        self._spoken_replies[call_id] = record
+        return record
+
+    async def _note_pipeline_reply_interrupted(
+        self, session: CallSession, played_ms: float, *, require_active: bool = True
+    ) -> Optional[SpokenReply]:
+        """A barge-in cut the call's stream after ``played_ms`` of audio reached the transport.
+
+        Only the reply that owns the cut stream is affected; a filler phrase, a
+        greeting or a caller-inactivity announcement has no record and is left
+        alone. When the reply is already in the history it is rewritten to the
+        heard part right away; otherwise the pipeline runner reads the record
+        when it persists the turn. A hangup passes ``require_active=False``:
+        the pacer may already have died with the transport, but the call's
+        stream is still the reply's own.
+        """
+        call_id = session.call_id
+        record = self._spoken_replies.get(call_id)
+        if record is None or record.interrupted:
+            return record
+        manager = getattr(self, "streaming_playback_manager", None)
+        try:
+            owns_stream = bool(manager and manager.is_stream_active(call_id, record.stream_id))
+            if not owns_stream and not require_active and manager is not None:
+                info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+                owns_stream = str(info.get("stream_id") or "") == str(record.stream_id)
+        except Exception:
+            owns_stream = False
+        if not owns_stream:
+            return None
+        heard = record.mark_interrupted(float(played_ms))
+        logger.info(
+            "Pipeline reply interrupted; keeping the heard part",
+            call_id=call_id,
+            stream_id=record.stream_id,
+            played_ms=int(played_ms),
+            heard_chars=len(heard),
+            generated_chars=len(record.full_text),
+            reply_complete=record.completed,
+        )
+        await self._patch_interrupted_reply_history(session, record)
+        return record
+
+    async def _patch_interrupted_reply_history(self, session: CallSession, record: SpokenReply) -> bool:
+        """Replace the persisted assistant text of an interrupted reply with the heard part.
+
+        The session's list is patched in place, so every holder of it (the
+        dialog worker resyncs from it at each turn) sees the trimmed reply.
+        """
+        target = str(record.persisted_text or "").strip()
+        if not target:
+            return False
+        existing = getattr(session, "conversation_history", None)
+        history = existing if isinstance(existing, list) else list(existing or [])
+        for index in range(len(history) - 1, -1, -1):
+            entry = history[index]
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            if str(entry.get("content") or "").strip() != target:
+                continue
+            heard = str(record.heard_text or "").strip()
+            prefix = str(record.prefix_text or "") if heard else ""
+            if prefix + heard == target:
+                return False
+            if heard:
+                patched = dict(entry)
+                patched["content"] = prefix + heard
+                patched["interrupted"] = True
+                history[index] = patched
+            else:
+                del history[index]
+            if history is not existing:
+                session.conversation_history = history
+            record.persisted_text = heard
+            await self._save_session(session)
+            return True
+        return False
+
+    # ── The caller hung up: what the record of the call still needs ─────────
+    @staticmethod
+    def _call_cleanup_started(session: Optional[CallSession]) -> bool:
+        if session is None:
+            return False
+        call_id = getattr(session, "call_id", None)
+        return call_id in _cleanup_in_progress or bool(getattr(session, "cleanup_in_progress", False))
+
+    async def _record_caller_words_after_hangup(self, session: CallSession, text: str) -> bool:
+        """Keep what the caller said when the call ended before the turn was answered.
+
+        The words become the caller's last turn in the conversation history,
+        with no LLM turn (nobody is left to answer), so the call record, the
+        post-call summary and the webhooks carry them. A turn the history
+        already holds is not repeated.
+        """
+        text = (text or "").strip()
+        if not text or not self._call_cleanup_started(session):
+            return False
+        if text == self._continue_reply_prompt():
+            return False
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list):
+            history = list(history or [])
+            session.conversation_history = history
+        for entry in reversed(history):
+            if isinstance(entry, dict) and entry.get("role") == "user":
+                if str(entry.get("content") or "").strip() == text:
+                    return False
+                break
+        history.append(_ts_msg("user", text))
+        logger.info(
+            "Caller's last words recorded after hangup",
+            call_id=session.call_id,
+            chars=len(text),
+            preview=text[:80],
+        )
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the caller's last words", call_id=session.call_id, exc_info=True)
+        await self._sync_call_history_transcript(session, reason="last-words")
+        return True
+
+    async def _record_turn_cut_by_hangup(self, session: CallSession, transcript_text: str) -> None:
+        """A turn the call's cleanup cancelled: record the caller's words and the heard part of the reply."""
+        if not self._call_cleanup_started(session):
+            return
+        await self._record_caller_words_after_hangup(session, transcript_text)
+        record = self._spoken_replies.get(session.call_id)
+        if record is None or not record.interrupted or record.persisted_text is not None:
+            return
+        heard = str(record.heard_text or "").strip()
+        record.persisted_text = heard
+        if not heard:
+            return
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list):
+            history = list(history or [])
+            session.conversation_history = history
+        history.append(_ts_msg("assistant", heard, interrupted=True))
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the reply cut by the hangup", call_id=session.call_id, exc_info=True)
+        await self._sync_call_history_transcript(session, reason="reply-cut-by-hangup")
+
+    async def _cut_pipeline_playback_for_turn(self, session: CallSession) -> bool:
+        """Stop the call's streaming playback because the caller's next turn is starting.
+
+        The reply on the stream was generated before the caller's latest words
+        (they spoke over it inside the barge-in protection window, or the
+        recognizer returned them late), so it is treated as interrupted at the
+        position the transport had reached: the history keeps the heard part,
+        the stream and its gating are released, and the next reply gets a
+        stream of its own. Nothing playing means nothing to do.
+        """
+        call_id = session.call_id
+        manager = getattr(self, "streaming_playback_manager", None)
+        if manager is None:
+            return False
+        try:
+            if not manager.is_stream_active(call_id):
+                return False
+        except Exception:
+            return False
+        info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+        stream_id = str(info.get("stream_id") or "")
+        playback_type = str(info.get("playback_type") or "")
+        try:
+            played_ms = int(manager.get_playback_position_ms(call_id))
+        except Exception:
+            played_ms = 0
+        try:
+            info["end_reason"] = "next-turn"
+        except Exception:
+            pass
+        try:
+            await self._note_pipeline_reply_interrupted(session, played_ms)
+        except Exception:
+            logger.debug("Heard-reply bookkeeping failed before the next turn", call_id=call_id, exc_info=True)
+        try:
+            await manager.stop_streaming_playback(call_id)
+        except Exception:
+            logger.debug("Streaming playback stop failed before the next turn", call_id=call_id, exc_info=True)
+        # Release the gating the cut stream held, as the barge-in handler does,
+        # so the caller's audio reaches the recognizer again at once.
+        try:
+            for token in list(getattr(session, "tts_tokens", set()) or []):
+                try:
+                    if self.conversation_coordinator:
+                        await self.conversation_coordinator.on_tts_end(call_id, token, reason="next-turn")
+                    else:
+                        await self.session_store.clear_gating_token(call_id, token)
+                except Exception:
+                    logger.debug("Failed to clear a gating token before the next turn", call_id=call_id, exc_info=True)
+        except Exception:
+            pass
+        logger.info(
+            "Pipeline playback cut by the caller's next turn",
+            call_id=call_id,
+            stream_id=stream_id,
+            playback_type=playback_type,
+            played_ms=played_ms,
+        )
+        return True
+
+    # ── Silero cuts the caller's utterances for the recognizer ───────────────
+    def _pipeline_utterance_mode(self, call_id: str) -> bool:
+        """Whether the engine, not the recognizer, cuts this call's utterances."""
+        return call_id in (getattr(self, "_utterance_cutters", None) or {})
+
+    def _pipeline_listens_during_playback(self) -> bool:
+        cfg = getattr(getattr(self, "config", None), "barge_in", None)
+        return bool(getattr(cfg, "pipeline_listen_during_playback", False)) if cfg else False
+
+    def _pipeline_forwards_gated_audio(self, call_id: str) -> bool:
+        """Gated caller frames still go to the recognizer: Silero owns barge-in and listening stays on."""
+        try:
+            return self._pipeline_listens_during_playback() and self._silero_owns_barge_in(call_id)
+        except Exception:
+            return False
+
+    def _pipeline_agent_audible(self, call_id: str) -> bool:
+        """Whether agent audio has actually reached the caller's line right now.
+
+        A streaming reply is audible once the pacer has sent its first bytes;
+        file playback and anything the engine cannot see are taken as audible
+        from the moment the gate closed.
+        """
+        manager = getattr(self, "streaming_playback_manager", None)
+        try:
+            if manager is not None and manager.is_stream_active(call_id):
+                return int(manager.get_playback_position_ms(call_id)) > 0
+        except Exception:
+            return True
+        return True
+
+    def _pipeline_caller_muted(self, session: CallSession) -> bool:
+        """Whether the caller's frames are withheld from the recognizer at this moment."""
+        if self._pipeline_input_blocked_before_reply(session):
+            return True
+        if bool(getattr(session, "audio_capture_enabled", True)):
+            return False
+        if self._pipeline_listens_during_playback():
+            return False
+        return self._pipeline_agent_audible(session.call_id)
+
+    def _feed_utterance_cutter(
+        self, session: CallSession, cutter: UtteranceCutter, pcm16: bytes, rate: int
+    ) -> None:
+        """Append one caller frame to the cutter at the recognizer's rate."""
+        call_id = session.call_id
+        if rate != cutter.sample_rate:
+            try:
+                states = self._resample_state_utterance16k
+                pcm16, states[call_id] = resample_audio(
+                    pcm16, rate, cutter.sample_rate, state=states.get(call_id), mode="fir"
+                )
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                return
+        cutter.append(pcm16, muted=self._pipeline_caller_muted(session))
+
+    def _send_pipeline_utterance(
+        self, call_id: str, utterance: SttUtterance, *, expect_result: bool
+    ) -> bool:
+        """Queue one caller utterance for the recognizer; False when nothing was sent."""
+        queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
+        if queue is None:
+            return False
+        if utterance.signal_ms < 80.0:
+            logger.debug(
+                "Caller utterance without their audio dropped",
+                call_id=call_id,
+                duration_ms=int(utterance.duration_ms),
+                reason=utterance.reason,
+            )
+            return False
+        utterance.utterance_id = f"{call_id}:{utterance.utterance_id}"
+        try:
+            queue.put_nowait(utterance)
+        except asyncio.QueueFull:
+            logger.warning(
+                "Pipeline queue full; caller utterance dropped",
+                call_id=call_id,
+                duration_ms=int(utterance.duration_ms),
+            )
+            return False
+        starts = self._pipeline_utterance_starts.setdefault(call_id, deque(maxlen=16))
+        starts.append((float(utterance.started_at), bool(utterance.interrupted_agent)))
+        over_announcement = call_id in (getattr(self, "_pipeline_speech_over_announcement", None) or set())
+        (getattr(self, "_pipeline_speech_over_announcement", None) or set()).discard(call_id)
+        logger.info(
+            "Caller utterance sent to the recognizer",
+            call_id=call_id,
+            utterance_id=utterance.utterance_id,
+            duration_ms=int(utterance.duration_ms),
+            signal_ms=int(utterance.signal_ms),
+            interrupted_agent=bool(utterance.interrupted_agent),
+            over_announcement=over_announcement,
+            reason=utterance.reason,
+        )
+        if expect_result:
+            expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+            if expected is None:
+                expected = self._pipeline_stt_final_expected_at = {}
+            expected[call_id] = time.monotonic()
+        return True
+
+    async def _send_stt_utterance(
+        self, pipeline: Any, call_id: str, utterance: SttUtterance, stream_format: str
+    ) -> None:
+        """Hand one utterance to the STT adapter, whole when it can take one.
+
+        An adapter (or a server behind it) that takes only a stream gets the
+        utterance as audio followed by the silence its own gate needs, so it
+        closes the phrase at once.
+        """
+        adapter = pipeline.stt_adapter
+        send = getattr(adapter, "send_utterance", None)
+        supported: Optional[bool] = None
+        probe = getattr(adapter, "utterances_supported", None)
+        if callable(probe):
+            try:
+                supported = probe(call_id)
+            except Exception:
+                supported = None
+        if callable(send) and supported is not False:
+            try:
+                await send(
+                    call_id,
+                    utterance.pcm16,
+                    sample_rate_hz=utterance.sample_rate,
+                    utterance_id=utterance.utterance_id,
+                    fmt=stream_format,
+                )
+            except Exception:
+                logger.debug("STT utterance send failed", call_id=call_id, exc_info=True)
+            return
+        warned = self._pipeline_utterance_fallback_warned
+        if call_id not in warned:
+            warned.add(call_id)
+            logger.warning(
+                "The recognizer takes no whole utterances; each one is streamed with a closing silence",
+                call_id=call_id,
+                component=getattr(adapter, "component_key", "unknown"),
+            )
+        try:
+            await adapter.send_audio(call_id, utterance.pcm16, fmt=stream_format)
+            burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
+            silence = b"\x00" * (
+                int(utterance.sample_rate) * PIPELINE_STT_BYTES_PER_SAMPLE * burst_ms // 1000
+            )
+            await adapter.send_audio(call_id, silence, fmt=stream_format)
+        except Exception:
+            logger.debug("STT utterance fallback send failed", call_id=call_id, exc_info=True)
+
+    # ── A reply the caller talks over before its first sound ─────────────────
+    def _discard_unheard_reply_enabled(self) -> bool:
+        cfg = getattr(getattr(self, "config", None), "streaming", None)
+        return bool(getattr(cfg, "pipeline_discard_unheard_reply", False)) if cfg else False
+
+    def _pipeline_input_blocked_before_reply(self, session: CallSession) -> bool:
+        """Off means discard input while preparing a reply, rather than queue another turn.
+
+        Keep this separate from TTS tokens: generating is not playback, and
+        only audible playback may be interrupted through the usual protection.
+        A completed producer may still have an unplayed stream on the transport.
+        """
+        if self._discard_unheard_reply_enabled():
+            return False
+        call_id = session.call_id
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            return not self._pipeline_reply_audio_started(call_id)
+        return bool(
+            (getattr(self, "_pipeline_forced", None) or {}).get(call_id)
+            and not bool(getattr(session, "audio_capture_enabled", True))
+            and not self._pipeline_agent_audible(call_id)
+        )
+
+    def _begin_pipeline_reply(self, call_id: str) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "released_at": time.monotonic(),
+            "superseded": False,
+            "stream_id": None,
+            "audible": False,
+        }
+        self._pipeline_reply_inflight[call_id] = record
+        if not self._discard_unheard_reply_enabled():
+            tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+            reset = getattr(tracker, "reset", None)
+            if callable(reset):
+                reset()
+            cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+            if cutter is not None:
+                cutter.discard()
+            buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+            if buffer is not None:
+                buffer.clear()
+            self._silero_deferred_barge_in.pop(call_id, None)
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
+            self._pipeline_stt_final_expected_at.pop(call_id, None)
+            self._note_pipeline_caller_talking(call_id, False, source="vad")
+            for states in (
+                self._resample_state_silero16k, self._resample_state_silero_vad,
+                self._resample_state_utterance16k, self._resample_state_pipeline16k,
+            ):
+                states.pop(call_id, None)
+        return record
+
+    def _end_pipeline_reply(self, call_id: str) -> None:
+        self._pipeline_reply_inflight.pop(call_id, None)
+
+    def _pipeline_reply_superseded(self, call_id: str) -> bool:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        return bool(record and record.get("superseded"))
+
+    def _mark_pipeline_reply_stream(self, call_id: str, stream_id: Any) -> None:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            record["stream_id"] = str(stream_id) if stream_id else None
+
+    def _mark_pipeline_reply_audible(self, call_id: str) -> None:
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if record is not None:
+            record["audible"] = True
+
+    def _pipeline_reply_audio_started(self, call_id: str) -> bool:
+        """Whether the reply in flight has put a first sound on the caller's line."""
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if not record:
+            return False
+        if record.get("audible"):
+            return True
+        stream_id = record.get("stream_id")
+        if not stream_id:
+            return False
+        manager = getattr(self, "streaming_playback_manager", None)
+        if manager is None:
+            return True
+        try:
+            if not manager.is_stream_active(call_id, stream_id):
+                # Played out already, or replaced: not this reply's first sound to discard.
+                return True
+            return int(manager.get_playback_position_ms(call_id)) > 0
+        except Exception:
+            return True
+
+    async def _discard_unheard_reply(self, session: CallSession) -> bool:
+        """The caller went on before the reply's first sound: drop the reply.
+
+        The model is still generating, or its text is being synthesized, or the
+        stream holds audio the pacer has not sent: none of it reached the
+        caller, so nothing is kept. The turn notices (its LLM request is
+        cancelled, no TTS is requested, a chunk put on the stopped stream
+        raises) and the dialog worker keeps the caller's words for their next
+        words. A reply that is already audible is left to barge-in.
+        """
+        call_id = session.call_id
+        record = (getattr(self, "_pipeline_reply_inflight", None) or {}).get(call_id)
+        if not record or record.get("superseded") or not self._discard_unheard_reply_enabled():
+            return False
+        if self._pipeline_reply_audio_started(call_id):
+            return False
+        record["superseded"] = True
+        stream_id = record.get("stream_id")
+        manager = getattr(self, "streaming_playback_manager", None)
+        stopped = False
+        if stream_id and manager is not None:
+            try:
+                if manager.is_stream_active(call_id, stream_id):
+                    info = (getattr(manager, "active_streams", None) or {}).get(call_id) or {}
+                    try:
+                        info["end_reason"] = "superseded"
+                    except Exception:
+                        pass
+                    await manager.stop_streaming_playback(call_id)
+                    stopped = True
+            except Exception:
+                logger.debug("Unplayed reply stream stop failed", call_id=call_id, exc_info=True)
+        # Nothing of it was heard: no heard-part bookkeeping for this reply.
+        self._spoken_replies.pop(call_id, None)
+        if stopped:
+            for token in list(getattr(session, "tts_tokens", set()) or []):
+                try:
+                    if self.conversation_coordinator:
+                        await self.conversation_coordinator.on_tts_end(call_id, token, reason="superseded")
+                    else:
+                        await self.session_store.clear_gating_token(call_id, token)
+                except Exception:
+                    logger.debug("Failed to clear a gating token of a discarded reply", call_id=call_id, exc_info=True)
+        logger.info(
+            "Reply discarded before its first sound; the caller went on",
+            call_id=call_id,
+            stream_id=stream_id,
+            since_release_ms=int((time.monotonic() - float(record.get("released_at") or 0.0)) * 1000),
+        )
+        return True
+
+    async def _generate_unless_resumed(
+        self, pipeline: Any, call_id: str, factory: Callable[[], Any]
+    ) -> Any:
+        """Run one LLM request unless (or until) the caller goes on talking.
+
+        Returns the request's result, or :data:`_REPLY_SUPERSEDED` when the
+        caller resumed before the reply and the request was cancelled (and the
+        adapter told to stop generating, when it can).
+        """
+        event = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        if event is None or not self._discard_unheard_reply_enabled():
+            return await factory()
+        if self._pipeline_reply_superseded(call_id):
+            return _REPLY_SUPERSEDED
+        gen_task = asyncio.ensure_future(factory())
+        waiter = asyncio.ensure_future(event.wait())
+        try:
+            while True:
+                done, _ = await asyncio.wait({gen_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if gen_task in done:
+                    break
+                if self._pipeline_reply_superseded(call_id):
+                    gen_task.cancel()
+                    await asyncio.wait({gen_task})
+                    cancel = getattr(pipeline.llm_adapter, "cancel_generation", None)
+                    if callable(cancel):
+                        try:
+                            await cancel(call_id)
+                        except Exception:
+                            logger.debug("LLM cancel_generation failed", call_id=call_id, exc_info=True)
+                    logger.info("LLM request cancelled: the caller went on before the reply", call_id=call_id)
+                    return _REPLY_SUPERSEDED
+                # The caller spoke but the reply stands (already audible): keep waiting.
+                event.clear()
+                waiter = asyncio.ensure_future(event.wait())
+        except asyncio.CancelledError:
+            gen_task.cancel()
+            waiter.cancel()
+            raise
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        return gen_task.result()
+
+    async def _drop_unspoken_reply_history(self, session: CallSession, response_text: str) -> None:
+        """Take a reply that never reached the caller back out of the history; their words stay."""
+        history = getattr(session, "conversation_history", None)
+        wanted = str(response_text or "").strip()
+        if not isinstance(history, list) or not history or not wanted:
+            return
+        entry = history[-1]
+        if (
+            isinstance(entry, dict)
+            and entry.get("role") == "assistant"
+            and str(entry.get("content") or "").strip() == wanted
+        ):
+            history.pop()
+            try:
+                await self.session_store.upsert_call(session)
+            except Exception:
+                logger.debug("Failed to persist the history without the unspoken reply", call_id=session.call_id, exc_info=True)
+
+    async def _drop_unheard_reply_history(
+        self, session: CallSession, transcript_text: str, response_text: str
+    ) -> None:
+        """Take a discarded reply, and the caller turn it answered, back out of the history."""
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return
+        changed = False
+        for wanted_role, wanted in (("assistant", response_text), ("user", transcript_text)):
+            wanted = str(wanted or "").strip()
+            if not wanted or not history:
+                continue
+            entry = history[-1]
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == wanted_role
+                and str(entry.get("content") or "").strip() == wanted
+            ):
+                history.pop()
+                changed = True
+        if changed:
+            try:
+                await self.session_store.upsert_call(session)
+            except Exception:
+                logger.debug("Failed to persist the history without the discarded reply", call_id=session.call_id, exc_info=True)
+
+    # ── A reply cut off by speech that came to nothing is continued ──────────
+    def _continue_reply_after_empty_interrupt(self, call_id: str) -> bool:
+        """Whether the reply a barge-in just cut off is to be picked up where it stopped."""
+        cfg = getattr(self.config, "streaming", None)
+        if not bool(getattr(cfg, "pipeline_continue_reply_after_empty_interrupt", True)):
+            return False
+        record = self._spoken_replies.get(call_id)
+        if record is None or not record.interrupted or record.continued:
+            return False
+        if self._pipeline_continue_streak.get(call_id, 0) >= 2:
+            logger.info(
+                "Interrupted reply left as it is: two continuations in a row were cut off by nothing",
+                call_id=call_id,
+            )
+            return False
+        return True
+
+    def _continue_reply_prompt(self) -> str:
+        """What the model is asked, in place of a caller turn, to go on with a cut-off reply."""
+        from .config import DEFAULT_CONTINUE_REPLY_PROMPT
+
+        cfg = getattr(self.config, "streaming", None)
+        text = str(getattr(cfg, "pipeline_continue_reply_prompt", "") or "").strip()
+        return text or DEFAULT_CONTINUE_REPLY_PROMPT
+
+    async def _join_continued_reply_history(self, session: CallSession, prompt: str, heard: str) -> bool:
+        """Fold the continuation of a cut-off reply into the history.
+
+        The request that asked for it is not a caller turn, so its entry goes;
+        the continuation is appended to the heard part's entry, which keeps one
+        assistant turn (a chat template that insists on alternating roles never
+        sees two assistant messages in a row) and reads as what was said.
+        """
+        history = getattr(session, "conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return False
+        prompt = str(prompt or "").strip()
+        heard = str(heard or "").strip()
+        index = None
+        for candidate in range(len(history) - 1, -1, -1):
+            entry = history[candidate]
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == "user"
+                and str(entry.get("content") or "").strip() == prompt
+            ):
+                index = candidate
+                break
+        if index is None:
+            return False
+        del history[index]
+        continuation = history[index] if index < len(history) else None
+        previous = history[index - 1] if index > 0 else None
+        if (
+            isinstance(continuation, dict)
+            and continuation.get("role") == "assistant"
+            and index == len(history) - 1
+            and isinstance(previous, dict)
+            and previous.get("role") == "assistant"
+            and heard
+            and str(previous.get("content") or "").strip() == heard
+        ):
+            text = str(continuation.get("content") or "").strip()
+            merged = f"{heard} {text}".strip() if text else heard
+            patched = {key: value for key, value in previous.items() if key != "interrupted"}
+            patched["content"] = merged
+            history[index - 1] = patched
+            del history[index]
+            record = self._spoken_replies.get(session.call_id)
+            if record is not None and str(record.persisted_text or "").strip() == text:
+                record.persisted_text = merged
+                record.prefix_text = f"{heard} "
+        session.conversation_history = history
+        try:
+            await self.session_store.upsert_call(session)
+        except Exception:
+            logger.debug("Failed to persist the continued reply", call_id=session.call_id, exc_info=True)
+        return True
+
+    def _pipeline_turn_waits_for_reply(
+        self, session: CallSession, speech_started_at: Optional[float]
+    ) -> bool:
+        """Words spoken into an audible reply wait for it to end (or for a barge-in).
+
+        Words spoken before the reply started make the reply stale: they are
+        released at once and cut it. Words spoken after it became audible,
+        inside the barge-in protection or too short to interrupt, are the
+        caller's answer to what they are hearing: the turn stays pending until
+        the reply ends or a barge-in cuts it.
+        """
+        if speech_started_at is None:
+            return False
+        if bool(getattr(session, "audio_capture_enabled", True)):
+            return False
+        if not self._pipeline_agent_audible(session.call_id):
+            return False
+        try:
+            tts_started = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tts_started = 0.0
+        if tts_started <= 0.0:
+            return False
+        reply_started_mono = time.monotonic() - max(0.0, time.time() - tts_started)
+        return float(speech_started_at) >= reply_started_mono
+
+    def _silero_speech_holds_turn(self, call_id: str, hold_sec: float) -> bool:
+        """Silero scored the caller's speech within the hold: the pending turn stays held.
+
+        Silero is the engine's own detector, so its stop cannot be lost the way
+        an Asterisk talk-detect end event can, and a caller in one long sentence
+        gives a VAD-gated recognizer no result for as long as the sentence
+        lasts. The hold therefore runs from the last frame scored as speech,
+        and only a detector left "talking" without speech frames (audio no
+        longer flowing) lets the hold expire.
+        """
+        if not (getattr(self, "_pipeline_caller_talking", None) or {}).get(call_id, False):
+            return False
+        tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+        last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+        if last_speech is None:
+            return False
+        return (time.monotonic() - float(last_speech)) < float(hold_sec)
+
+    async def _sync_call_history_transcript(self, session: CallSession, *, reason: str) -> bool:
+        """Write the session's conversation into an already persisted call record.
+
+        The record is saved once, before the post-call tools run; anything the
+        conversation gains after that (the caller's last words recorded after
+        a hangup, a turn the cleanup cancelled) would reach the webhooks but
+        not the call history the Admin UI shows. Best effort: no record, no
+        store, nothing to do.
+        """
+        call_id = session.call_id
+        persisted_calls = getattr(self, "_call_history_persisted", None) or set()
+        if call_id not in persisted_calls:
+            return False
+        try:
+            from src.core.call_history import get_call_history_store
+
+            store = get_call_history_store()
+            if not getattr(store, "_enabled", False):
+                return False
+            history = list(getattr(session, "conversation_history", None) or [])
+            updated = await store.update_conversation_history(call_id, history)
+            if updated:
+                logger.info(
+                    "Call history transcript synced after the record was written",
+                    call_id=call_id,
+                    reason=reason,
+                    entries=len(history),
+                )
+            return bool(updated)
+        except Exception:
+            logger.debug("Call history transcript sync failed", call_id=call_id, reason=reason, exc_info=True)
+            return False
+
+    async def _settle_pipeline_on_hangup(self, session: CallSession) -> None:
+        """Before the dialog worker is cancelled: what the caller heard, and what they last said.
+
+        A reply the hangup cut is marked interrupted at the audio position the
+        transport had reached, like a barge-in. Then, when speech is
+        outstanding (the detector saw the caller talk after the recognizer's
+        last result, or a finalize is already pending), the recognizer is fed
+        its closing silence and the cleanup waits up to
+        ``streaming.pipeline_hangup_final_wait_ms`` for the result: a
+        VAD-gated model (GigaAM v3, Sherpa offline) returns a phrase only after
+        its silence gate, so a caller who speaks and hangs up at once leaves
+        the words in it. The dialog worker records the result as the caller's
+        last turn when it is cancelled.
+        """
+        call_id = session.call_id
+        if call_id not in self._pipeline_tasks:
+            return
+        try:
+            played_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
+        except Exception:
+            played_ms = 0
+        try:
+            await self._note_pipeline_reply_interrupted(session, played_ms, require_active=False)
+        except Exception:
+            logger.debug("Heard-reply bookkeeping failed during hangup", call_id=call_id, exc_info=True)
+
+        cfg = getattr(self.config, "streaming", None)
+        try:
+            wait_ms = int(getattr(cfg, "pipeline_hangup_final_wait_ms", 0) or 0)
+        except (TypeError, ValueError):
+            wait_ms = 0
+        if wait_ms <= 0:
+            return
+        now = time.monotonic()
+        last_final = self._pipeline_last_final_at.get(call_id)
+        expected_at = self._pipeline_stt_final_expected_at.get(call_id)
+        reason = "finalize pending" if expected_at is not None else ""
+        if not reason:
+            talking = bool(self._pipeline_caller_talking.get(call_id, False))
+            changed_at = self._pipeline_caller_talk_changed_at.get(call_id)
+            recent = changed_at is not None and (now - changed_at) <= 5.0
+            if recent and (talking or last_final is None or last_final < changed_at):
+                reason = "caller talked after the last result"
+        if not reason:
+            tracker = self._silero_trackers.get(call_id)
+            last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+            if (
+                last_speech is not None
+                and (now - last_speech) <= 5.0
+                and (last_final is None or last_final < last_speech)
+            ):
+                reason = "speech after the last result"
+        if not reason:
+            return
+        if expected_at is None:
+            cutter = self._utterance_cutters.get(call_id)
+            if cutter is not None:
+                # Speech that began inside the reply's protection window was
+                # still waiting for the window to end when the call did: the
+                # hangup decides it now, as the window's end would have, so the
+                # utterance carries the caller's audio rather than the silence
+                # its muted frames read back as.
+                if call_id in self._silero_deferred_barge_in:
+                    cutter.note_barge_in()
+                # Whatever the caller was saying when they hung up goes to the
+                # recognizer as it stands.
+                last = cutter.flush(reason="hangup")
+                if last is None or not self._send_pipeline_utterance(call_id, last, expect_result=True):
+                    return
+            else:
+                burst_ms = max(int(self._silero_config()["stt_finalize_ms"]), 1200)
+                self._request_pipeline_stt_finalize(call_id, expect_result=True, burst_ms=burst_ms)
+        deadline = now + wait_ms / 1000.0
+        arrived = False
+        while time.monotonic() < deadline:
+            latest = self._pipeline_last_final_at.get(call_id)
+            if latest is not None and (last_final is None or latest > last_final):
+                arrived = True
+                break
+            await asyncio.sleep(0.02)
+        if arrived:
+            # Let the dialog worker take the result off its queue.
+            await asyncio.sleep(0)
+        logger.info(
+            "Waited for the caller's last words after hangup",
+            call_id=call_id,
+            reason=reason,
+            arrived=arrived,
+            waited_ms=int((time.monotonic() - now) * 1000),
+            limit_ms=wait_ms,
+        )
 
     def _pipeline_tts_uses_streaming(self, pipeline: Any) -> bool:
         """Resolve the pipeline TTS delivery mode for every response path."""
@@ -7671,8 +9355,11 @@ class Engine:
         text: str,
         *,
         playback_type: str = "pipeline-tts",
+        timing: Optional[Dict[str, int]] = None,
     ) -> Optional[str]:
         """Synthesize one pipeline response onto the call-owned media stream.
+
+        ``timing`` takes the TTS's time to its first audio as ``tts_ms``.
 
         Tool-result continuations historically bypassed this path and handed
         PCM16/16 kHz bytes to the file player as if they were μ-law/8 kHz. Keep
@@ -7699,10 +9386,13 @@ class Engine:
             source_sample_rate=source_rate,
         )
         try:
+            tts_started = time.monotonic()
             async for chunk in pipeline.tts_adapter.synthesize(
                 call_id, text, pipeline.tts_options
             ):
                 if chunk:
+                    if timing is not None:
+                        timing.setdefault("tts_ms", _ms_since(tts_started))
                     await self._put_pipeline_stream_chunk(
                         call_id, stream_id, stream_queue, chunk
                     )
@@ -7730,15 +9420,74 @@ class Engine:
                 )
             raise
 
+    async def _maybe_hangup_on_assistant_farewell(
+        self,
+        call_id: str,
+        session: CallSession,
+        text: str,
+    ) -> None:
+        """Terminate after the agent's own farewell when the policy opts in.
+
+        Complements the hangup_call tool: providers whose platform-side agent
+        never calls the tool (e.g. ElevenLabs) still end deterministically
+        when the agent speaks a configured assistant_farewell marker. The
+        marker must appear in the trailing window of the utterance, so a
+        mid-sentence "goodbye" cannot drop the call. Termination reuses the
+        cleanup_after_tts flow — the farewell audio drains before the hangup,
+        with the terminal fallback bounding a missing audio-done event.
+        """
+        try:
+            if not text or getattr(session, "cleanup_after_tts", False):
+                return
+            policy = resolve_hangup_policy(
+                (self._tool_config_for_session(session).get("tools") or {})
+            )
+            if not policy.get("hangup_on_assistant_farewell"):
+                return
+            markers = (policy.get("markers") or {}).get("assistant_farewell") or []
+            if not text_ends_with_marker(text, markers):
+                return
+            session.cleanup_after_tts = True
+            await self.session_store.upsert_call(session)
+            logger.info(
+                "🔚 Assistant farewell marker matched - hanging up after audio",
+                call_id=call_id,
+                text_preview=text[:80],
+            )
+            self._schedule_terminal_fallback(
+                call_id,
+                reason="assistant_farewell_marker",
+                timeout_sec=15.0,
+                call_outcome="agent_hangup",
+            )
+        except Exception:
+            logger.debug(
+                "Assistant farewell hangup check failed",
+                call_id=call_id,
+                exc_info=True,
+            )
+
     @staticmethod
     def _is_pipeline_farewell_without_tool(
         user_text: str,
         assistant_text: str,
         hangup_policy: Dict[str, Any],
     ) -> bool:
-        """Require explicit caller end intent plus a spoken assistant farewell."""
+        """Require explicit caller end intent plus a spoken assistant farewell.
+
+        With the opt-in ``hangup_on_assistant_farewell`` policy flag the
+        assistant's own farewell (at the end of the utterance) is sufficient —
+        no caller end intent needed.
+        """
         markers = hangup_policy.get("markers") if isinstance(hangup_policy, dict) else {}
         markers = markers if isinstance(markers, dict) else {}
+        if isinstance(hangup_policy, dict) and hangup_policy.get("hangup_on_assistant_farewell"):
+            farewell_only = normalize_marker_list(
+                markers.get("assistant_farewell"),
+                DEFAULT_HANGUP_MARKERS["assistant_farewell"],
+            )
+            if text_ends_with_marker(assistant_text, farewell_only):
+                return True
         configured = normalize_marker_list(
             markers.get("end_call"), DEFAULT_HANGUP_MARKERS["end_call"]
         )
@@ -8563,6 +10312,12 @@ class Engine:
                 caller_channel_id=caller_channel_id,
             )
             raise RuntimeError("AudioSocket configuration missing")
+        if self._call_setup_aborted(caller_channel_id):
+            logger.info(
+                "🎯 HYBRID ARI - Call ended before the AudioSocket leg was originated; skipping",
+                caller_channel_id=caller_channel_id,
+            )
+            return
 
         audio_uuid = str(uuid.uuid4())
         bind_host = self.config.audiosocket.host or "127.0.0.1"
@@ -8650,6 +10405,209 @@ class Engine:
         except Exception as exc:
             logger.error("Error handling StasisEnd", error=str(exc), exc_info=True)
 
+    # ----------------------------------------------------------------------------
+    # Ghost-session defences. The StasisStart handler runs as its own task; when the
+    # caller hangs up in the first few hundred milliseconds, ChannelDestroyed and
+    # its cleanup race the setup steps that are still building the bridge and the
+    # media legs. Setup must stop as soon as cleanup has begun, and a session whose
+    # channel is gone must never outlive it.
+    # ----------------------------------------------------------------------------
+    _DESTROYED_CHANNEL_MEMORY_SECONDS = 900.0
+    _DESTROYED_CHANNEL_MAX_ENTRIES = 5000
+
+    def _note_channel_destroyed(self, channel_id: str) -> None:
+        """Remember a destroyed channel id for a while so a StasisStart handler that
+        is still running for it can see the call is over."""
+        import time as _time
+
+        store = getattr(self, "_destroyed_channel_ts", None)
+        if store is None:
+            store = self._destroyed_channel_ts = {}
+        now = _time.time()
+        store[channel_id] = now
+        if len(store) > self._DESTROYED_CHANNEL_MAX_ENTRIES:
+            cutoff = now - self._DESTROYED_CHANNEL_MEMORY_SECONDS
+            for cid in [c for c, ts in store.items() if ts < cutoff]:
+                store.pop(cid, None)
+            overflow = len(store) - self._DESTROYED_CHANNEL_MAX_ENTRIES
+            if overflow > 0:
+                for cid, _ts in sorted(store.items(), key=lambda kv: kv[1])[:overflow]:
+                    store.pop(cid, None)
+
+    def _call_setup_aborted(self, call_id: str) -> bool:
+        """True once the call is over from the engine's point of view: its channel was
+        destroyed, or cleanup for it has started or finished. Call setup checks this
+        after each await and stops building media legs for a dead channel; the late
+        writes of those steps are what resurrected sessions after cleanup."""
+        if not call_id:
+            return False
+        if call_id in _cleanup_in_progress or call_id in _cleanup_completed_at:
+            return True
+        destroyed = getattr(self, "_destroyed_channel_ts", None) or {}
+        if call_id in destroyed:
+            return True
+        store = getattr(self, "session_store", None)
+        checker = getattr(store, "is_tombstoned", None)
+        return bool(checker and checker(call_id))
+
+    @staticmethod
+    def _session_reconcile_settings() -> tuple:
+        """(interval, grace, force_after) in seconds from the environment."""
+
+        def _read(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        return (
+            _read("AAVA_SESSION_RECONCILE_INTERVAL_SECONDS", 60.0),
+            _read("AAVA_SESSION_ORPHAN_GRACE_SECONDS", 30.0),
+            _read("AAVA_SESSION_ORPHAN_FORCE_SECONDS", 600.0),
+        )
+
+    async def _session_reconcile_loop(self) -> None:
+        """Periodically drop call sessions whose caller channel no longer exists in
+        Asterisk. Sessions live only in this process and are removed by the end
+        events of their channel; an event lost across an ARI reconnect, a cleanup
+        that hangs on a provider, or a late write that resurrects a removed session
+        otherwise leaves a call the dashboard shows as active forever, and that
+        blocks the engine restart button. Disabled with
+        AAVA_SESSION_RECONCILE_INTERVAL_SECONDS<=0."""
+        try:
+            interval, _grace, _force = self._session_reconcile_settings()
+            if interval <= 0:
+                logger.info("Session reconciliation disabled (AAVA_SESSION_RECONCILE_INTERVAL_SECONDS<=0)")
+                return
+            await asyncio.sleep(min(interval, 60.0))
+            while True:
+                try:
+                    await self._session_reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("Session reconciliation pass failed", exc_info=True)
+                interval, _grace, _force = self._session_reconcile_settings()
+                await asyncio.sleep(max(5.0, interval))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Session reconciliation loop exited", exc_info=True)
+
+    async def _session_reconcile_once(self) -> int:
+        """One reconciliation pass; returns the number of sessions removed.
+
+        A session older than the grace period whose caller channel answers 404 for
+        a whole grace period is an orphan. What happens next depends on how it got
+        there: a session that never saw cleanup (its end event was lost) gets the
+        normal cleanup, history and post-call work included; a session that already
+        went through cleanup and came back (a late write resurrected it) is removed
+        outright, because its cleanup work already happened once; a session whose
+        cleanup is still running is left alone until AAVA_SESSION_ORPHAN_FORCE_SECONDS
+        have passed, then removed so the dashboard stops counting it.
+        """
+        import time as _time
+
+        ari = getattr(self, "ari_client", None)
+        if not ari or not getattr(ari, "running", False):
+            return 0
+        _interval, grace, force_after = self._session_reconcile_settings()
+        seen = getattr(self, "_orphan_first_seen", None)
+        if seen is None:
+            seen = self._orphan_first_seen = {}
+        now = _time.time()
+        removed = 0
+        sessions = await self.session_store.get_all_sessions()
+        live_ids = {s.call_id for s in sessions}
+        for cid in [c for c in seen if c not in live_ids]:
+            seen.pop(cid, None)
+        for session in sessions:
+            call_id = session.call_id
+            created_at = float(getattr(session, "created_at", 0.0) or 0.0)
+            if created_at and (now - created_at) < grace:
+                continue
+            channel_id = getattr(session, "caller_channel_id", None) or call_id
+            try:
+                resp = await ari.send_command("GET", f"channels/{channel_id}", tolerate_statuses=[404])
+            except Exception:
+                logger.debug("Session reconciliation: channel lookup failed", call_id=call_id, exc_info=True)
+                continue
+            status = resp.get("status") if isinstance(resp, dict) else None
+            if status != 404:
+                # The channel exists (a channel document comes back without "status")
+                # or ARI failed transiently: neither is evidence of an orphan.
+                seen.pop(call_id, None)
+                continue
+            first_seen = seen.setdefault(call_id, now)
+            if (now - first_seen) < grace:
+                continue
+            if await self._reap_orphaned_session(
+                session,
+                reason="caller channel is gone from Asterisk",
+                orphaned_for=now - first_seen,
+                force_after=force_after,
+            ):
+                removed += 1
+                seen.pop(call_id, None)
+        return removed
+
+    async def _reap_orphaned_session(
+        self,
+        session: "CallSession",
+        *,
+        reason: str,
+        orphaned_for: float = 0.0,
+        force_after: Optional[float] = None,
+        force: bool = False,
+    ) -> bool:
+        """Remove one orphaned session the right way for how it got orphaned (see
+        ``_session_reconcile_once``). Returns True when the session is gone."""
+        import time as _time
+
+        call_id = session.call_id
+        created_at = float(getattr(session, "created_at", 0.0) or 0.0)
+        age = round(_time.time() - created_at, 1) if created_at else None
+        cleanup_running = call_id in _cleanup_in_progress
+        went_through_cleanup = bool(getattr(session, "cleanup_in_progress", False))
+        details = dict(
+            call_id=call_id,
+            caller_channel_id=getattr(session, "caller_channel_id", None),
+            status=getattr(session, "status", None),
+            conversation_state=getattr(session, "conversation_state", None),
+            provider=getattr(session, "provider_name", None),
+            pipeline=getattr(session, "pipeline_name", None),
+            is_outbound=bool(getattr(session, "is_outbound", False)),
+            age_seconds=age,
+            orphaned_for_seconds=round(orphaned_for, 1),
+            reason=reason,
+        )
+        if cleanup_running:
+            if force or (force_after is not None and orphaned_for >= force_after):
+                logger.error("Orphaned call session: cleanup has been running too long, removing the session", **details)
+                await self.session_store.remove_call(call_id, tombstone=True)
+                return True
+            logger.warning("Orphaned call session: cleanup still running, leaving it for now", **details)
+            return False
+        if went_through_cleanup:
+            # Cleanup already ran to its end for this object (history, emails, post-call
+            # tools) and something wrote the session back afterwards. Do not run all
+            # of that twice: just drop it.
+            logger.error("Orphaned call session was resurrected after its cleanup; removing it", **details)
+            await self.session_store.remove_call(call_id, tombstone=True)
+            return True
+        logger.warning("Orphaned call session never saw cleanup; running cleanup now", **details)
+        try:
+            await self._cleanup_call(call_id, ignore_ttl_guard=True)
+        except Exception:
+            logger.debug("Orphaned call session: cleanup failed", call_id=call_id, exc_info=True)
+        if await self.session_store.get_by_call_id(call_id) is None:
+            return True
+        if call_id in _cleanup_in_progress and not force:
+            return False
+        logger.error("Orphaned call session survived cleanup; removing it", **details)
+        await self.session_store.remove_call(call_id, tombstone=True)
+        return True
+
     async def _handle_channel_destroyed(self, event: dict):
         """Clean up when a channel is destroyed."""
         try:
@@ -8659,6 +10617,7 @@ class Engine:
                 return
             # Remove from pre-stasis tracking if present
             self._pre_stasis_channels.discard(channel_id)
+            self._note_channel_destroyed(channel_id)
             # An originated AudioSocket leg can fail before StasisStart attaches
             # it to the session. At that point the pending map is the only link
             # back to the caller, so consume it here and end setup ringback.
@@ -8888,6 +10847,8 @@ class Engine:
             # forever when Asterisk never follows it with ChannelTalkingFinished.
             # The media receive paths already drop audio during this same configured
             # guard window, so keep TALK_DETECT aligned with them.
+            if self._pipeline_input_blocked_before_reply(session):
+                return
             cfg = getattr(self.config, "barge_in", None)
             try:
                 post_guard_ms = int(getattr(cfg, "post_tts_end_protection_ms", 0)) if cfg else 0
@@ -8914,6 +10875,7 @@ class Engine:
             # While listening, TALK_DETECT is direct evidence that the caller is
             # present even though there is no playback to interrupt.
             if bool(getattr(session, "audio_capture_enabled", True)) and not bool(getattr(session, "tts_playing", False)):
+                self._note_pipeline_caller_talking(call_id, True)
                 await self._no_input_note_input_state(call_id, True, "asterisk:talk_detect")
                 return
 
@@ -8950,6 +10912,7 @@ class Engine:
             if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
                 return
 
+            self._note_pipeline_caller_talking(call_id, True)
             await self._no_input_note_activity(call_id, "asterisk:talk_detect_barge_in")
 
             # The event may have entered this handler while playback was gated
@@ -9015,7 +10978,10 @@ class Engine:
             if not session:
                 return
             call_id = session.call_id
+            if self._pipeline_input_blocked_before_reply(session):
+                return
             logger.debug("TalkDetect finished", call_id=call_id, channel_id=channel_id)
+            self._note_pipeline_caller_talking(call_id, False)
             await self._no_input_note_input_state(call_id, False, "asterisk:talk_detect")
             
             # Explicitly flush STT adapters that support early flushing via TalkDetect
@@ -9037,7 +11003,7 @@ class Engine:
                                     stt.flush_speech(call_id, pipeline.options_summary().get("stt", {})),
                                     timeout=5,
                                 )
-                                if transcript:
+                                if transcript and not self._pipeline_input_blocked_before_reply(session):
                                     logger.debug("Early STT flush returned transcript", call_id=call_id, transcript_len=len(transcript))
                                     tq = getattr(self, "_pipeline_transcript_queues", {}).get(call_id)
                                     if tq:
@@ -9059,9 +11025,17 @@ class Engine:
             logger.debug("ChannelTalkingFinished handler failed", ari_event=event, exc_info=True)
 
     async def _cleanup_call(
-        self, channel_or_call_id: str, *, force_caller_hangup: bool = False
+        self,
+        channel_or_call_id: str,
+        *,
+        force_caller_hangup: bool = False,
+        ignore_ttl_guard: bool = False,
     ) -> None:
-        """Shared cleanup for StasisEnd/ChannelDestroyed paths."""
+        """Shared cleanup for StasisEnd/ChannelDestroyed paths.
+
+        ``ignore_ttl_guard`` lets the session reconciler and the operator endpoint
+        clean a call whose earlier cleanup is still within the dedupe window.
+        """
         resolved_call_id = None  # Track for finally block cleanup
         cleanup_owned = False
         try:
@@ -9107,8 +11081,15 @@ class Engine:
                 # them so we don't write a duplicate "abandoned" row. The genuine inbound
                 # pre-session abandoned case (HIGH-1a) falls through below.
                 seen_outbound = getattr(self, "_seen_outbound_channels", None)
-                if seen_outbound is not None and channel_or_call_id in seen_outbound:
-                    seen_outbound.discard(channel_or_call_id)
+                # StasisEnd reaches this path before ChannelDestroyed marks the channel
+                # as an outbound dial; the attempt metadata still keyed by channel says
+                # the same thing, and its finalizer writes the history row itself.
+                outbound_meta = getattr(self, "_outbound_attempt_meta_by_channel_id", None) or {}
+                if (seen_outbound is not None and channel_or_call_id in seen_outbound) or (
+                    channel_or_call_id in outbound_meta
+                ):
+                    if seen_outbound is not None:
+                        seen_outbound.discard(channel_or_call_id)
                     seen_caller_stasis = getattr(self, "_seen_caller_stasis_channels", None)
                     if seen_caller_stasis is not None:
                         seen_caller_stasis.discard(channel_or_call_id)
@@ -9143,7 +11124,7 @@ class Engine:
                 now = _time.time()
                 ttl = float(os.getenv("AAVA_CLEANUP_COMPLETED_TTL_SECONDS", "900") or "900")
                 last_done = _cleanup_completed_at.get(call_id)
-                if last_done and (now - float(last_done)) < ttl:
+                if last_done and (now - float(last_done)) < ttl and not ignore_ttl_guard:
                     logger.debug("Cleanup already completed (ttl guard)", call_id=call_id)
                     return
                 # Prune old entries opportunistically.
@@ -9234,6 +11215,14 @@ class Engine:
                         exc_info=True,
                     )
 
+            # The caller may have hung up while the recognizer still held their
+            # last words, or while a reply was playing: settle both before the
+            # dialog worker is cancelled, so the record of the call is complete.
+            try:
+                await self._settle_pipeline_on_hangup(session)
+            except Exception:
+                logger.debug("Pipeline hangup settlement failed", call_id=call_id, exc_info=True)
+
             # Stop the dialog producer before tearing down playback or media.
             # An in-flight LLM request can otherwise finish after the first
             # stop_streaming_playback() call and create a new stream on a dead
@@ -9306,6 +11295,9 @@ class Engine:
                     fallback.cancel()
                 self._terminal_hangup_locks.pop(call_id, None)
                 self._terminal_hangup_started.discard(call_id)
+                self._terminal_hangup_reasons.pop(call_id, None)
+                self._terminal_fallback_reasons.pop(call_id, None)
+                self._terminal_hangup_cancelled.discard(call_id)
                 self._local_tts_farewell_pending.discard(call_id)
             except Exception:
                 logger.debug("Terminal lifecycle cleanup failed", call_id=call_id, exc_info=True)
@@ -9463,6 +11455,35 @@ class Engine:
             self._resample_state_provider_in.pop(call_id, None)
             self._resample_state_provider_out.pop(call_id, None)
             self._resample_state_pipeline16k.pop(call_id, None)
+            self._pipeline_gated_silence_ms.pop(call_id, None)
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
+            self._spoken_replies.pop(call_id, None)
+            self._pipeline_caller_talking.pop(call_id, None)
+            self._pipeline_caller_talk_changed_at.pop(call_id, None)
+            self._pipeline_turn_wakeup.pop(call_id, None)
+            self._pipeline_turn_source.pop(call_id, None)
+            self._pipeline_stt_final_expected_at.pop(call_id, None)
+            self._pipeline_last_final_at.pop(call_id, None)
+            self._pipeline_pending_asr_ms.pop(call_id, None)
+            self._pipeline_turn_speech_ended_at.pop(call_id, None)
+            self._silero_trackers.pop(call_id, None)
+            self._silero_deferred_barge_in.pop(call_id, None)
+            self._resample_state_silero16k.pop(call_id, None)
+            self._resample_state_silero_vad.pop(call_id, None)
+            self._turn_audio.pop(call_id, None)
+            self._utterance_cutters.pop(call_id, None)
+            self._resample_state_utterance16k.pop(call_id, None)
+            self._pipeline_utterance_starts.pop(call_id, None)
+            self._pipeline_speech_over_announcement.discard(call_id)
+            self._pipeline_utterance_fallback_warned.discard(call_id)
+            self._pipeline_reply_inflight.pop(call_id, None)
+            self._pipeline_caller_resumed.pop(call_id, None)
+            self._pipeline_continue_streak.pop(call_id, None)
+            self._pipeline_turn_verdict.pop(call_id, None)
+            self._pipeline_turn_verdict_pending.pop(call_id, None)
+            warm_up_task = self._pipeline_llm_warm_ups.pop(call_id, None)
+            if warm_up_task is not None and not warm_up_task.done():
+                warm_up_task.cancel()
             self._resample_state_vad8k.pop(call_id, None)
             self.audiosocket_resample_state.pop(call_id, None)
 
@@ -9628,8 +11649,22 @@ class Engine:
             # Clean up call start time after post-call tools have used it
             _call_start_times.pop(call_id, None)
 
-            # Finally remove the session.
-            await self.session_store.remove_call(call_id)
+            # The record was written before the post-call tools; whatever the
+            # conversation gained since (the caller's last words, a turn the
+            # cleanup cancelled) goes into it too, so the Admin UI shows the
+            # same transcript the webhooks were given.
+            try:
+                await self._sync_call_history_transcript(session, reason="cleanup-end")
+            except Exception:
+                logger.debug("Final call history transcript sync failed", call_id=call_id, exc_info=True)
+            getattr(self, "_call_history_persisted", set()).discard(call_id)
+
+            # Finally remove the session. The tombstone makes the store refuse a late
+            # upsert of this object: a pipeline task, a coordinator timer or an
+            # AudioSocket bind finishing after this point would otherwise put the
+            # session back with no channel behind it, and nothing would ever remove
+            # it again (Asterisk sends no further events for a destroyed channel).
+            await self.session_store.remove_call(call_id, tombstone=True)
 
             # Best-effort cleanup of attended transfer agent channel mappings for this call.
             try:
@@ -9770,8 +11805,9 @@ class Engine:
             # Determine outcome
             outcome = "completed"
             explicit_outcome = str(getattr(session, "call_outcome", "") or "").strip()
-            if explicit_outcome == "no_input_timeout":
-                outcome = "no_input_timeout"
+            if explicit_outcome in ("no_input_timeout", "max_duration"):
+                # Policy outcomes, not provider failures.
+                outcome = explicit_outcome
             elif session.error_message:
                 outcome = "error"
             elif self._session_was_transferred(session):
@@ -9836,6 +11872,10 @@ class Engine:
             saved = await store.save(record)
             if saved:
                 logger.debug("Call history record saved", call_id=call_id, record_id=record.id)
+                persisted_calls = getattr(self, "_call_history_persisted", None)
+                if persisted_calls is None:
+                    persisted_calls = self._call_history_persisted = set()
+                persisted_calls.add(call_id)
 
                 # CallHistoryStore.save(...) is dedupe-by-call_id; when a record already exists,
                 # `record.id` is not the persisted row id. Resolve the persisted id so outbound
@@ -9861,8 +11901,8 @@ class Engine:
                                 final_outcome = "error"
                             elif self._session_was_transferred(session):
                                 final_outcome = "transferred"
-                            elif str(getattr(session, "call_outcome", "") or "") == "no_input_timeout":
-                                final_outcome = "no_input_timeout"
+                            elif str(getattr(session, "call_outcome", "") or "") in ("no_input_timeout", "max_duration"):
+                                final_outcome = str(getattr(session, "call_outcome", "") or "")
 
                             await self.outbound_store.finish_attempt(
                                 attempt_id,
@@ -9957,6 +11997,53 @@ class Engine:
             logger.error("Error binding AudioSocket UUID", conn_id=conn_id, uuid=uuid_str, error=str(exc), exc_info=True)
             return False
 
+    def _probe_audiosocket_first_frame(
+        self, session: CallSession, frame: AudioSocketAudioFrame, call_id: str
+    ) -> None:
+        """Log the format and level of a call's first inbound AudioSocket frame.
+
+        AudioSocket carries signed-linear audio little-endian, at the rate its
+        message type names, so the frame is taken as it comes. The probe used
+        to guess the byte order from this one frame's energy, and the guess
+        was backwards: byte-swapping a quiet, correctly ordered frame makes it
+        loud, so a 16 kHz call whose first frame was line noise or a breath
+        would have had every frame swapped into noise. The rule never ran only
+        because the probe raised first: the audio handler's own later
+        ``import audioop`` leaves the name unbound above it, which is why the
+        probe lives in a method of its own. ``rms_swapped`` stays in the log
+        for a client that does send big-endian audio.
+        """
+        vad_state = getattr(session, "vad_state", None)
+        if not isinstance(vad_state, dict):
+            vad_state = session.vad_state = {}
+        if vad_state.get("format_probe_done"):
+            return
+        vad_state["format_probe_done"] = True
+        vad_state["pcm16_inbound_swap"] = False
+        audio = frame.payload
+        try:
+            if str(frame.encoding).startswith("slin"):
+                logger.info(
+                    "AudioSocket frame probe",
+                    call_id=call_id,
+                    audiosocket_format=frame.encoding,
+                    sample_rate=frame.sample_rate,
+                    message_type=f"0x{frame.message_type:02x}",
+                    frame_bytes=len(audio),
+                    rms_native=audioop.rms(audio, 2),
+                    rms_swapped=audioop.rms(audioop.byteswap(audio, 2), 2),
+                )
+            else:
+                logger.info(
+                    "AudioSocket frame probe",
+                    call_id=call_id,
+                    audiosocket_format=frame.encoding,
+                    frame_bytes=len(audio),
+                    rms_pcm8k=audioop.rms(audioop.ulaw2lin(audio, 2), 2),
+                )
+        except Exception:
+            logger.debug("AudioSocket frame probe failed", call_id=call_id, exc_info=True)
+
     async def _audiosocket_handle_audio(
         self,
         conn_id: str,
@@ -10036,68 +12123,8 @@ class Engine:
             except Exception:
                 pass
 
-            # First-frame diagnostics probe (no mutation): log RMS for format verification
-            try:
-                vad_state = session.vad_state
-            except Exception:
-                vad_state = session.vad_state = {}
-            if not vad_state.get('format_probe_done'):
-                try:
-                    as_fmt = frame_format
-                    if as_fmt.startswith('slin'):
-                        rms_native = audioop.rms(audio_bytes, 2)
-                        try:
-                            swapped = audioop.byteswap(audio_bytes, 2)
-                            rms_swapped = audioop.rms(swapped, 2)
-                        except Exception:
-                            rms_swapped = 0
-                        logger.info(
-                            "AudioSocket frame probe",
-                            call_id=caller_channel_id,
-                            audiosocket_format=as_fmt,
-                            sample_rate=frame_rate,
-                            message_type=f"0x{frame.message_type:02x}",
-                            frame_bytes=len(audio_bytes),
-                            rms_native=rms_native,
-                            rms_swapped=rms_swapped,
-                        )
-                        # Determine if inbound PCM16 appears byte-swapped (big-endian on wire)
-                        try:
-                            frame_bytes = len(audio_bytes)
-                            # Conservative rule: only flag swap when swapped energy is clearly higher
-                            swap_flag = (
-                                frame_bytes >= 640 and  # 20ms @ 16k PCM
-                                rms_swapped >= 2048 and
-                                rms_swapped >= 16 * max(1, rms_native)
-                            )
-                            vad_state['pcm16_inbound_swap'] = bool(swap_flag)
-                            if swap_flag:
-                                logger.warning(
-                                    "Inbound slin16 appears byte-swapped; will normalize to PCM16-LE for processing",
-                                    call_id=caller_channel_id,
-                                    rms_native=rms_native,
-                                    rms_swapped=rms_swapped,
-                                )
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            pcm = audioop.ulaw2lin(audio_bytes, 2)
-                            rms_pcm = audioop.rms(pcm, 2)
-                        except Exception:
-                            rms_pcm = 0
-                        logger.info(
-                            "AudioSocket frame probe",
-                            call_id=caller_channel_id,
-                            audiosocket_format=as_fmt,
-                            frame_bytes=len(audio_bytes),
-                            rms_pcm8k=rms_pcm,
-                        )
-                        # μ-law path: no PCM16 swap needed
-                        vad_state['pcm16_inbound_swap'] = False
-                    vad_state['format_probe_done'] = True
-                except Exception:
-                    pass
+            # First-frame diagnostics probe: logs the format and level, never alters the audio.
+            self._probe_audiosocket_first_frame(session, frame, caller_channel_id)
 
             try:
                 swap_needed_flag = bool(session.vad_state.get('pcm16_inbound_swap', False))
@@ -10174,22 +12201,36 @@ class Engine:
                 )
                 return
 
+            if self._pipeline_input_blocked_before_reply(session):
+                return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
+
+            # Silero VAD sees every caller frame, gated or not, before any
+            # routing decision below can drop it.
+            if self._silero_vad_active(session.call_id):
+                await self._observe_silero_vad(session, pcm_bytes, pcm_rate, source="audiosocket")
+
             # CRITICAL FIX: Check for pipeline mode FIRST before routing to monolithic providers
             if self._pipeline_forced.get(caller_channel_id):
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
+                # (unless the deployment keeps listening while the agent speaks:
+                # then the frames go to the recognizer and Silero, which already
+                # scored them, still decides barge-in).
+                if not session.audio_capture_enabled and not self._pipeline_forwards_gated_audio(session.call_id):
                     # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
-                        return
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     # If TALK_DETECT is enabled for this pipeline, prefer it over local energy checks
                     # to avoid double-triggering and false positives on AudioSocket.
                     try:
                         td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
                         if bool(td.get("enabled", False)):
-                            return
+                            return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     except Exception:
                         pass
+                    # Silero VAD already scored this frame and owns barge-in.
+                    if self._silero_owns_barge_in(session.call_id):
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
                     now = time.time()
                     tts_elapsed_ms = 0
                     try:
@@ -10280,8 +12321,15 @@ class Engine:
                                 self.conversation_coordinator.note_audio_during_tts(caller_channel_id)
                             except Exception:
                                 pass
-                        return
+                        return self._feed_pipeline_silence(caller_channel_id, pcm_bytes, pcm_rate)
+                else:
+                    # Real audio is flowing again, so the next gated stretch gets
+                    # the full silence budget.
+                    self._pipeline_gated_silence_used_ms.pop(caller_channel_id, None)
                 
+                if self._pipeline_utterance_mode(caller_channel_id):
+                    # Silero cuts the caller's utterances for the recognizer; the raw stream is not sent.
+                    return
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
@@ -11276,6 +13324,848 @@ class Engine:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # Silero VAD: the engine's own caller-speech detector for pipelines
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_silero_settings(config: Any) -> Dict[str, Any]:
+        vad_cfg = getattr(config, "vad", None)
+
+        def _get(name: str, default: Any) -> Any:
+            value = getattr(vad_cfg, name, None) if vad_cfg is not None else None
+            return default if value is None else value
+
+        stop_threshold = _get("silero_stop_threshold", None)
+        sample_rate = _get("silero_sample_rate", None)
+        return {
+            "enabled": bool(_get("silero_enabled", False)),
+            "model_path": str(_get("silero_model_path", SILERO_DEFAULT_MODEL_PATH) or SILERO_DEFAULT_MODEL_PATH),
+            "auto_download": bool(_get("silero_auto_download", True)),
+            "threshold": float(_get("silero_threshold", 0.5)),
+            "stop_threshold": float(stop_threshold) if stop_threshold is not None else None,
+            "start_ms": int(_get("silero_start_ms", 96)),
+            "stop_ms": int(_get("silero_stop_ms", 300)),
+            # None: the line's own rate.
+            "sample_rate": int(sample_rate) if sample_rate else None,
+            "stt_finalize_ms": int(_get("silero_stt_finalize_ms", 900)),
+            "barge_in": bool(_get("silero_barge_in", True)),
+            "stt_utterances": bool(_get("silero_stt_utterances", False)),
+            "utterance_preroll_ms": int(_get("silero_utterance_preroll_ms", 300)),
+            "utterance_max_ms": int(_get("silero_utterance_max_ms", 20000)),
+        }
+
+    def _silero_config(self) -> Dict[str, Any]:
+        settings = getattr(self, "_silero_settings", None)
+        if not settings:
+            settings = self._silero_settings = self._read_silero_settings(getattr(self, "config", None))
+        return settings
+
+    async def _init_silero_vad(self) -> None:
+        """Load the Silero VAD model when ``vad.silero_enabled``, fetching it first if allowed.
+
+        A missing runtime or model disables the detector with an error rather
+        than failing the engine: calls then fall back to talk detection or the
+        result window exactly as before.
+        """
+        settings = self._silero_config()
+        if not settings["enabled"]:
+            return
+        path = settings["model_path"]
+        try:
+            resolved = await asyncio.to_thread(
+                ensure_silero_model_file, path, auto_download=settings["auto_download"]
+            )
+            self._silero_model = await asyncio.to_thread(load_silero_model, resolved)
+        except SileroVadError as exc:
+            self._silero_model = None
+            logger.error(
+                "Silero VAD unavailable; pipelines fall back to talk detection",
+                error=str(exc),
+                path=path,
+            )
+            return
+        except Exception:
+            self._silero_model = None
+            logger.error("Silero VAD failed to load", path=path, exc_info=True)
+            return
+        logger.info(
+            "Silero VAD enabled",
+            version=SILERO_VAD_VERSION,
+            path=resolved,
+            threshold=settings["threshold"],
+            stop_threshold=settings["stop_threshold"],
+            start_ms=settings["start_ms"],
+            stop_ms=settings["stop_ms"],
+            sample_rate=settings["sample_rate"] or "line",
+            stt_finalize_ms=settings["stt_finalize_ms"],
+            barge_in=settings["barge_in"],
+        )
+
+    def _new_silero_tracker(self) -> Optional[SileroCallerTracker]:
+        model = getattr(self, "_silero_model", None)
+        if model is None:
+            return None
+        settings = self._silero_config()
+        return SileroCallerTracker(
+            model,
+            threshold=settings["threshold"],
+            stop_threshold=settings["stop_threshold"],
+            start_ms=settings["start_ms"],
+            stop_ms=settings["stop_ms"],
+        )
+
+    def _silero_vad_active(self, call_id: str) -> bool:
+        """Whether Silero VAD tracks this call's caller audio."""
+        trackers = getattr(self, "_silero_trackers", None)
+        return bool(trackers) and call_id in trackers
+
+    def _silero_owns_barge_in(self, call_id: str) -> bool:
+        return self._silero_vad_active(call_id) and bool(self._silero_config()["barge_in"])
+
+    async def _observe_silero_vad(
+        self,
+        session: CallSession,
+        pcm16: bytes,
+        sample_rate_hz: int,
+        *,
+        source: str,
+    ) -> None:
+        """Score inbound caller audio and act on speech start/stop transitions.
+
+        Runs on every frame, gated or not, so a caller interrupting the agent is
+        seen exactly like one answering it. Inference costs well under a
+        millisecond per 32 ms chunk, so it stays inline on the event loop.
+        """
+        call_id = session.call_id
+        if self._pipeline_input_blocked_before_reply(session):
+            return
+        tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+        if tracker is None or not pcm16:
+            return
+        rate = int(sample_rate_hz or 0)
+        if rate not in SILERO_SAMPLE_RATES:
+            try:
+                states = getattr(self, "_resample_state_silero16k", None)
+                if states is None:
+                    states = self._resample_state_silero16k = {}
+                pcm16, states[call_id] = resample_audio(
+                    pcm16, rate, PIPELINE_STT_SAMPLE_RATE_HZ, state=states.get(call_id)
+                )
+                rate = PIPELINE_STT_SAMPLE_RATE_HZ
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                return
+        buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+        if buffer is not None:
+            buffer.append(pcm16, rate)
+        cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+        if cutter is not None:
+            self._feed_utterance_cutter(session, cutter, pcm16, rate)
+        scored = self._silero_scoring_audio(call_id, pcm16, rate)
+        if scored is None:
+            return
+        try:
+            events = tracker.feed(*scored)
+        except Exception:
+            logger.debug("Silero VAD inference failed", call_id=call_id, source=source, exc_info=True)
+            return
+        if cutter is not None and float(tracker.last_probability) < float(
+            getattr(tracker, "stop_threshold", 0.35)
+        ):
+            cutter.mark_quiet()
+        for event in events:
+            if event == "start":
+                if cutter is not None:
+                    cutter.speech_started()
+                    self._keep_answer_over_announcement_whole(session, cutter)
+                await self._on_silero_speech_started(session, tracker, source=source)
+            elif event == "stop":
+                utterance = cutter.speech_stopped() if cutter is not None else None
+                await self._on_silero_speech_finished(
+                    session, tracker, source=source, utterance=utterance
+                )
+        if cutter is not None and tracker.talking:
+            self._keep_answer_over_announcement_whole(session, cutter)
+        deferred_since = (getattr(self, "_silero_deferred_barge_in", None) or {}).get(call_id)
+        if deferred_since is not None:
+            if tracker.talking:
+                await self._retry_deferred_silero_barge_in(session, tracker, source=source, since=deferred_since)
+            else:
+                self._silero_deferred_barge_in.pop(call_id, None)
+        if tracker.talking:
+            await self._interrupt_output_started_over_speech(session, tracker, source=source)
+        if cutter is not None and tracker.talking:
+            # A caller who never pauses: the recognizer gets the utterance in
+            # pieces rather than a minute of speech at once.
+            piece = cutter.split_overflow()
+            if piece is not None:
+                self._send_pipeline_utterance(call_id, piece, expect_result=True)
+
+    def _silero_scoring_audio(self, call_id: str, pcm16: bytes, rate: int) -> Optional[Tuple[bytes, int]]:
+        """The caller's frame at the rate Silero scores it at (``vad.silero_sample_rate``).
+
+        Only Silero gets the converted frame. Upsampling is linear, as for any
+        other line rate: on the recorded 8 kHz call that motivated the setting
+        it let Silero score short answers more surely than an alias-free
+        upsampler did. Downsampling is alias-safe. None when the frame cannot
+        be converted, so Silero skips it rather than restart at the line rate.
+        """
+        target = self._silero_config().get("sample_rate")
+        if not target or target == rate:
+            return pcm16, rate
+        states = getattr(self, "_resample_state_silero_vad", None)
+        if states is None:
+            states = self._resample_state_silero_vad = {}
+        try:
+            converted, states[call_id] = resample_audio(
+                pcm16,
+                rate,
+                target,
+                state=states.get(call_id),
+                mode="linear" if target > rate else "fir",
+            )
+        except (TypeError, ValueError, IndexError, ZeroDivisionError):
+            return None
+        return converted, target
+
+    @staticmethod
+    def _no_input_announcement_active(session: Optional[CallSession]) -> bool:
+        """Whether the inactivity watchdog's check-in or final message is being spoken right now."""
+        state = getattr(session, "no_input_state", None) if session is not None else None
+        return bool(isinstance(state, dict) and state.get("announcement_active"))
+
+    def _keep_answer_over_announcement_whole(self, session: CallSession, cutter: UtteranceCutter) -> None:
+        """The caller is talking over the watchdog's own announcement: what they say is their answer.
+
+        The protection window still keeps the check-in or final message from
+        being cut by its own echo, but the caller's words over it are not
+        something to hold back: the utterance goes to the recognizer whole,
+        the frames muted while the announcement was audible included, so a
+        short "yes" said over "are you still there?" is heard instead of being
+        dropped as silence. Whatever the recognizer returns is taken as said.
+        """
+        if not self._no_input_announcement_active(session):
+            return
+        marks = getattr(self, "_pipeline_speech_over_announcement", None)
+        if marks is None:
+            marks = self._pipeline_speech_over_announcement = set()
+        call_id = session.call_id
+        if call_id not in marks:
+            logger.info(
+                "Caller speaking over an inactivity announcement; the utterance is kept whole",
+                call_id=call_id,
+                kind=(getattr(session, "no_input_state", None) or {}).get("announcement_kind"),
+            )
+            marks.add(call_id)
+        cutter.keep_whole()
+
+    async def _await_answer_over_announcement(self, call_id: str, *, kind: str) -> None:
+        """Let the caller's words over a watchdog announcement reach the dialog before the watchdog decides.
+
+        Right after its check-in or final message the watchdog decides whether
+        the caller answered: by a turn having reached the model. Words spoken
+        over the end of the announcement are still with Silero or the
+        recognizer at that moment, so the announcement waits, at most
+        ``NO_INPUT_ANSWER_WAIT_SEC``, until the caller is quiet and the result
+        has arrived; an answer over "goodbye" keeps the call. Only Silero's
+        speech and a recent pending result hold it, never raw line sound, so a
+        tone or a ringback never does.
+        """
+        if not self._pipeline_utterance_mode(call_id):
+            return
+
+        def outstanding() -> Optional[str]:
+            tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+            if tracker is not None and bool(getattr(tracker, "talking", False)):
+                return "caller talking"
+            expected_at = (getattr(self, "_pipeline_stt_final_expected_at", None) or {}).get(call_id)
+            if expected_at is not None and time.monotonic() - float(expected_at) <= 5.0:
+                return "result pending"
+            return None
+
+        reason = outstanding()
+        if reason is None:
+            return
+        started = time.monotonic()
+        deadline = started + NO_INPUT_ANSWER_WAIT_SEC
+        while outstanding() is not None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        # Let the dialog worker take the result off its queue and note the turn.
+        await asyncio.sleep(0.05)
+        logger.info(
+            "Waited for the caller's answer over an inactivity announcement",
+            call_id=call_id,
+            kind=kind,
+            reason=reason,
+            settled=outstanding() is None,
+            waited_ms=int((time.monotonic() - started) * 1000),
+            limit_ms=int(NO_INPUT_ANSWER_WAIT_SEC * 1000),
+        )
+
+    async def _on_silero_speech_started(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+    ) -> None:
+        """The caller started talking: hold the turn, wake the watchdog, barge in."""
+        call_id = session.call_id
+        if self._pipeline_input_blocked_before_reply(session):
+            return
+        self._note_pipeline_caller_talking(call_id, True, source="vad")
+        # The caller went on: whatever Smart Turn said about the last stop no
+        # longer applies, and the next stop is judged on the whole turn.
+        self._discard_turn_verdict(call_id)
+        # A turn released a moment ago is being answered without these words:
+        # before the reply's first sound it is discarded and the words wait
+        # for what the caller says next.
+        resumed = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+        if resumed is not None:
+            resumed.set()
+        # The inactivity watchdog pauses while the caller talks, whatever this
+        # speech leads to (a barge-in included); the stop tells it they are done.
+        await self._no_input_note_input_state(call_id, True, "engine:silero_vad")
+        try:
+            if await self._discard_unheard_reply(session):
+                return
+        except Exception:
+            logger.debug("Unheard-reply discard failed", call_id=call_id, exc_info=True)
+        listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
+            getattr(session, "tts_playing", False)
+        )
+        if listening:
+            return
+        outcome = await self._silero_barge_in(session, tracker, source=source)
+        if outcome == "protected":
+            # The window only says when speech may interrupt: a caller still
+            # talking when it ends interrupts then (retried frame by frame).
+            self._silero_deferred_barge_in[call_id] = time.monotonic()
+
+    async def _silero_barge_in(
+        self,
+        session: CallSession,
+        tracker: SileroCallerTracker,
+        *,
+        source: str,
+        deferred_since: Optional[float] = None,
+    ) -> str:
+        """Interrupt the agent for the caller's speech unless something says not to.
+
+        Returns ``"fired"``, ``"protected"`` (inside the echo-protection
+        window, where the start of a reply may still be the agent's own voice
+        coming back; the caller may outlast the window, so the decision is
+        retried while they talk) or ``"skipped"`` (barge-in off, cooldown).
+        """
+        call_id = session.call_id
+        if not self._silero_config()["barge_in"]:
+            return "skipped"
+        if self._pipeline_input_blocked_before_reply(session):
+            return "protected"
+        cfg = getattr(self.config, "barge_in", None)
+        if not cfg or not getattr(cfg, "enabled", True):
+            return "skipped"
+        now = time.time()
+        tts_elapsed_ms = 0
+        try:
+            if float(getattr(session, "tts_started_ts", 0.0) or 0.0) > 0:
+                tts_elapsed_ms = int((now - float(session.tts_started_ts)) * 1000)
+        except Exception:
+            tts_elapsed_ms = 0
+        if not self._discard_unheard_reply_enabled():
+            manager = getattr(self, "streaming_playback_manager", None)
+            if manager is not None and manager.is_stream_active(call_id):
+                # A slow LLM/TTS must not spend the protection window before
+                # the caller can hear the reply.
+                tts_elapsed_ms = min(tts_elapsed_ms, int(manager.get_playback_position_ms(call_id)))
+        # The same echo protection as Asterisk talk detection, so switching
+        # detectors keeps the tuning a deployment already has.
+        initial_protect = int(getattr(cfg, "talk_detect_initial_protection_ms", 1500))
+        try:
+            if getattr(session, "conversation_state", None) == "greeting":
+                greet_ms = int(getattr(cfg, "greeting_protection_ms", 0))
+                if greet_ms > initial_protect:
+                    initial_protect = greet_ms
+        except Exception:
+            pass
+        if tts_elapsed_ms < initial_protect:
+            if deferred_since is None:
+                logger.debug(
+                    "Silero VAD speech inside the protection window; barge-in deferred to its end",
+                    call_id=call_id,
+                    tts_elapsed_ms=tts_elapsed_ms,
+                    protection_ms=initial_protect,
+                )
+            return "protected"
+        cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
+        last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
+        if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
+            return "skipped"
+        await self._no_input_note_activity(call_id, "engine:silero_vad_barge_in")
+        try:
+            if not bool(getattr(session, "media_rx_confirmed", False)):
+                session.media_rx_confirmed = True
+                session.first_media_rx_ts = now
+                await self._save_session(session)
+        except Exception:
+            pass
+        await self._apply_barge_in_action(call_id, source="silero_vad", reason="pipeline_tts_overlap")
+        # Reopen capture at once, like the energy path: the caller is talking
+        # over the agent and every further frame belongs to the recognizer.
+        session.audio_capture_enabled = True
+        logger.info(
+            "🎧 BARGE-IN (Silero VAD) triggered",
+            call_id=call_id,
+            source=source,
+            tts_elapsed_ms=tts_elapsed_ms,
+            probability=round(tracker.last_probability, 3),
+            deferred_ms=int((time.monotonic() - deferred_since) * 1000) if deferred_since is not None else None,
+        )
+        return "fired"
+
+    async def _retry_deferred_silero_barge_in(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str, since: float
+    ) -> None:
+        """The caller started inside the protection window and is still talking: interrupt once it has passed.
+
+        The window never outlasts the reply: when the reply ends on its own
+        first (``barge_in.protection_ends_with_reply``), the caller's speech
+        is their turn from its first frame and the utterance is sent whole,
+        without counting as a barge-in since nothing was cut.
+        """
+        call_id = session.call_id
+        listening = bool(getattr(session, "audio_capture_enabled", True)) and not bool(
+            getattr(session, "tts_playing", False)
+        )
+        if listening:
+            # The reply ended, or something else cut it: nothing left to interrupt.
+            self._silero_deferred_barge_in.pop(call_id, None)
+            cfg = getattr(self.config, "barge_in", None)
+            if cfg is not None and not getattr(cfg, "protection_ends_with_reply", True):
+                return
+            cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+            if cutter is not None:
+                cutter.note_reply_ended_over_speech()
+            spoke_for_ms = int((time.monotonic() - float(since)) * 1000)
+            logger.info(
+                "Protection window ended with the reply; the caller's speech over its tail is kept",
+                call_id=call_id,
+                source=source,
+                spoke_for_ms=spoke_for_ms,
+                utterance_kept_whole=cutter is not None,
+            )
+            return
+        outcome = await self._silero_barge_in(session, tracker, source=source, deferred_since=since)
+        if outcome != "protected":
+            self._silero_deferred_barge_in.pop(call_id, None)
+
+    async def _interrupt_output_started_over_speech(
+        self, session: CallSession, tracker: SileroCallerTracker, *, source: str
+    ) -> None:
+        """The agent became audible while the caller was already talking: the caller was first.
+
+        Barge-in is otherwise decided at Silero's speech start, and the start
+        that opened this speech came before the output existed, so nothing
+        would ever cut it. Output that starts over speech (an inactivity
+        check-in, a filler, a reply whose turn ended on a pause the caller did
+        not take) is cut at once, without the protection window: speech that
+        predates the agent's audio cannot be its echo. The greeting is left to
+        its own protection, as a callee's "hello" runs into it by design.
+        """
+        if bool(getattr(session, "audio_capture_enabled", True)) or not bool(
+            getattr(session, "tts_playing", False)
+        ):
+            return
+        if getattr(session, "conversation_state", None) == "greeting":
+            return
+        started_at = getattr(tracker, "segment_started_at", None)
+        if started_at is None:
+            return
+        try:
+            tts_started = float(getattr(session, "tts_started_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if tts_started <= 0.0:
+            return
+        speech_started_wall = time.time() - (time.monotonic() - float(started_at))
+        if tts_started <= speech_started_wall:
+            return  # the caller spoke into the output: the ordinary rules apply
+        call_id = session.call_id
+        if not self._silero_config()["barge_in"]:
+            return
+        cfg = getattr(self.config, "barge_in", None)
+        if not cfg or not getattr(cfg, "enabled", True):
+            return
+        now = time.time()
+        cooldown_ms = int(getattr(cfg, "cooldown_ms", 500))
+        last_barge_in_ts = float(getattr(session, "last_barge_in_ts", 0.0) or 0.0)
+        if last_barge_in_ts and (now - last_barge_in_ts) * 1000 < cooldown_ms:
+            return
+        try:
+            if await self._discard_unheard_reply(session):
+                logger.info("Reply discarded: it started over the caller's speech", call_id=call_id)
+                return
+        except Exception:
+            logger.debug("Unheard-reply discard failed", call_id=call_id, exc_info=True)
+        await self._no_input_note_activity(call_id, "engine:silero_vad_barge_in")
+        await self._apply_barge_in_action(call_id, source="silero_vad", reason="output_over_speech")
+        session.audio_capture_enabled = True
+        logger.info(
+            "🎧 BARGE-IN (Silero VAD) triggered",
+            call_id=call_id,
+            source=source,
+            tts_elapsed_ms=int((now - tts_started) * 1000),
+            probability=round(tracker.last_probability, 3),
+            over_speech=True,
+        )
+
+    async def _on_silero_speech_finished(
+        self,
+        session: CallSession,
+        tracker: SileroCallerTracker,
+        *,
+        source: str,
+        utterance: Optional[SttUtterance] = None,
+    ) -> None:
+        """The caller stopped: finalize the recognizer, then release the turn.
+
+        The finalize request is recorded before the worker is woken so that
+        its recomputed deadline already waits for the result on its way. With
+        Silero cutting the utterances, ``utterance`` is what the caller just
+        said and goes to the recognizer whole instead of a finalize burst.
+        """
+        call_id = session.call_id
+        self._silero_deferred_barge_in.pop(call_id, None)
+        finalize_requested = False
+        expect_result = False
+        if self._pipeline_utterance_mode(call_id):
+            if utterance is not None:
+                expect_result = self._send_pipeline_utterance(call_id, utterance, expect_result=True)
+                finalize_requested = expect_result
+            (getattr(self, "_pipeline_speech_over_announcement", None) or set()).discard(call_id)
+        elif bool(getattr(session, "audio_capture_enabled", True)):
+            last_final = (getattr(self, "_pipeline_last_final_at", None) or {}).get(call_id)
+            last_speech = tracker.last_speech_at
+            # A result that arrived after the caller's last speech already
+            # covers it; otherwise the recognizer still holds this speech.
+            expect_result = last_speech is not None and (last_final is None or last_final < last_speech)
+            finalize_requested = self._request_pipeline_stt_finalize(call_id, expect_result=expect_result)
+        self._note_pipeline_caller_talking(call_id, False, source="vad")
+        await self._no_input_note_input_state(call_id, False, "engine:silero_vad")
+        analysis_requested = self._schedule_turn_analysis(call_id)
+        logger.debug(
+            "Silero VAD: caller quiet",
+            smart_turn=analysis_requested,
+            call_id=call_id,
+            source=source,
+            segment_ms=round(tracker.segment_ms),
+            finalize_requested=finalize_requested,
+            result_expected=expect_result,
+        )
+
+    def _request_pipeline_stt_finalize(
+        self, call_id: str, *, expect_result: bool, burst_ms: Optional[int] = None
+    ) -> bool:
+        """Feed the recognizer a burst of silence so it emits its result now.
+
+        A streaming recognizer only closes a phrase after its own silence gate
+        (T-one: 600 ms, at a chunk boundary), so once the caller is known to be
+        quiet the gate is satisfied in one go instead of in real time. The
+        burst is plain zeros through the normal queue, so no recognizer
+        protocol change is needed; a recognizer that already emitted the phrase
+        simply scores a little more silence.
+        """
+        ms = int(burst_ms) if burst_ms is not None else int(self._silero_config()["stt_finalize_ms"])
+        queue = (getattr(self, "_pipeline_queues", None) or {}).get(call_id)
+        if queue is None or ms <= 0 or self._pipeline_utterance_mode(call_id):
+            return False
+        silence = b"\x00" * (PIPELINE_STT_SAMPLE_RATE_HZ * PIPELINE_STT_BYTES_PER_SAMPLE * ms // 1000)
+        try:
+            queue.put_nowait(silence)
+        except asyncio.QueueFull:
+            logger.debug("Pipeline queue full; STT finalize burst dropped", call_id=call_id)
+            return False
+        if expect_result:
+            expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+            if expected is None:
+                expected = self._pipeline_stt_final_expected_at = {}
+            expected[call_id] = time.monotonic()
+        return True
+
+    def _note_pipeline_final_arrived(self, call_id: str, *, asr_ms: Optional[float] = None) -> None:
+        """A recognizer result reached the dialog queue: nothing is outstanding.
+
+        The recognizer's latency for it is kept for the turn it starts: as
+        measured by the caller (a chunked adapter's transcribe call), else from
+        the moment the caller's utterance was queued for the recognizer.
+        """
+        now = time.monotonic()
+        arrived = getattr(self, "_pipeline_last_final_at", None)
+        if arrived is None:
+            arrived = self._pipeline_last_final_at = {}
+        arrived[call_id] = now
+        expected = getattr(self, "_pipeline_stt_final_expected_at", None)
+        sent_at = expected.pop(call_id, None) if expected else None
+        if asr_ms is None and sent_at is not None:
+            try:
+                asr_ms = (now - float(sent_at)) * 1000.0
+            except (TypeError, ValueError):
+                asr_ms = None
+        if asr_ms is not None:
+            pending = getattr(self, "_pipeline_pending_asr_ms", None)
+            if pending is None:
+                pending = self._pipeline_pending_asr_ms = {}
+            pending[call_id] = max(0, int(round(float(asr_ms))))
+
+    # ------------------------------------------------------------------
+    # Smart Turn: is the caller done, or only pausing?
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_smart_turn_settings(config: Any) -> Dict[str, Any]:
+        vad_cfg = getattr(config, "vad", None)
+
+        def _get(name: str, default: Any) -> Any:
+            value = getattr(vad_cfg, name, None) if vad_cfg is not None else None
+            return default if value is None else value
+
+        return {
+            "enabled": bool(_get("smart_turn_enabled", False)),
+            "model_path": str(
+                _get("smart_turn_model_path", SMART_TURN_DEFAULT_MODEL_PATH) or SMART_TURN_DEFAULT_MODEL_PATH
+            ),
+            "auto_download": bool(_get("smart_turn_auto_download", True)),
+            "threshold": float(_get("smart_turn_threshold", 0.5)),
+            "incomplete_hold_ms": int(_get("smart_turn_incomplete_hold_ms", 3000)),
+            "trailing_silence_ms": int(_get("smart_turn_trailing_silence_ms", 200)),
+            "timeout_ms": int(_get("smart_turn_timeout_ms", 500)),
+            "threads": int(_get("smart_turn_threads", 1)),
+        }
+
+    def _smart_turn_config(self) -> Dict[str, Any]:
+        settings = getattr(self, "_smart_turn_settings", None)
+        if not settings:
+            settings = self._smart_turn_settings = self._read_smart_turn_settings(getattr(self, "config", None))
+        return settings
+
+    async def _init_smart_turn(self) -> None:
+        """Load the Smart Turn model when ``vad.smart_turn_enabled``.
+
+        It rides on Silero VAD for the stop events and the audio, so without
+        Silero it stays off with an error rather than a silent no-op.
+        """
+        settings = self._smart_turn_config()
+        if not settings["enabled"]:
+            return
+        if getattr(self, "_silero_model", None) is None:
+            logger.error(
+                "Smart Turn needs Silero VAD; enable vad.silero_enabled (and check its model loaded)",
+            )
+            return
+        path = settings["model_path"]
+        try:
+            resolved = await asyncio.to_thread(
+                ensure_smart_turn_model_file, path, auto_download=settings["auto_download"]
+            )
+            self._smart_turn_model = await asyncio.to_thread(
+                load_smart_turn_model, resolved, threads=settings["threads"]
+            )
+        except SmartTurnError as exc:
+            self._smart_turn_model = None
+            logger.error("Smart Turn unavailable; turns end on Silero VAD alone", error=str(exc), path=path)
+            return
+        except Exception:
+            self._smart_turn_model = None
+            logger.error("Smart Turn failed to load", path=path, exc_info=True)
+            return
+        logger.info(
+            "Smart Turn enabled",
+            version=SMART_TURN_VERSION,
+            path=resolved,
+            threshold=settings["threshold"],
+            incomplete_hold_ms=settings["incomplete_hold_ms"],
+            trailing_silence_ms=settings["trailing_silence_ms"],
+            timeout_ms=settings["timeout_ms"],
+        )
+
+    def _smart_turn_active(self, call_id: str) -> bool:
+        """Whether Smart Turn judges this call's turns."""
+        if getattr(self, "_smart_turn_model", None) is None:
+            return False
+        buffers = getattr(self, "_turn_audio", None)
+        return bool(buffers) and call_id in buffers
+
+    def _discard_turn_verdict(self, call_id: str) -> None:
+        (getattr(self, "_pipeline_turn_verdict", None) or {}).pop(call_id, None)
+        (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).pop(call_id, None)
+
+    def _take_turn_verdict(self, call_id: str) -> Optional[Dict[str, Any]]:
+        """Consume the verdict of the turn being released; the next turn's audio starts afresh."""
+        verdict = (getattr(self, "_pipeline_turn_verdict", None) or {}).pop(call_id, None)
+        was_pending = (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).pop(call_id, None) is not None
+        buffer = (getattr(self, "_turn_audio", None) or {}).get(call_id)
+        if buffer is not None:
+            buffer.clear()
+        if verdict is not None:
+            return {
+                "label": "complete" if verdict.get("complete") else "incomplete",
+                "probability": verdict.get("probability"),
+            }
+        if was_pending:
+            return {"label": "pending", "probability": None}
+        return None
+
+    def _schedule_turn_analysis(self, call_id: str) -> bool:
+        """The caller stopped: have Smart Turn judge the turn so far.
+
+        Runs only when Silero VAD decides the turn, on the audio since the
+        last release, trimmed so the model sees ``smart_turn_trailing_silence_ms``
+        of the silence after the caller's last speech.
+        """
+        if not self._smart_turn_active(call_id):
+            return False
+        if (getattr(self, "_pipeline_turn_source", None) or {}).get(call_id, "vad") != "vad":
+            return False
+        buffer = self._turn_audio.get(call_id)
+        if buffer is None or buffer.duration_ms <= 0:
+            return False
+        settings = self._smart_turn_config()
+        trim_ms = max(0.0, float(self._silero_config()["stop_ms"]) - float(settings["trailing_silence_ms"]))
+        pcm, rate = buffer.snapshot(trim_trailing_ms=trim_ms)
+        if not pcm:
+            return False
+        stop_at = self._pipeline_caller_talk_changed_at.get(call_id, time.monotonic())
+        self._pipeline_turn_verdict.pop(call_id, None)
+        self._pipeline_turn_verdict_pending[call_id] = {"at": stop_at, "since": time.monotonic()}
+        self._fire_and_forget_for_call(
+            call_id,
+            self._analyze_caller_turn(call_id, stop_at, pcm, rate),
+            name=f"smart-turn-{call_id}",
+        )
+        return True
+
+    async def _analyze_caller_turn(self, call_id: str, stop_at: float, pcm: bytes, sample_rate: int) -> None:
+        model = getattr(self, "_smart_turn_model", None)
+        if model is None:
+            return
+        settings = self._smart_turn_config()
+        try:
+            result = await asyncio.to_thread(model.predict, pcm, sample_rate)
+        except Exception:
+            logger.warning("Smart Turn inference failed", call_id=call_id, exc_info=True)
+            result = None
+        pending = self._pipeline_turn_verdict_pending.get(call_id)
+        if pending is None or pending.get("at") != stop_at:
+            # The caller went on, or the turn was released meanwhile.
+            return
+        self._pipeline_turn_verdict_pending.pop(call_id, None)
+        if result is not None:
+            probability = float(result["probability"])
+            complete = probability >= float(settings["threshold"])
+            self._pipeline_turn_verdict[call_id] = {
+                "at": stop_at,
+                "probability": probability,
+                "complete": complete,
+            }
+            logger.info(
+                "Smart Turn verdict",
+                call_id=call_id,
+                complete=complete,
+                probability=round(probability, 3),
+                audio_ms=round(float(result.get("audio_ms", 0.0))),
+                inference_ms=round(float(result.get("inference_ms", 0.0)), 1),
+                waited_ms=round((time.monotonic() - float(pending.get("since", stop_at))) * 1000),
+            )
+        event = (getattr(self, "_pipeline_turn_wakeup", None) or {}).get(call_id)
+        if event is not None:
+            event.set()
+
+    def _apply_turn_verdict(self, call_id: str, stop_at: float, deadline: float) -> float:
+        """Stretch a release deadline by Smart Turn's view of this stop.
+
+        An incomplete verdict holds the turn ``smart_turn_incomplete_hold_ms``
+        past the stop; a verdict still being computed holds it up to
+        ``smart_turn_timeout_ms``; a complete verdict, or none, changes nothing.
+        """
+        settings = self._smart_turn_config()
+        verdict = (getattr(self, "_pipeline_turn_verdict", None) or {}).get(call_id)
+        if verdict is not None and verdict.get("at") == stop_at:
+            if not verdict.get("complete", True):
+                return max(deadline, stop_at + float(settings["incomplete_hold_ms"]) / 1000.0)
+            return deadline
+        pending = (getattr(self, "_pipeline_turn_verdict_pending", None) or {}).get(call_id)
+        if pending is not None and pending.get("at") == stop_at:
+            return max(deadline, float(pending.get("since", stop_at)) + float(settings["timeout_ms"]) / 1000.0)
+        return deadline
+
+    def _note_pipeline_caller_talking(
+        self, call_id: str, talking: bool, source: str = "talk_detect"
+    ) -> None:
+        """Record a detector's talking state and wake the dialog worker.
+
+        Only the detector the worker resolved for the call may drive it: with
+        Silero VAD in charge, Asterisk talk-detect events still serve barge-in
+        and the watchdog but no longer touch the end of turn, so there is one
+        source of truth. Tolerates an engine built without __init__ (tests
+        construct handlers that way), so a talk event can never break the
+        watchdog path it shares.
+        """
+        owner = (getattr(self, "_pipeline_turn_source", None) or {}).get(call_id)
+        if owner in ("vad", "talk_detect") and source != owner:
+            return
+        talking_map = getattr(self, "_pipeline_caller_talking", None)
+        if talking_map is None:
+            talking_map = self._pipeline_caller_talking = {}
+        changed_map = getattr(self, "_pipeline_caller_talk_changed_at", None)
+        if changed_map is None:
+            changed_map = self._pipeline_caller_talk_changed_at = {}
+        talking_map[call_id] = bool(talking)
+        changed_map[call_id] = time.monotonic()
+        event = (getattr(self, "_pipeline_turn_wakeup", None) or {}).get(call_id)
+        if event is not None:
+            event.set()
+
+    def _feed_pipeline_silence(self, call_id: str, pcm_bytes: bytes, pcm_rate: int) -> None:
+        """Replace a gated frame with silence instead of dropping it.
+
+        Dropping leaves the streaming recognizer a splice: the audio either side
+        of the gap is glued together and a word straddling it comes out garbled.
+        Silence keeps the timeline continuous. It costs one more inference per
+        frame, so ``gated_silence_ms`` bounds how long it is worth paying.
+        """
+        if self._pipeline_utterance_mode(call_id):
+            # The cutter hands the recognizer whole utterances; nothing streams.
+            return None
+        budget_ms = self._pipeline_gated_silence_ms.get(
+            call_id, float(PIPELINE_GATED_SILENCE_MS_DEFAULT)
+        )
+        if budget_ms <= 0 or not pcm_bytes:
+            return None
+        used_ms = self._pipeline_gated_silence_used_ms.get(call_id, 0.0)
+        if used_ms >= budget_ms:
+            return None
+        frame_ms = (len(pcm_bytes) / 2.0) / max(1, int(pcm_rate)) * 1000.0
+        self._pipeline_gated_silence_used_ms[call_id] = used_ms + frame_ms
+
+        q = self._pipeline_queues.get(call_id)
+        if not q:
+            return None
+        try:
+            # Run the zeros through the same resampler so its state stays aligned
+            # with the sample count the recognizer has already consumed.
+            silence = bytes(len(pcm_bytes))
+            if pcm_rate != PIPELINE_STT_SAMPLE_RATE_HZ:
+                try:
+                    state = self._resample_state_pipeline16k.get(call_id)
+                    silence, state = resample_audio(
+                        silence,
+                        pcm_rate,
+                        PIPELINE_STT_SAMPLE_RATE_HZ,
+                        state=state,
+                    )
+                    self._resample_state_pipeline16k[call_id] = state
+                except (TypeError, ValueError, IndexError):
+                    return None
+            if silence:
+                q.put_nowait(silence)
+        except asyncio.QueueFull:
+            logger.debug("Pipeline queue full; dropping gated silence frame", call_id=call_id)
+        return None
+
     async def _maybe_provider_barge_in_fallback(
         self,
         session: CallSession,
@@ -11647,6 +14537,23 @@ class Engine:
                 )
                 return
 
+            # A farewell the caller talks over was not the end of the call: drop
+            # the hangup it armed before anything else drains and executes it.
+            try:
+                await self._cancel_terminal_hangup_for_barge_in(call_id, session)
+            except Exception:
+                logger.debug("Farewell hangup cancellation failed during barge-in", call_id=call_id, exc_info=True)
+
+            # The utterance that cuts the agent off goes to the recognizer whole:
+            # its head, spoken while the agent was still audible, is kept as
+            # audio instead of the silence gated frames are stored as.
+            try:
+                cutter = (getattr(self, "_utterance_cutters", None) or {}).get(call_id)
+                if cutter is not None:
+                    cutter.note_barge_in()
+            except Exception:
+                logger.debug("Utterance cutter barge-in note failed", call_id=call_id, exc_info=True)
+
             provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
             local_provider_notified = False
             local_turn_interrupted = bool(
@@ -11684,9 +14591,18 @@ class Engine:
             except Exception:
                 pass
             try:
+                await self._note_pipeline_reply_interrupted(session, playback_position_ms)
+            except Exception:
+                logger.debug("Heard-reply bookkeeping failed during barge-in", call_id=call_id, exc_info=True)
+            try:
                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
             except Exception:
                 logger.debug("Streaming playback stop failed during barge-in", call_id=call_id, exc_info=True)
+            # A synthesis still awaiting its next chunk for that stream is woken
+            # so it notices the stop now, not at a chunk that may never come.
+            resumed = (getattr(self, "_pipeline_caller_resumed", None) or {}).get(call_id)
+            if resumed is not None:
+                resumed.set()
             # Ensure subsequent provider audio can restart playback cleanly.
             # If we keep the old queue, on_provider_event will continue enqueueing but never restart streaming.
             try:
@@ -11928,6 +14844,13 @@ class Engine:
                 int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
                 source="externalmedia",
             )
+            if self._silero_vad_active(session.call_id) and not self._pipeline_input_blocked_before_reply(session):
+                await self._observe_silero_vad(
+                    session,
+                    pcm_16k,
+                    int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
+                    source="externalmedia",
+                )
 
             # Check for pipeline mode FIRST (before continuous_input provider routing)
             # Pipeline adapters need audio in their queue, not sent to monolithic providers
@@ -11948,9 +14871,15 @@ class Engine:
                 audio_capture_enabled=session.audio_capture_enabled,
                 has_queue=caller_channel_id in self._pipeline_queues,
             )
+            if self._pipeline_input_blocked_before_reply(session):
+                return self._feed_pipeline_silence(
+                    caller_channel_id, pcm_16k,
+                    int(getattr(self.rtp_server, 'sample_rate', 16000) if self.rtp_server else 16000),
+                )
             if pipeline_forced:
                 # AAVA-28: Check gating to prevent agent from hearing its own TTS output
-                if not session.audio_capture_enabled:
+                # (unless the deployment keeps listening while the agent speaks).
+                if not session.audio_capture_enabled and not self._pipeline_forwards_gated_audio(session.call_id):
                     # Pipelines: allow barge-in detection during TTS gating, but do not forward audio until triggered.
                     cfg = getattr(self.config, "barge_in", None)
                     if not cfg or not getattr(cfg, "enabled", True):
@@ -11962,6 +14891,9 @@ class Engine:
                             return
                     except Exception:
                         pass
+                    # Silero VAD already scored this frame and owns barge-in.
+                    if self._silero_owns_barge_in(session.call_id):
+                        return
                     now = time.time()
                     tts_elapsed_ms = 0
                     try:
@@ -12049,6 +14981,9 @@ class Engine:
                                 pass
                         return
                 
+                if self._pipeline_utterance_mode(caller_channel_id):
+                    # Silero cuts the caller's utterances for the recognizer; the raw stream is not sent.
+                    return
                 q = self._pipeline_queues.get(caller_channel_id)
                 if q:
                     try:
@@ -13999,6 +16934,8 @@ class Engine:
                     session.conversation_history.append(_ts_msg("assistant", text))
                     await self.session_store.upsert_call(session)
                     logger.debug("Added agent transcript to history", call_id=call_id, text_preview=text[:50])
+                    # Opt-in assistant-farewell hangup (per-agent hangup policy).
+                    await self._maybe_hangup_on_assistant_farewell(call_id, session, text)
             
             else:
                 # Log control/JSON events at debug for now
@@ -14152,6 +17089,7 @@ class Engine:
         timeout_sec: float,
         quiet_sec: float,
         reason: str,
+        abort: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """Wait until generated audio is paced onto the call transport.
 
@@ -14171,6 +17109,8 @@ class Engine:
         logged_wait = False
 
         while (time.monotonic() - started_at) < timeout_sec:
+            if abort is not None and abort():
+                return False
             session = await self.session_store.get_by_call_id(call_id)
             if session and bool(getattr(session, "cleanup_in_progress", False)):
                 return False
@@ -14258,6 +17198,14 @@ class Engine:
                 return False
 
             started.add(call_id)
+            reasons = getattr(self, "_terminal_hangup_reasons", None)
+            if reasons is None:
+                reasons = self._terminal_hangup_reasons = {}
+            reasons[call_id] = reason
+            cancelled = getattr(self, "_terminal_hangup_cancelled", None)
+            if cancelled is None:
+                cancelled = self._terminal_hangup_cancelled = set()
+            cancelled.discard(call_id)
             fallback_tasks = getattr(self, "_terminal_fallback_tasks", {})
             fallback = fallback_tasks.pop(call_id, None)
             current_task = asyncio.current_task()
@@ -14271,7 +17219,21 @@ class Engine:
                     timeout_sec=drain_timeout_sec,
                     quiet_sec=self._terminal_transport_quiet_sec(),
                     reason=reason,
+                    abort=lambda: call_id in cancelled,
                 )
+
+            if call_id in cancelled:
+                # A barge-in during the farewell: the caller is not done, so the
+                # guessed hangup is dropped and the dialog goes on.
+                cancelled.discard(call_id)
+                started.discard(call_id)
+                reasons.pop(call_id, None)
+                logger.info(
+                    "Terminal hangup cancelled: the caller interrupted the farewell",
+                    call_id=call_id,
+                    reason=reason,
+                )
+                return False
 
             session = await self.session_store.get_by_call_id(call_id)
             if not session or self._session_was_transferred(session):
@@ -14348,6 +17310,10 @@ class Engine:
         previous = tasks.pop(call_id, None)
         if previous and not previous.done():
             previous.cancel()
+        fallback_reasons = getattr(self, "_terminal_fallback_reasons", None)
+        if fallback_reasons is None:
+            fallback_reasons = self._terminal_fallback_reasons = {}
+        fallback_reasons[call_id] = reason
 
         async def _fallback() -> None:
             try:
@@ -14372,9 +17338,73 @@ class Engine:
             finally:
                 if tasks.get(call_id) is asyncio.current_task():
                     tasks.pop(call_id, None)
+                    fallback_reasons.pop(call_id, None)
 
         task = asyncio.create_task(_fallback(), name=f"terminal-fallback-{call_id}")
         tasks[call_id] = task
+
+    def _terminal_hangup_is_heuristic(self, call_id: str, reason: Optional[str]) -> bool:
+        """Whether a pending terminal hangup is a guess a barge-in may cancel.
+
+        ``cleanup_after_tts`` is the generic audio-done hangup; it counts as a
+        guess only when the assistant-farewell marker armed it.
+        """
+        base = str(reason or "").split(":", 1)[0]
+        if base in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS:
+            return True
+        if base == "cleanup_after_tts":
+            origin = str((getattr(self, "_terminal_fallback_reasons", None) or {}).get(call_id) or "")
+            return origin.split(":", 1)[0] in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS
+        return False
+
+    async def _cancel_terminal_hangup_for_barge_in(
+        self, call_id: str, session: Optional[CallSession]
+    ) -> bool:
+        """The caller interrupted a farewell: drop the hangup that farewell had armed.
+
+        Only the heuristic hangups are dropped (the pipeline's
+        farewell-without-tool fallback and the assistant-farewell marker); an
+        explicit ``hangup_call`` keeps ending the call. A hangup already
+        waiting for the audio to drain is told to stop, its fallback timer is
+        cancelled and ``cleanup_after_tts`` is cleared, so the caller's words
+        reach the model as an ordinary turn and the model may say goodbye again.
+        """
+        cancelled_any = False
+        started = getattr(self, "_terminal_hangup_started", None) or set()
+        reasons = getattr(self, "_terminal_hangup_reasons", None) or {}
+        pending_reason = reasons.get(call_id)
+        if call_id in started and self._terminal_hangup_is_heuristic(call_id, pending_reason):
+            cancelled = getattr(self, "_terminal_hangup_cancelled", None)
+            if cancelled is None:
+                cancelled = self._terminal_hangup_cancelled = set()
+            cancelled.add(call_id)
+            cancelled_any = True
+            logger.info(
+                "Pending farewell hangup cancelled by barge-in",
+                call_id=call_id,
+                reason=pending_reason,
+            )
+        fallback_reasons = getattr(self, "_terminal_fallback_reasons", None) or {}
+        origin = fallback_reasons.get(call_id)
+        if origin is not None and str(origin).split(":", 1)[0] in _BARGE_IN_CANCELLABLE_TERMINAL_REASONS:
+            tasks = getattr(self, "_terminal_fallback_tasks", None) or {}
+            task = tasks.pop(call_id, None)
+            fallback_reasons.pop(call_id, None)
+            if task and not task.done():
+                task.cancel()
+            if session is not None and bool(getattr(session, "cleanup_after_tts", False)):
+                session.cleanup_after_tts = False
+                try:
+                    await self._save_session(session)
+                except Exception:
+                    logger.debug("Failed to clear cleanup_after_tts after barge-in", call_id=call_id, exc_info=True)
+            cancelled_any = True
+            logger.info(
+                "Pending farewell fallback cancelled by barge-in",
+                call_id=call_id,
+                reason=origin,
+            )
+        return cancelled_any
 
     async def _speak_no_input_announcement(self, call_id: str, text: str, kind: str) -> bool:
         """Speak a watchdog message in the call's configured provider/pipeline voice."""
@@ -14404,6 +17434,29 @@ class Engine:
             if getattr(session, "pipeline_name", None) and getattr(self, "pipeline_orchestrator", None):
                 pipeline = self.pipeline_orchestrator.get_pipeline(call_id, session.pipeline_name)
             if pipeline and getattr(pipeline, "tts_adapter", None):
+                if self._pipeline_tts_uses_streaming(pipeline):
+                    # The same negotiated media stream (AudioSocket / ExternalMedia) as
+                    # every reply. The file player below needs the media directory on
+                    # the Asterisk host, which a split-server deployment does not have,
+                    # and it takes 8 kHz mu-law only.
+                    await self._stream_pipeline_tts_text(
+                        call_id,
+                        session,
+                        pipeline,
+                        message,
+                        playback_type=f"no-input-{kind}",
+                    )
+                    session = await self.session_store.get_by_call_id(call_id)
+                    if session:
+                        session.conversation_history.append({
+                            **_ts_msg("assistant", message),
+                            "event": f"no_input_{kind}",
+                        })
+                        await self._save_session(session)
+                    await asyncio.sleep(0.25)
+                    await self._await_answer_over_announcement(call_id, kind=kind)
+                    delivery_complete = True
+                    return True
                 audio = bytearray()
                 async for chunk in pipeline.tts_adapter.synthesize(
                     call_id,
@@ -14437,6 +17490,7 @@ class Engine:
                 )
                 if delivery_complete:
                     await asyncio.sleep(0.25)
+                    await self._await_answer_over_announcement(call_id, kind=kind)
                 return delivery_complete
 
             provider = self._call_providers.get(call_id)
@@ -14503,26 +17557,46 @@ class Engine:
         if self._session_was_transferred(session) or self._session_has_pending_attended_transfer(session):
             logger.info("No-input hangup skipped during transfer", call_id=call_id)
             return
-        session.call_outcome = "no_input_timeout"
+        # The check-ins, the stall timer and the hard duration cap share this
+        # terminal path; the watchdog's phase says which one fired. The first
+        # two end as no_input_timeout, the cap as max_duration.
+        watchdog = getattr(self, "no_input_watchdog", None)
+        snapshot = watchdog.snapshot(call_id) if watchdog is not None else None
+        phase = str((snapshot or {}).get("phase") or "")
+        if phase == "max_duration_hangup":
+            reason, outcome, message = "max_duration", "max_duration", "Hanging up call at its maximum duration"
+            details = {"max_call_duration_sec": snapshot.get("max_call_duration_sec")}
+        elif phase == "stall_hangup":
+            reason, outcome, message = "stall", "no_input_timeout", "Hanging up stalled conversation"
+            details = {
+                "stall_timeout_sec": snapshot.get("stall_timeout_sec"),
+                "last_exchange_source": snapshot.get("last_exchange_source"),
+            }
+        else:
+            reason, outcome, message, details = "no_input", "no_input_timeout", "Hanging up inactive caller", {}
+        session.call_outcome = outcome
         session.no_input_state.update(
             {
                 "timed_out": True,
                 "timed_out_at": time.time(),
+                "timed_out_reason": reason,
             }
         )
         await self._save_session(session)
         logger.info(
-            "Hanging up inactive caller",
+            message,
             call_id=call_id,
             channel_id=session.caller_channel_id,
             provider=session.provider_name,
             pipeline=session.pipeline_name,
+            **details,
         )
         await self._terminate_call_after_audio(
             call_id,
-            reason="no_input_timeout",
-            call_outcome="no_input_timeout",
-            # _speak_no_input_announcement already completed the transport drain.
+            reason=outcome,
+            call_outcome=outcome,
+            # The announcements already completed the transport drain; the
+            # stall timer and the cap end the call at once by design.
             audio_already_drained=True,
         )
 
@@ -14582,6 +17656,38 @@ class Engine:
         # transcripts before _pipeline_runner reaches its own queue setup.
         self._pipeline_transcript_queues.setdefault(call_id, asyncio.Queue(maxsize=8))
         self._pipeline_forced[call_id] = bool(forced)
+        if forced:
+            tracker = self._new_silero_tracker()
+            if tracker is not None:
+                self._silero_trackers[call_id] = tracker
+                logger.info(
+                    "Silero VAD tracking caller speech",
+                    call_id=call_id,
+                    stop_ms=self._silero_config()["stop_ms"],
+                    stt_finalize_ms=self._silero_config()["stt_finalize_ms"],
+                    sample_rate=self._silero_config()["sample_rate"] or "line",
+                )
+                if self._silero_config()["stt_utterances"]:
+                    self._utterance_cutters[call_id] = UtteranceCutter(
+                        sample_rate=PIPELINE_STT_SAMPLE_RATE_HZ,
+                        preroll_ms=self._silero_config()["utterance_preroll_ms"],
+                        max_ms=self._silero_config()["utterance_max_ms"],
+                    )
+                    logger.info(
+                        "Silero cuts the caller's utterances for the recognizer",
+                        call_id=call_id,
+                        preroll_ms=self._silero_config()["utterance_preroll_ms"],
+                        max_ms=self._silero_config()["utterance_max_ms"],
+                        listen_during_playback=self._pipeline_listens_during_playback(),
+                    )
+                if self._smart_turn_model is not None:
+                    self._turn_audio[call_id] = TurnAudioBuffer()
+                    logger.info(
+                        "Smart Turn judging caller turns",
+                        call_id=call_id,
+                        threshold=self._smart_turn_config()["threshold"],
+                        incomplete_hold_ms=self._smart_turn_config()["incomplete_hold_ms"],
+                    )
         # Pipelines: enable Asterisk talk detection so barge-in can trigger even when
         # ExternalMedia RTP delivery is paused/altered during channel playback.
         try:
@@ -14618,6 +17724,68 @@ class Engine:
                 stage=stage,
             )
         return allowed
+
+    def _start_pipeline_llm_warm_up(
+        self,
+        call_id: str,
+        session: CallSession,
+        pipeline: Any,
+        llm_options: Dict[str, Any],
+        greeting: str,
+    ) -> Optional[asyncio.Task]:
+        """Warm the LLM for this call while the greeting plays.
+
+        The first Chat Completions request of a call pays for a new
+        connection (each call has its own adapter, so nothing is pooled from
+        the previous call) and for the prefill of the whole system prompt.
+        Both are known before the caller says a word: the prompt, the tools
+        and the greeting are final here, and the caller's first words are
+        seconds away. The adapter sends one ``max_tokens: 1`` request with
+        exactly the prefix the first turn will carry, through the session the
+        turns will use, so that turn finds the connection open and the prefix
+        cached. Fire-and-forget: nothing waits for it, and cleanup cancels it.
+        """
+        adapter = getattr(pipeline, "llm_adapter", None)
+        warm_up = getattr(adapter, "warm_up", None)
+        if not callable(warm_up) or not getattr(adapter, "warm_up_enabled", False):
+            return None
+        # The first turn sends the session history with the greeting appended
+        # (the runner persists it once the greeting audio starts); send the same.
+        prior = _sanitize_for_llm(list(getattr(session, "conversation_history", None) or []))
+        if greeting:
+            prior.append({"role": "assistant", "content": greeting})
+        context = {"prior_messages": prior}
+        task = asyncio.create_task(
+            self._run_pipeline_llm_warm_up(call_id, warm_up, context, dict(llm_options))
+        )
+        self._pipeline_llm_warm_ups[call_id] = task
+
+        def _forget(done: asyncio.Task) -> None:
+            if self._pipeline_llm_warm_ups.get(call_id) is done:
+                self._pipeline_llm_warm_ups.pop(call_id, None)
+
+        task.add_done_callback(_forget)
+        logger.debug(
+            "Pipeline LLM warm-up started",
+            call_id=call_id,
+            prior_messages=len(prior),
+            tools_count=len(llm_options.get("tools") or []),
+        )
+        return task
+
+    async def _run_pipeline_llm_warm_up(
+        self,
+        call_id: str,
+        warm_up: Callable[..., Any],
+        context: Dict[str, Any],
+        llm_options: Dict[str, Any],
+    ) -> None:
+        try:
+            await warm_up(call_id, context, llm_options)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Pipeline LLM warm-up failed", call_id=call_id, error=str(exc))
 
     async def _pipeline_runner(self, call_id: str) -> None:
         """Minimal adapter-driven loop: STT -> LLM -> TTS -> file playback.
@@ -14756,10 +17924,15 @@ class Engine:
                 if getattr(session, "is_outbound", False) and getattr(session, "outbound_custom_vars", None):
                     system_prompt = str(llm_options.get("system_prompt") or "")
                     if system_prompt.strip():
+                        ctx_cfg = None
+                        if getattr(session, "context_name", None):
+                            ctx_cfg = self.transport_orchestrator.get_context_config(
+                                session.context_name, getattr(session, "routing_method", None))
                         llm_options = dict(llm_options)
                         llm_options["system_prompt"] = self._append_outbound_custom_vars_to_prompt(
                             system_prompt,
                             getattr(session, "outbound_custom_vars", {}) or {},
+                            ctx_cfg,
                         )
             except Exception:
                 logger.debug("Outbound custom_vars injection failed (pipeline)", call_id=call_id, exc_info=True)
@@ -14791,6 +17964,31 @@ class Engine:
                             stt_options["chunk_ms"] = 160
                     except Exception:
                         stt_options["chunk_ms"] = 160
+
+            if self._pipeline_utterance_mode(call_id):
+                # The adapter tells the recognizer that the engine cuts the utterances.
+                stt_options["utterances"] = True
+
+            if not bool(stt_options.get("streaming", True)) and streaming_supported:
+                # A recognizer that answers only when a phrase ends cannot serve the buffered
+                # path (one transcribe() per chunk, each waiting for a final): keep it streaming.
+                requires_streaming = getattr(pipeline.stt_adapter, "requires_streaming", False)
+                try:
+                    requires_streaming = (
+                        bool(requires_streaming(stt_options)) if callable(requires_streaming) else bool(requires_streaming)
+                    )
+                except Exception:
+                    requires_streaming = False
+                if requires_streaming:
+                    logger.warning(
+                        "Buffered STT (options.stt.streaming=false) is not supported by this recognizer; using streaming",
+                        call_id=call_id,
+                        component=getattr(pipeline.stt_adapter, "component_key", "unknown"),
+                        stt_backend=stt_options.get("stt_backend") or getattr(
+                            getattr(pipeline.stt_adapter, "_provider_config", None), "stt_backend", None
+                        ),
+                    )
+                    stt_options["streaming"] = True
 
             requested_streaming = bool(stt_options.get("streaming", True))
             if requested_streaming and streaming_supported:
@@ -14917,6 +18115,11 @@ class Engine:
                         greeting, session
                     )
 
+            # Prompt, tools and greeting are final here and the caller's first
+            # words are seconds away: warm the LLM now, alongside the greeting.
+            if self._pipeline_output_allowed(call_id, session, stage="llm-warm-up"):
+                self._start_pipeline_llm_warm_up(call_id, session, pipeline, llm_options, greeting)
+
             # Bound pipeline greeting handoff just like monolithic providers.
             # This background watchdog still fires if a TTS async generator hangs
             # before yielding its first caller-facing audio chunk.
@@ -14959,19 +18162,63 @@ class Engine:
                             if not stream_id:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
                             any_audio = False
-                            async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
-                                if not chunk:
-                                    continue
-                                if not any_audio:
-                                    await self._stop_connection_audio(
-                                        session, reason="first-pipeline-greeting-audio"
-                                    )
-                                any_audio = True
-                                await q.put(chunk)
+                            greeting_cut: Optional[str] = None
+                            greeting_timing: Dict[str, int] = {}
+                            heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
+                            if heard_rec is not None:
+                                heard_rec.open_segment(greeting)
+                            tts_started = time.monotonic()
+
+                            async def _stream_greeting() -> None:
+                                nonlocal any_audio
+                                # Each frame is put with the stream's liveness checked and
+                                # the synthesis is given up the moment the stream is cut (a
+                                # barge-in into the greeting): a bare put on a stream nobody
+                                # drains any more blocked here, with the recognizer path and
+                                # the inactivity watchdog still waiting behind it, for the
+                                # rest of the call.
+                                async for chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options),
+                                ):
+                                    if not chunk:
+                                        continue
+                                    if not any_audio:
+                                        greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
+                                        await self._stop_connection_audio(
+                                            session, reason="first-pipeline-greeting-audio"
+                                        )
+                                    any_audio = True
+                                    if heard_rec is not None:
+                                        heard_rec.add_audio_bytes(len(chunk))
+                                    await self._put_pipeline_stream_chunk(call_id, stream_id, q, chunk)
+
                             try:
-                                q.put_nowait(None)
-                            except asyncio.QueueFull:
-                                asyncio.create_task(q.put(None))
+                                await asyncio.wait_for(_stream_greeting(), timeout=PIPELINE_GREETING_TIMEOUT_SEC)
+                            except _PipelinePlaybackInterrupted as exc:
+                                greeting_cut = str(exc)
+                            except asyncio.TimeoutError:
+                                greeting_cut = f"synthesis exceeded {int(PIPELINE_GREETING_TIMEOUT_SEC)} s"
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                            if heard_rec is not None:
+                                heard_rec.close_segment()
+                                heard_rec.completed = greeting_cut is None
+                            if greeting_cut is None:
+                                try:
+                                    q.put_nowait(None)
+                                except asyncio.QueueFull:
+                                    asyncio.create_task(q.put(None))
+                            else:
+                                logger.info(
+                                    "Pipeline greeting cut short; the rest of it is not synthesized",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                    reason=greeting_cut,
+                                )
                             if not any_audio:
                                 logger.warning(
                                     "Pipeline greeting produced no audio",
@@ -14979,17 +18226,37 @@ class Engine:
                                     attempt=attempt,
                                 )
                             else:
-                                # AAVA-85: Persist greeting to session history so it appears in email summary
+                                # AAVA-85: Persist greeting to session history so it appears in email summary.
+                                # A greeting the caller cut is recorded as what they heard of it when
+                                # the barge-in handler measured that, as interrupted either way.
+                                heard_known = bool(
+                                    heard_rec is not None and heard_rec.interrupted and heard_rec.heard_text is not None
+                                )
+                                spoken = (heard_rec.heard_text or "").strip() if heard_known else greeting
                                 try:
-                                    session.conversation_history.append(_ts_msg("assistant", greeting))
+                                    if spoken:
+                                        session.conversation_history.append(
+                                            _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(greeting_timing))
+                                            if greeting_cut is not None
+                                            else _ts_msg("assistant", greeting, **_latency_extra(greeting_timing))
+                                        )
+                                    if heard_rec is not None:
+                                        heard_rec.persisted_text = spoken
                                     await self.session_store.upsert_call(session)
-                                    logger.info("Persisted initial greeting to session history", call_id=call_id)
+                                    logger.info(
+                                        "Persisted initial greeting to session history",
+                                        call_id=call_id,
+                                        interrupted=greeting_cut is not None,
+                                    )
                                 except Exception as e:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
                         else:
                             tts_bytes = bytearray()
+                            greeting_timing: Dict[str, int] = {}
+                            tts_started = time.monotonic()
                             async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
                                 if chunk:
+                                    greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
                                     tts_bytes.extend(chunk)
                             if not tts_bytes:
                                 logger.warning(
@@ -15005,7 +18272,9 @@ class Engine:
                                 
                                 # AAVA-85: Persist greeting to session history so it appears in email summary
                                 try:
-                                    session.conversation_history.append(_ts_msg("assistant", greeting))
+                                    session.conversation_history.append(
+                                        _ts_msg("assistant", greeting, **_latency_extra(greeting_timing))
+                                    )
                                     await self.session_store.upsert_call(session)
                                     logger.info("Persisted initial greeting to session history", call_id=call_id)
                                 except Exception as e:
@@ -15064,6 +18333,20 @@ class Engine:
             base_commit_ms = 160
             stt_chunk_ms = int(stt_options.get("chunk_ms", base_commit_ms)) if stt_options else base_commit_ms
             commit_ms = max(stt_chunk_ms, 80)
+            try:
+                self._pipeline_gated_silence_ms[call_id] = max(
+                    0.0,
+                    float(
+                        (stt_options or {}).get(
+                            "gated_silence_ms", PIPELINE_GATED_SILENCE_MS_DEFAULT
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                self._pipeline_gated_silence_ms[call_id] = float(
+                    PIPELINE_GATED_SILENCE_MS_DEFAULT
+                )
+            self._pipeline_gated_silence_used_ms.pop(call_id, None)
             commit_bytes = bytes_per_ms * commit_ms
 
             inbound_queue = self._pipeline_queues.get(call_id)
@@ -15071,9 +18354,26 @@ class Engine:
                 return
 
             buffer_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=200)
+            # Changes when Off commits to an answer. Results from requests
+            # already in flight must not become another turn after it plays.
+            input_generation = 0
+            submitted_utterance_generations: deque = deque()
             # Reuse queue created by _ensure_pipeline_runner, or create if missing
-            transcript_queue: asyncio.Queue[Optional[str]] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
+            # Receiver entries carry (input generation, text); legacy early
+            # flushes may still enqueue text, and None ends the stream.
+            transcript_queue: asyncio.Queue[Any] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
             self._pipeline_transcript_queues[call_id] = transcript_queue
+            # Set by Silero's start while a turn is being answered, so the turn
+            # notices the caller going on before the reply's first sound.
+            self._pipeline_caller_resumed[call_id] = asyncio.Event()
+
+            def remaining_transcript(item: Any) -> str:
+                """Unwrap results for hangup history without resurrecting discarded input."""
+                if isinstance(item, tuple):
+                    generation, item = item
+                    if generation != input_generation:
+                        return ""
+                return str(item or "")
 
             use_streaming = bool(stt_options.get("streaming", True))
             if use_streaming:
@@ -15128,6 +18428,8 @@ class Engine:
 
                 async def process_audio(audio_chunk: bytes) -> None:
                     transcript = ""
+                    generation = input_generation
+                    asr_started = time.monotonic()
                     try:
                         transcript = await pipeline.stt_adapter.transcribe(
                             call_id,
@@ -15138,16 +18440,20 @@ class Engine:
                     except Exception:
                         logger.debug("STT transcribe failed", call_id=call_id, exc_info=True)
                         return
+                    asr_ms = (time.monotonic() - asr_started) * 1000.0
+                    if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
+                        return
                     transcript = (transcript or "").strip()
                     if not transcript:
                         return
                     # Record time when a final transcript is obtained
                     try:
                         self._last_transcript_ts[call_id] = time.time()
+                        self._note_pipeline_final_arrived(call_id, asr_ms=asr_ms)
                     except Exception:
                         pass
                     try:
-                        transcript_queue.put_nowait(transcript)
+                        transcript_queue.put_nowait((generation, transcript))
                     except asyncio.QueueFull:
                         try:
                             dropped = transcript_queue.get_nowait()
@@ -15158,18 +18464,28 @@ class Engine:
                             )
                         except asyncio.QueueEmpty:
                             pass
-                        await transcript_queue.put(transcript)
+                        await transcript_queue.put((generation, transcript))
 
                 async def stt_worker() -> None:
                     local_buf = bytearray()
+                    generation = input_generation
                     try:
                         while True:
                             frame = await buffer_queue.get()
+                            if generation != input_generation:
+                                local_buf.clear()
+                                generation = input_generation
                             if frame is None:
                                 if local_buf:
                                     await process_audio(bytes(local_buf))
                                 await transcript_queue.put(None)
                                 break
+                            if isinstance(frame, SttUtterance):
+                                if local_buf:
+                                    await process_audio(bytes(local_buf))
+                                    local_buf.clear()
+                                await process_audio(frame.pcm16)
+                                continue
                             local_buf.extend(frame)
                             if len(local_buf) < commit_bytes:
                                 continue
@@ -15182,9 +18498,13 @@ class Engine:
 
                 async def stt_sender() -> None:
                     local_buf = bytearray()
+                    generation = input_generation
                     try:
                         while True:
                             frame = await buffer_queue.get()
+                            if generation != input_generation:
+                                local_buf.clear()
+                                generation = input_generation
                             if frame is None:
                                 if local_buf:
                                     try:
@@ -15201,6 +18521,20 @@ class Engine:
                                         )
                                     local_buf.clear()
                                 break
+                            if isinstance(frame, SttUtterance):
+                                # An utterance cut by Silero goes as one unit; raw frames
+                                # still ahead of it are flushed first.
+                                if local_buf:
+                                    try:
+                                        await pipeline.stt_adapter.send_audio(
+                                            call_id, bytes(local_buf), fmt=stream_format
+                                        )
+                                    except Exception:
+                                        logger.debug("Streaming STT send failed", call_id=call_id, exc_info=True)
+                                    local_buf.clear()
+                                submitted_utterance_generations.append(generation)
+                                await self._send_stt_utterance(pipeline, call_id, frame, stream_format)
+                                continue
                             local_buf.extend(frame)
                             if len(local_buf) < commit_bytes:
                                 continue
@@ -15224,10 +18558,17 @@ class Engine:
                 async def stt_receiver() -> None:
                     try:
                         async for final in pipeline.stt_adapter.iter_results(call_id):
+                            generation = (
+                                submitted_utterance_generations.popleft()
+                                if submitted_utterance_generations else input_generation
+                            )
+                            if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
+                                continue
                             try:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
-                                transcript_queue.put_nowait(final)
+                                self._note_pipeline_final_arrived(call_id)
+                                transcript_queue.put_nowait((generation, final))
                                 logger.debug(
                                     "Pipeline STT final enqueued for dialog",
                                     call_id=call_id,
@@ -15239,7 +18580,7 @@ class Engine:
                                     transcript_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     pass
-                                await transcript_queue.put(final)
+                                await transcript_queue.put((generation, final))
                     except asyncio.CancelledError:
                         pass
                     except Exception:
@@ -15256,32 +18597,107 @@ class Engine:
 
             async def dialog_worker() -> None:
                 pending_segments: List[str] = []
-                flush_task: Optional[asyncio.Task] = None
-                accumulation_timeout = float(
-                    (pipeline.llm_options or {}).get("aggregation_timeout_sec", 2.0)
+                # The turn deadline is polled by the consumer loop rather than
+                # armed as its own task: run_turn must stay on this task so that
+                # call cleanup cancelling the worker also cancels an in-flight
+                # LLM request.
+                pending_started_at: Optional[float] = None
+                # When the caller's speech behind the first pending result began
+                # (monotonic), for the wait on a reply they are speaking into.
+                pending_speech_started_at: Optional[float] = None
+                pending_deadline: Optional[float] = None
+                end_of_turn = EndOfTurnPolicy(pipeline.llm_options)
+                wakeup = asyncio.Event()
+                self._pipeline_turn_wakeup[call_id] = wakeup
+                last_final_at: Optional[float] = None
+                # The pending text is the request to continue a cut-off reply, not the caller's words.
+                pending_resume: bool = False
+                logger.info(
+                    "Pipeline end-of-turn policy resolved",
+                    call_id=call_id,
+                    source=end_of_turn.source,
+                    silence_ms=end_of_turn.silence_ms,
+                    talk_detect_grace_ms=end_of_turn.talk_detect_grace_ms,
+                    talk_detect_hold_ms=end_of_turn.talk_detect_hold_ms,
+                    vad_final_wait_ms=end_of_turn.vad_final_wait_ms,
+                    silero_vad=self._silero_vad_active(call_id),
+                    smart_turn=self._smart_turn_active(call_id),
+                    max_wait_ms=end_of_turn.max_wait_ms or None,
+                    legacy_options=list(end_of_turn.legacy_options) or None,
                 )
+                if end_of_turn.ignored_options:
+                    logger.warning(
+                        "Ignoring superseded transcript aggregation options",
+                        call_id=call_id,
+                        options=list(end_of_turn.ignored_options),
+                        replacement="end_of_turn_silence_ms",
+                    )
                 # Track conversation history to include prior messages
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
 
-                async def cancel_flush() -> None:
-                    nonlocal flush_task
-                    if flush_task and not flush_task.done():
-                        current = asyncio.current_task()
-                        if flush_task is not current:
-                            flush_task.cancel()
-                    flush_task = None
+                async def run_turn(transcript_text: str) -> str:
+                    """Answer one caller turn; "superseded" when the caller went on before the reply."""
+                    nonlocal input_generation
+                    if not self._discard_unheard_reply_enabled():
+                        input_generation += 1
+                        for queue in (inbound_queue, buffer_queue, transcript_queue):
+                            ended = False
+                            while not queue.empty():
+                                ended = queue.get_nowait() is None or ended
+                            if ended:
+                                queue.put_nowait(None)
+                    self._begin_pipeline_reply(call_id)
+                    try:
+                        outcome = await run_turn_body(transcript_text)
+                    finally:
+                        self._end_pipeline_reply(call_id)
+                    # The call ended while the turn was being answered and the
+                    # body left on an output boundary instead of being cancelled
+                    # (the LLM answered in the moment between the cleanup's
+                    # start and the worker's cancellation, or its request failed
+                    # with the call): the caller's words, and what they heard of
+                    # a reply the hangup cut, still go into the record. Words
+                    # already there are not repeated.
+                    if outcome != "superseded" and self._call_cleanup_started(session):
+                        await self._record_turn_cut_by_hangup(session, transcript_text)
+                    return outcome or "answered"
 
-                async def run_turn(transcript_text: str) -> None:
+                async def run_turn_body(transcript_text: str) -> Optional[str]:
                     nonlocal conversation_history
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
                     ):
+                        # The call is ending; the caller's words still belong in its record.
+                        await self._record_caller_words_after_hangup(session, transcript_text)
                         return
+                    # A reply still playing now was produced without the caller's
+                    # latest words (their speech ran into it, or the recognizer
+                    # returned them late): cut it like a barge-in, keeping only the
+                    # heard part, before answering. A second reply started on top
+                    # of it would attach to the live stream and never be played.
+                    await self._cut_pipeline_playback_for_turn(session)
+                    # The session is the record of the call: a barge-in trims the
+                    # reply it holds, an announcement or a tool appends to it. Every
+                    # turn starts from it, not from this worker's copy, or the next
+                    # persist would put the untrimmed reply back.
+                    conversation_history = list(session.conversation_history or [])
                     response_text = ""
                     tool_calls = []
                     _streaming_handled = False  # Set True when streaming overlap played audio + recorded history
                     turn_start_time = time.time()  # Track turn latency for call history
+                    # The turn's stage latencies, recorded on its assistant entry
+                    # (see _latency_extra). The recognizer's time for the caller's
+                    # last phrase is taken here so it never leaks into a later turn;
+                    # a continuation of a cut-off reply has no caller phrase.
+                    turn_timing: Dict[str, int] = {}
+                    pending_asr = (getattr(self, "_pipeline_pending_asr_ms", None) or {}).pop(call_id, None)
+                    if pending_asr is not None and transcript_text != self._continue_reply_prompt():
+                        turn_timing["asr_ms"] = int(pending_asr)
+                    speech_ended_at = (getattr(self, "_pipeline_turn_speech_ended_at", None) or {}).pop(call_id, None)
+                    if speech_ended_at is not None and transcript_text != self._continue_reply_prompt():
+                        # The end of the turn: the caller's last word to this moment.
+                        turn_timing["wait_ms"] = _ms_since(speech_ended_at)
                     
                     pipeline_label = getattr(session, 'pipeline_name', None) or 'none'
                     provider_label = getattr(session, 'provider_name', None) or 'unknown'
@@ -15400,6 +18816,10 @@ class Engine:
                         _SENTENCE_RE = re.compile(r"[.!?]\s+")
                         sentence_buffer = ""
                         full_response_text = ""
+                        # Sentences fully handed to playback; on an interruption
+                        # this is what the caller could have heard.
+                        spoken_text = ""
+                        heard_rec: Optional[SpokenReply] = None
                         first_tts_ts: Optional[float] = None
 
                         stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -15431,10 +18851,22 @@ class Engine:
                             )
                             if not stream_id:
                                 raise RuntimeError("start_streaming_playback returned no stream_id")
+                            self._mark_pipeline_reply_stream(call_id, stream_id)
+                            if self._pipeline_reply_superseded(call_id):
+                                # The caller went on while the stream was being set up.
+                                raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
+                            heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
 
+                            llm_started = time.monotonic()
+                            tts_started: Optional[float] = None
                             async for token in pipeline.llm_adapter.generate_stream(
                                 call_id, transcript_text, context_for_llm, llm_options,
                             ):
+                                if self._pipeline_reply_superseded(call_id):
+                                    # The caller went on before any of this was heard.
+                                    raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
+                                if "llm_first_token_ms" not in turn_timing:
+                                    turn_timing["llm_first_token_ms"] = _ms_since(llm_started)
                                 sentence_buffer += token
                                 full_response_text += token
 
@@ -15445,14 +18877,26 @@ class Engine:
                                     sentence_buffer = sentence_buffer[split_pos:]
 
                                     if to_speak:
-                                        async for tts_chunk in pipeline.tts_adapter.synthesize(
-                                            call_id, to_speak, pipeline.tts_options,
+                                        # The model's share of the turn ends where the
+                                        # text the TTS starts on is complete.
+                                        turn_timing.setdefault("llm_ms", _ms_since(llm_started))
+                                        if heard_rec:
+                                            heard_rec.open_segment(to_speak)
+                                        if tts_started is None:
+                                            tts_started = time.monotonic()
+                                        async for tts_chunk in self._tts_chunks_while_wanted(
+                                            call_id,
+                                            stream_id,
+                                            pipeline.tts_adapter.synthesize(call_id, to_speak, pipeline.tts_options),
                                         ):
                                             if tts_chunk:
+                                                if heard_rec:
+                                                    heard_rec.add_audio_bytes(len(tts_chunk))
                                                 if first_tts_ts is None:
                                                     first_tts_ts = time.time()
                                                     turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                     session.turn_latencies_ms.append(turn_latency_ms)
+                                                    _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                                     try:
                                                         if t_start is not None:
                                                             _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(
@@ -15463,26 +18907,44 @@ class Engine:
                                                 await self._put_pipeline_stream_chunk(
                                                     call_id, stream_id, stream_q, tts_chunk
                                                 )
+                                        if heard_rec:
+                                            heard_rec.close_segment()
+                                        spoken_text += to_speak + " "
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
                             if remainder:
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(
-                                    call_id, remainder, pipeline.tts_options,
+                                turn_timing.setdefault("llm_ms", _ms_since(llm_started))
+                                if heard_rec:
+                                    heard_rec.open_segment(remainder)
+                                if tts_started is None:
+                                    tts_started = time.monotonic()
+                                async for tts_chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, remainder, pipeline.tts_options),
                                 ):
                                     if tts_chunk:
+                                        if heard_rec:
+                                            heard_rec.add_audio_bytes(len(tts_chunk))
                                         if first_tts_ts is None:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
+                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                         await self._put_pipeline_stream_chunk(
                                             call_id, stream_id, stream_q, tts_chunk
                                         )
+                                if heard_rec:
+                                    heard_rec.close_segment()
+                                spoken_text += remainder
 
                             # End-of-segment sentinel
                             await self._put_pipeline_stream_chunk(
                                 call_id, stream_id, stream_q, None
                             )
+                            if heard_rec:
+                                heard_rec.completed = True
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -15492,15 +18954,54 @@ class Engine:
                                 pass
 
                         except _PipelinePlaybackInterrupted:
+                            if self._pipeline_reply_superseded(call_id):
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                return "superseded"
+                            # The barge-in handler measured what had played and left
+                            # the heard estimate on the record; without it (the
+                            # feature off, or a stream cut by something else) the
+                            # sentences fully handed to playback are kept, as before.
+                            heard_known = bool(
+                                heard_rec is not None and heard_rec.interrupted and heard_rec.heard_text is not None
+                            )
+                            spoken = (heard_rec.heard_text or "").strip() if heard_known else spoken_text.strip()
                             logger.info(
                                 "Pipeline streaming turn interrupted; discarding remaining TTS",
                                 call_id=call_id,
                                 stream_id=stream_id,
+                                spoken_chars=len(spoken),
+                                generated_chars=len(full_response_text),
+                                heard_estimate=heard_known,
                             )
                             try:
                                 await self.streaming_playback_manager.stop_streaming_playback(call_id)
                             except Exception:
                                 pass
+                            # The caller's words must survive the interruption, or the
+                            # model answers the next turn with no memory of them. For
+                            # the assistant only the sentences that reached playback
+                            # are kept, so the history says what was actually heard.
+                            conversation_history.append(_ts_msg("user", transcript_text))
+                            if spoken:
+                                conversation_history.append(
+                                    _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(turn_timing))
+                                    if heard_known
+                                    else _ts_msg("assistant", spoken, **_latency_extra(turn_timing))
+                                )
+                            if heard_rec is not None:
+                                heard_rec.persisted_text = spoken
+                            session.conversation_history = list(conversation_history)
+                            try:
+                                await self.session_store.upsert_call(session)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist interrupted turn",
+                                    call_id=call_id,
+                                    exc_info=True,
+                                )
                             return
                         except Exception:
                             logger.error(
@@ -15525,7 +19026,20 @@ class Engine:
                             response_text = full_response_text.strip()
                             _streaming_handled = True
                             conversation_history.append(_ts_msg("user", transcript_text))
-                            conversation_history.append(_ts_msg("assistant", response_text))
+                            if heard_rec is not None and heard_rec.interrupted:
+                                # The caller cut the reply after its last chunk was queued.
+                                heard = str(heard_rec.heard_text or "").strip()
+                                if heard:
+                                    conversation_history.append(
+                                        _ts_msg("assistant", heard, interrupted=True, **_latency_extra(turn_timing))
+                                    )
+                                heard_rec.persisted_text = heard
+                            else:
+                                conversation_history.append(
+                                    _ts_msg("assistant", response_text, **_latency_extra(turn_timing))
+                                )
+                                if heard_rec is not None:
+                                    heard_rec.persisted_text = response_text
                             session.conversation_history = list(conversation_history)
                             await self.session_store.upsert_call(session)
 
@@ -15585,17 +19099,25 @@ class Engine:
 
                     # ── Serial path (original) ──
                     # Skip if streaming path already set tool_calls
+                    llm_started = time.monotonic()
                     if not tool_calls:
                         try:
-                            llm_result = await pipeline.llm_adapter.generate(
+                            llm_result = await self._generate_unless_resumed(
+                                pipeline,
                                 call_id,
-                                transcript_text,
-                                context_for_llm,  # Include conversation history
-                                llm_options,  # Use context-injected options (includes system_prompt)
+                                lambda: pipeline.llm_adapter.generate(
+                                    call_id,
+                                    transcript_text,
+                                    context_for_llm,  # Include conversation history
+                                    llm_options,  # Use context-injected options (includes system_prompt)
+                                ),
                             )
                         except Exception:
                             logger.debug("LLM generate failed", call_id=call_id, exc_info=True)
                             return
+                        turn_timing["llm_ms"] = _ms_since(llm_started)
+                        if llm_result is _REPLY_SUPERSEDED:
+                            return "superseded"
 
                         if not self._pipeline_output_allowed(
                             call_id, session, stage="post-llm"
@@ -15721,6 +19243,7 @@ class Engine:
                                     context_for_llm,
                                     llm_options_no_tools,
                                 )
+                                turn_timing["llm_ms"] = _ms_since(llm_started)
                                 if not self._pipeline_output_allowed(
                                     call_id, session, stage="post-llm-retry"
                                 ):
@@ -15752,12 +19275,18 @@ class Engine:
                         call_id, session, stage="pre-output"
                     ):
                         return
+                    if self._pipeline_reply_superseded(call_id):
+                        # The caller went on while the model was answering.
+                        return "superseded"
 
                     # Update conversation history (skip if streaming path already did this)
                     if not _streaming_handled:
                         conversation_history.append(_ts_msg("user", transcript_text))
                         if response_text:
-                            conversation_history.append(_ts_msg("assistant", response_text))
+                            # The TTS stages land on the same dict once the reply's first audio arrives.
+                            conversation_history.append(
+                                _ts_msg("assistant", response_text, **_latency_extra(turn_timing))
+                            )
 
                         # AAVA-85: Persist session history so tools (email) can access it
                         session.conversation_history = list(conversation_history)
@@ -15780,6 +19309,7 @@ class Engine:
                         if use_streaming_playback:
                             stream_q: asyncio.Queue = asyncio.Queue(maxsize=256)
                             stream_id: Optional[str] = None
+                            heard_rec: Optional[SpokenReply] = None
                             old_provider_name = getattr(session, "provider_name", None)
                             try:
                                 # Provide a stable provider label for adaptive streaming + metrics
@@ -15810,14 +19340,31 @@ class Engine:
                                     raise RuntimeError("start_streaming_playback returned no stream_id")
                                 playback_id = stream_id
                                 first_tts_ts: Optional[float] = None
+                                self._mark_pipeline_reply_stream(call_id, stream_id)
+                                if self._pipeline_reply_superseded(call_id):
+                                    # The caller went on while the stream was being set up.
+                                    raise _PipelinePlaybackInterrupted("reply superseded before its first sound")
+                                heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
+                                if heard_rec:
+                                    # The whole reply is already in the history (appended above).
+                                    heard_rec.open_segment(response_text)
+                                    heard_rec.persisted_text = response_text
 
-                                async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
+                                tts_started = time.monotonic()
+                                async for tts_chunk in self._tts_chunks_while_wanted(
+                                    call_id,
+                                    stream_id,
+                                    pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options),
+                                ):
                                     if not tts_chunk:
                                         continue
+                                    if heard_rec:
+                                        heard_rec.add_audio_bytes(len(tts_chunk))
                                     if first_tts_ts is None:
                                         first_tts_ts = time.time()
                                         turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                         session.turn_latencies_ms.append(turn_latency_ms)
+                                        _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                         try:
                                             if t_start is not None:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -15831,17 +19378,60 @@ class Engine:
                                 await self._put_pipeline_stream_chunk(
                                     call_id, stream_id, stream_q, None
                                 )
+                                if heard_rec:
+                                    heard_rec.close_segment()
+                                    heard_rec.completed = True
                                 try:
                                     if playback_id and t_start is not None:
                                         _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
                                 except Exception:
                                     pass
                             except _PipelinePlaybackInterrupted:
+                                if self._pipeline_reply_superseded(call_id):
+                                    try:
+                                        await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                    except Exception:
+                                        pass
+                                    await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                    return "superseded"
                                 logger.info(
                                     "Pipeline streaming turn interrupted; discarding remaining TTS",
                                     call_id=call_id,
                                     stream_id=stream_id,
                                 )
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                if heard_rec is not None and heard_rec.interrupted:
+                                    try:
+                                        await self._patch_interrupted_reply_history(session, heard_rec)
+                                    except Exception:
+                                        logger.debug("Heard-reply history patch failed", call_id=call_id, exc_info=True)
+                                return
+                            except TTSUnavailable as exc:
+                                # The service gave no audio: there is nothing to fall
+                                # back to, and the reply must not stay in the history
+                                # as if it had been spoken.
+                                played_ms = 0
+                                try:
+                                    played_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
+                                except Exception:
+                                    played_ms = 0
+                                logger.error(
+                                    "Pipeline TTS gave no audio; the reply is skipped",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                    played_ms=played_ms,
+                                    error=str(exc),
+                                )
+                                if played_ms > 0:
+                                    try:
+                                        await self._note_pipeline_reply_interrupted(session, played_ms)
+                                    except Exception:
+                                        logger.debug("Heard-reply bookkeeping failed after a TTS stall", call_id=call_id, exc_info=True)
+                                else:
+                                    await self._drop_unspoken_reply_history(session, response_text)
                                 try:
                                     await self.streaming_playback_manager.stop_streaming_playback(call_id)
                                 except Exception:
@@ -15857,12 +19447,14 @@ class Engine:
                                 try:
                                     tts_bytes = bytearray()
                                     first_tts_ts = None
+                                    tts_started = time.monotonic()
                                     async for tts_chunk in pipeline.tts_adapter.synthesize(call_id, response_text, pipeline.tts_options):
                                         if tts_chunk:
                                             if first_tts_ts is None:
                                                 first_tts_ts = time.time()
                                                 turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                                 session.turn_latencies_ms.append(turn_latency_ms)
+                                                _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                                 try:
                                                     if t_start is not None:
                                                         _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -15870,6 +19462,10 @@ class Engine:
                                                     pass
                                             tts_bytes.extend(tts_chunk)
                                     if tts_bytes:
+                                        if self._pipeline_reply_superseded(call_id):
+                                            await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                            return "superseded"
+                                        self._mark_pipeline_reply_audible(call_id)
                                         playback_id = await self.playback_manager.play_audio(call_id, bytes(tts_bytes), "pipeline-tts")
                                 except Exception:
                                     logger.debug("Pipeline file-playback fallback failed", call_id=call_id, exc_info=True)
@@ -15886,6 +19482,7 @@ class Engine:
                             # downstream_mode=file: keep existing pipeline file playback behavior
                             tts_bytes = bytearray()
                             first_tts_ts: Optional[float] = None
+                            tts_started = time.monotonic()
                             try:
                                 async for tts_chunk in pipeline.tts_adapter.synthesize(
                                     call_id,
@@ -15898,6 +19495,7 @@ class Engine:
                                             # Track turn latency for call history (Milestone 21)
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
+                                            _note_first_audio(turn_timing, tts_started, turn_latency_ms)
                                             try:
                                                 if t_start is not None:
                                                     _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
@@ -15911,6 +19509,10 @@ class Engine:
                                     return
                             
                             if tts_bytes:
+                                if self._pipeline_reply_superseded(call_id):
+                                    await self._drop_unheard_reply_history(session, transcript_text, response_text)
+                                    return "superseded"
+                                self._mark_pipeline_reply_audible(call_id)
                                 try:
                                     playback_id = await self.playback_manager.play_audio(
                                         call_id,
@@ -16121,11 +19723,18 @@ class Engine:
                                                 logger.info("Farewell playback completed", duration_sec=duration_sec, call_id=call_id)
                                             except Exception as e:
                                                 logger.error("Farewell TTS failed", error=str(e))
+                                        else:
+                                            # farewell_message disabled: the reply already said
+                                            # goodbye, so the call ends once its audio has been heard.
+                                            logger.info(
+                                                "Hangup without farewell; ending after the reply audio drains",
+                                                call_id=call_id,
+                                            )
                                         
                                         await self._terminate_call_after_audio(
                                             call_id,
                                             reason="pipeline_hangup_call",
-                                            audio_already_drained=True,
+                                            audio_already_drained=bool(farewell),
                                         )
                                         return
 
@@ -16156,18 +19765,27 @@ class Engine:
                                         # Trigger LLM to generate follow-up response
                                         try:
                                             context_for_llm = {"prior_messages": _sanitize_for_llm(llm_context_history)}
+                                            # The follow-up is the same conversation: it carries
+                                            # the turn's own options (the agent's prompt, the tool
+                                            # allowlist, the pipeline's settings), not the raw
+                                            # pipeline block those were resolved from.
+                                            continuation_timing: Dict[str, int] = {}
+                                            continuation_llm_started = time.monotonic()
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
                                                 context_for_llm,
-                                                pipeline.llm_options
+                                                llm_options,
                                             )
+                                            continuation_timing["llm_ms"] = _ms_since(continuation_llm_started)
                                             if llm_response:
                                                 # Handle text response if present
                                                 if getattr(llm_response, 'text', None):
                                                     response_text = llm_response.text.strip()
                                                     if response_text:
-                                                        conversation_history.append(_ts_msg("assistant", response_text))
+                                                        conversation_history.append(
+                                                            _ts_msg("assistant", response_text, **_latency_extra(continuation_timing))
+                                                        )
                                                         session.conversation_history = list(conversation_history)
                                                         await self.session_store.upsert_call(session)
                                                         logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
@@ -16186,6 +19804,7 @@ class Engine:
                                                                     session,
                                                                     pipeline,
                                                                     response_text,
+                                                                    timing=continuation_timing,
                                                                 )
                                                             except _PipelinePlaybackInterrupted:
                                                                 logger.info(
@@ -16197,12 +19816,16 @@ class Engine:
                                                             # File-mode adapters are required to emit
                                                             # the file player's μ-law/8 kHz contract.
                                                             tts_bytes = bytearray()
+                                                            continuation_tts_started = time.monotonic()
                                                             async for chunk in pipeline.tts_adapter.synthesize(
                                                                 call_id,
                                                                 response_text,
                                                                 pipeline.tts_options,
                                                             ):
                                                                 if chunk:
+                                                                    continuation_timing.setdefault(
+                                                                        "tts_ms", _ms_since(continuation_tts_started)
+                                                                    )
                                                                     tts_bytes.extend(chunk)
                                                             if tts_bytes:
                                                                 pid = await self.playback_manager.play_audio(
@@ -16398,25 +20021,33 @@ class Engine:
                                                                 await self._commit_pending_deferred_transfer_for_call(call_id, session)
                                                                 return
                                                             if next_result.get("will_hangup"):
-                                                                farewell = next_result.get("message", "Goodbye!")
-                                                                conversation_history.append(_ts_msg("assistant", farewell))
-                                                                session.conversation_history = list(conversation_history)
-                                                                await self.session_store.upsert_call(session)
-                                                                fw_bytes = bytearray()
-                                                                async for chunk in pipeline.tts_adapter.synthesize(call_id, farewell, pipeline.tts_options):
-                                                                    fw_bytes.extend(chunk)
-                                                                if fw_bytes:
-                                                                    fw_pid = await self.playback_manager.play_audio(call_id, bytes(fw_bytes), "pipeline-farewell")
-                                                                    if fw_pid:
-                                                                        await self.playback_manager.wait_for_playback_end(
-                                                                            call_id,
-                                                                            fw_pid,
-                                                                            timeout_sec=(len(fw_bytes) / 8000.0 + 3.0),
-                                                                        )
+                                                                # An empty message means the farewell is
+                                                                # disabled: the reply is the goodbye.
+                                                                farewell = str(next_result.get("message") or "").strip()
+                                                                if farewell:
+                                                                    conversation_history.append(_ts_msg("assistant", farewell))
+                                                                    session.conversation_history = list(conversation_history)
+                                                                    await self.session_store.upsert_call(session)
+                                                                    fw_bytes = bytearray()
+                                                                    async for chunk in pipeline.tts_adapter.synthesize(call_id, farewell, pipeline.tts_options):
+                                                                        fw_bytes.extend(chunk)
+                                                                    if fw_bytes:
+                                                                        fw_pid = await self.playback_manager.play_audio(call_id, bytes(fw_bytes), "pipeline-farewell")
+                                                                        if fw_pid:
+                                                                            await self.playback_manager.wait_for_playback_end(
+                                                                                call_id,
+                                                                                fw_pid,
+                                                                                timeout_sec=(len(fw_bytes) / 8000.0 + 3.0),
+                                                                            )
+                                                                else:
+                                                                    logger.info(
+                                                                        "Hangup without farewell; ending after the reply audio drains",
+                                                                        call_id=call_id,
+                                                                    )
                                                                 await self._terminate_call_after_audio(
                                                                     call_id,
                                                                     reason="pipeline_followup_hangup_call",
-                                                                    audio_already_drained=True,
+                                                                    audio_already_drained=bool(farewell),
                                                                 )
                                                                 return
                                                         else:
@@ -16514,82 +20145,314 @@ class Engine:
                                             exc_info=True,
                                         )
 
-                async def maybe_respond(force: bool, from_flush: bool = False) -> None:
-                    nonlocal pending_segments, flush_task
-                    if not pending_segments:
-                        if from_flush:
-                            flush_task = None
-                        else:
-                            await cancel_flush()
-                        return
+                def turn_source() -> str:
+                    """Which detector decides the end of this turn right now.
+
+                    ``vad`` while Silero VAD tracks the call, ``talk_detect``
+                    while Asterisk talk detection is enabled for it, ``final``
+                    otherwise; an explicit end_of_turn_source pins one. The
+                    answer is recorded per call so talking reports from the
+                    other detectors are ignored.
+                    """
+                    try:
+                        td = (session.vad_state or {}).get("pipeline_talk_detect", {}) or {}
+                        td_enabled = bool(td.get("enabled", False))
+                    except Exception:
+                        td_enabled = False
+                    resolved = end_of_turn.resolve_source(td_enabled, self._silero_vad_active(call_id))
+                    self._pipeline_turn_source[call_id] = resolved
+                    return resolved
+
+                def detector_driven() -> bool:
+                    """Whether a speech detector, not the result window, ends this turn."""
+                    return turn_source() in ("vad", "talk_detect")
+
+                turn_source()
+
+                async def flush_pending() -> None:
+                    """Hand everything the caller has said so far to the LLM."""
+                    nonlocal pending_segments, pending_started_at, pending_deadline, last_final_at
+                    nonlocal pending_speech_started_at, pending_resume
                     aggregated = " ".join(pending_segments).strip()
-                    if not aggregated:
-                        pending_segments.clear()
-                        if from_flush:
-                            flush_task = None
-                        else:
-                            await cancel_flush()
-                        return
-                    words = len([w for w in aggregated.split() if w])
-                    chars = len(aggregated.replace(" ", ""))
-                    
-                    try:
-                        min_words = max(1, int((pipeline.llm_options or {}).get("aggregation_min_words", 3)))
-                    except (ValueError, TypeError):
-                        min_words = 3
-                    try:
-                        min_chars = max(1, int((pipeline.llm_options or {}).get("aggregation_min_chars", 12)))
-                    except (ValueError, TypeError):
-                        min_chars = 12
-                    threshold_met = words >= min_words or chars >= min_chars
-                    
-                    if not threshold_met:
-                        if not force:
-                            logger.debug(
-                                "Accumulating transcript before LLM",
-                                call_id=call_id,
-                                preview=aggregated[:80],
-                                chars=chars,
-                                words=words,
-                            )
-                            return
-                    if from_flush:
-                        flush_task = None
-                    else:
-                        await cancel_flush()
-                    await run_turn(aggregated)
+                    segments = len(pending_segments)
+                    resume, pending_resume = pending_resume, False
                     pending_segments.clear()
+                    pending_deadline = None
+                    last_final, last_final_at = last_final_at, None
+                    started_at, pending_started_at = pending_started_at, None
+                    speech_started, pending_speech_started_at = pending_speech_started_at, None
+                    starts = self._pipeline_utterance_starts.get(call_id)
+                    if starts:
+                        starts.clear()
+                    if not aggregated:
+                        return
+                    if resume:
+                        await continue_interrupted_reply(aggregated)
+                        return
+                    now = time.monotonic()
+                    source = turn_source()
+                    # How long the caller had been quiet by the detector's
+                    # account: the wait a caller feels, unlike waited_sec,
+                    # which spans the whole turn from its first result.
+                    quiet_since = None
+                    if source in ("vad", "talk_detect") and not self._pipeline_caller_talking.get(call_id, False):
+                        quiet_since = self._pipeline_caller_talk_changed_at.get(call_id)
+                    verdict = self._take_turn_verdict(call_id)
+                    logger.info(
+                        "Caller turn ended on silence",
+                        call_id=call_id,
+                        source=source,
+                        turn_verdict=verdict.get("label") if verdict else None,
+                        turn_probability=round(verdict["probability"], 3)
+                        if verdict and verdict.get("probability") is not None
+                        else None,
+                        segments=segments,
+                        waited_sec=round(now - started_at, 3)
+                        if started_at is not None
+                        else None,
+                        quiet_ms=round((now - quiet_since) * 1000) if quiet_since else None,
+                        since_result_ms=round((now - last_final) * 1000) if last_final is not None else None,
+                        chars=len(aggregated),
+                        preview=aggregated[:80],
+                        # The ending is what end-of-turn tuning needs to see.
+                        tail=aggregated[-40:] if len(aggregated) > 80 else None,
+                    )
+                    resumed = self._pipeline_caller_resumed.get(call_id)
+                    if resumed is not None:
+                        resumed.clear()
+                    # When the caller's last word was heard, for the turn's wait and
+                    # response figures: the VAD's last speech frame, else the detector's
+                    # quiet report, else the last recognizer result.
+                    tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+                    last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+                    speech_ended_at = None
+                    for candidate in (last_speech, quiet_since):
+                        # A detector's mark from long before the last result is
+                        # not this turn's last word (the detector missed it).
+                        if candidate is not None and (last_final is None or candidate >= last_final - 10.0):
+                            speech_ended_at = candidate
+                            break
+                    if speech_ended_at is None:
+                        speech_ended_at = last_final
+                    if speech_ended_at is not None:
+                        ended = getattr(self, "_pipeline_turn_speech_ended_at", None)
+                        if ended is None:
+                            ended = self._pipeline_turn_speech_ended_at = {}
+                        ended[call_id] = float(speech_ended_at)
+                    try:
+                        outcome = await run_turn(aggregated)
+                    except asyncio.CancelledError:
+                        # Cancelled by the call's cleanup with the turn unanswered:
+                        # the caller's words, and what they heard of a reply the
+                        # hangup cut, still go into the record.
+                        await self._record_turn_cut_by_hangup(session, aggregated)
+                        raise
+                    if outcome == "superseded":
+                        # The caller went on before the reply's first sound: their
+                        # words are pending again and merge with what follows.
+                        pending_segments.append(aggregated)
+                        pending_started_at = started_at if started_at is not None else time.monotonic()
+                        pending_speech_started_at = speech_started
+                        last_final_at = last_final if last_final is not None else time.monotonic()
+                        logger.info(
+                            "Caller's words wait for their next words",
+                            call_id=call_id,
+                            chars=len(aggregated),
+                            preview=aggregated[:80],
+                        )
+                        reevaluate()
 
-                async def schedule_flush() -> None:
-                    nonlocal flush_task
-                    await cancel_flush()
+                async def continue_interrupted_reply(prompt: str) -> None:
+                    """The speech that cut the reply off came to nothing: pick the reply up where it stopped.
 
-                    async def _flush() -> None:
-                        try:
-                            await asyncio.sleep(accumulation_timeout)
-                            await maybe_respond(force=True, from_flush=True)
-                        except asyncio.CancelledError:
-                            pass
+                    The model is asked, with the heard part of the reply in
+                    front of it, to go on from there. The request is not a
+                    caller turn: it leaves no trace in the history, and the
+                    continuation joins the heard part as one assistant entry.
+                    The caller speaking before the continuation's first sound
+                    discards it like any reply, and their words are the next
+                    turn on their own.
+                    """
+                    if self._call_cleanup_started(session):
+                        return
+                    record = self._spoken_replies.get(call_id)
+                    heard = str(getattr(record, "persisted_text", "") or "").strip() if record is not None else ""
+                    if record is not None:
+                        record.continued = True
+                    attempt = self._pipeline_continue_streak.get(call_id, 0) + 1
+                    self._pipeline_continue_streak[call_id] = attempt
+                    logger.info(
+                        "Interrupted reply continued: the speech that cut it off came to nothing",
+                        call_id=call_id,
+                        heard_chars=len(heard),
+                        heard_tail=heard[-40:] if heard else None,
+                        attempt=attempt,
+                    )
+                    resumed = self._pipeline_caller_resumed.get(call_id)
+                    if resumed is not None:
+                        resumed.clear()
+                    outcome = await run_turn(prompt)
+                    if outcome == "superseded":
+                        logger.info(
+                            "Continuation discarded before its first sound; the caller went on",
+                            call_id=call_id,
+                        )
+                        return
+                    await self._join_continued_reply_history(session, prompt, heard)
 
-                    flush_task = asyncio.create_task(_flush())
+                def reevaluate() -> None:
+                    """Recompute when the pending text may become a turn.
 
+                    Driven by talk detection the turn is held while Asterisk
+                    reports the caller talking and released a short grace after
+                    it reports them quiet. Otherwise the legacy window since the
+                    last result applies.
+                    """
+                    nonlocal pending_deadline
+                    if not pending_segments:
+                        pending_deadline = None
+                        return
+                    now = time.monotonic()
+                    if detector_driven():
+                        talking = self._pipeline_caller_talking.get(call_id, False)
+                        changed_at = self._pipeline_caller_talk_changed_at.get(call_id, 0.0)
+                        anchor = last_final_at if last_final_at is not None else now
+                        if talking:
+                            hold_anchor = anchor
+                            if turn_source() == "vad":
+                                # Silero's stop cannot be lost, and a long sentence
+                                # gives no result while it lasts: hold from the last
+                                # frame it scored as speech, not from the last result.
+                                tracker = (getattr(self, "_silero_trackers", None) or {}).get(call_id)
+                                last_speech = getattr(tracker, "last_speech_at", None) if tracker is not None else None
+                                hold_anchor = max(anchor, changed_at, float(last_speech or 0.0))
+                            deadline = hold_anchor + end_of_turn.talk_detect_hold_sec
+                        else:
+                            deadline = max(anchor, changed_at) + end_of_turn.talk_detect_grace_sec
+                        # The recognizer was told to finalize when the caller
+                        # stopped: its result gets a bounded chance to join.
+                        expected_at = self._pipeline_stt_final_expected_at.get(call_id)
+                        if expected_at is not None:
+                            deadline = max(deadline, expected_at + end_of_turn.vad_final_wait_sec)
+                        # Smart Turn: an incomplete verdict on this very stop
+                        # holds the turn; one still computing holds it briefly.
+                        if not talking:
+                            deadline = self._apply_turn_verdict(call_id, changed_at, deadline)
+                    else:
+                        deadline = now + end_of_turn.silence_sec
+                    # Words spoken into a reply after it became audible (inside the
+                    # barge-in protection, or too short to interrupt) wait for the
+                    # reply to end or for a barge-in to cut it; words from before it
+                    # started make it stale and are released at once.
+                    if self._pipeline_turn_waits_for_reply(session, pending_speech_started_at):
+                        deadline = max(deadline, now + 0.1)
+                    if end_of_turn.max_wait_ms > 0 and pending_started_at is not None:
+                        deadline = min(deadline, pending_started_at + end_of_turn.max_wait_sec)
+                    pending_deadline = deadline
+
+                get_task: Optional[asyncio.Task] = None
                 try:
                     while True:
-                        transcript = await transcript_queue.get()
+                        if get_task is None:
+                            get_task = asyncio.ensure_future(transcript_queue.get())
+                        timeout = None
+                        if pending_segments and pending_deadline is not None:
+                            timeout = max(0.0, pending_deadline - time.monotonic())
+                        wake_task = asyncio.ensure_future(wakeup.wait())
+                        done, _ = await asyncio.wait(
+                            {get_task, wake_task},
+                            timeout=timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if wake_task in done:
+                            wakeup.clear()
+                        else:
+                            wake_task.cancel()
+                        if get_task in done:
+                            transcript = get_task.result()
+                            get_task = None
+                        elif wake_task in done:
+                            # The caller started or stopped talking.
+                            if detector_driven():
+                                reevaluate()
+                            continue
+                        else:
+                            # Quiet for long enough: release the turn, unless a
+                            # recomputation still holds it (Silero still scoring the
+                            # caller's speech, a reply they spoke into still audible),
+                            # as long as that gives a deadline ahead of now. The
+                            # result window (source "final") restarts from now, so it
+                            # is not recomputed here.
+                            if detector_driven():
+                                reevaluate()
+                            elif self._pipeline_turn_waits_for_reply(session, pending_speech_started_at):
+                                pending_deadline = time.monotonic() + 0.1
+                            if pending_deadline is not None and pending_deadline > time.monotonic():
+                                continue
+                            await flush_pending()
+                            continue
                         if transcript is None:
-                            await maybe_respond(force=True)
+                            await flush_pending()
                             break
+                        if isinstance(transcript, tuple):
+                            generation, transcript = transcript
+                            if generation != input_generation:
+                                continue
+                        # When this result's utterance started: the start the
+                        # cutter recorded when it sent it, else Silero's latest.
+                        starts = self._pipeline_utterance_starts.get(call_id)
+                        speech_started_for_result, result_interrupted_agent = (
+                            starts.popleft() if starts else (None, False)
+                        )
+                        if speech_started_for_result is None:
+                            tracker = self._silero_trackers.get(call_id)
+                            speech_started_for_result = (
+                                getattr(tracker, "segment_started_at", None) if tracker is not None else None
+                            )
                         normalized = (transcript or "").strip()
                         if not normalized:
-                            if pending_segments and flush_task is None:
-                                await schedule_flush()
+                            # An empty result is not speech, so it must not
+                            # push the deadline out. When it is all that the
+                            # speech which cut the agent off came to, the reply
+                            # it cut is continued instead of left hanging.
+                            if (
+                                result_interrupted_agent
+                                and not pending_segments
+                                and self._continue_reply_after_empty_interrupt(call_id)
+                            ):
+                                pending_segments.append(self._continue_reply_prompt())
+                                pending_resume = True
+                                pending_speech_started_at = None
+                                pending_started_at = last_final_at = time.monotonic()
+                                reevaluate()
                             continue
                         await self._no_input_note_activity(call_id, "pipeline:transcript")
                         await self._no_input_note_processing(call_id, True)
+                        self._pipeline_continue_streak.pop(call_id, None)
+                        if pending_resume:
+                            # The caller did say something after all: their words,
+                            # not the continuation, are the next turn.
+                            pending_segments.clear()
+                            pending_resume = False
+                            pending_started_at = None
+                        if not pending_segments:
+                            pending_speech_started_at = speech_started_for_result
                         pending_segments.append(normalized)
-                        await maybe_respond(force=False)
-                        if pending_segments:
-                            await schedule_flush()
+                        last_final_at = time.monotonic()
+                        self._pipeline_stt_final_expected_at.pop(call_id, None)
+                        if pending_started_at is None:
+                            pending_started_at = last_final_at
+                        reevaluate()
+                        logger.debug(
+                            "Waiting for caller silence before LLM turn",
+                            call_id=call_id,
+                            segments=len(pending_segments),
+                            source=turn_source(),
+                            caller_talking=self._pipeline_caller_talking.get(call_id, False),
+                            deadline_in_ms=round((pending_deadline - time.monotonic()) * 1000)
+                            if pending_deadline is not None
+                            else None,
+                        )
                 except asyncio.CancelledError:
                     pass
                 except Exception:
@@ -16601,7 +20464,28 @@ class Engine:
                     )
                     raise
                 finally:
-                    await cancel_flush()
+                    leftovers: List[str] = []
+                    if get_task is not None:
+                        if not get_task.done():
+                            get_task.cancel()
+                        elif not get_task.cancelled() and get_task.exception() is None:
+                            leftovers.append(remaining_transcript(get_task.result()))
+                    if self._pipeline_turn_wakeup.get(call_id) is wakeup:
+                        self._pipeline_turn_wakeup.pop(call_id, None)
+                    # Cancelled by the call's cleanup: the results the worker was
+                    # still holding for the end of the turn, and those it had not
+                    # taken off its queue yet, are the caller's last words.
+                    if self._call_cleanup_started(session):
+                        leftovers = list(pending_segments) + leftovers
+                        pending_segments.clear()
+                        while True:
+                            try:
+                                leftovers.append(remaining_transcript(transcript_queue.get_nowait()))
+                            except asyncio.QueueEmpty:
+                                break
+                        text = " ".join(part.strip() for part in leftovers if part and part.strip()).strip()
+                        if text:
+                            await self._record_caller_words_after_hangup(session, text)
 
             async def dialog_supervisor() -> None:
                 restart_count = 0
@@ -16836,6 +20720,36 @@ class Engine:
 
         return canonical, sample_rate, reported
 
+    def _resolve_context_from_channel_vars(
+        self, session: CallSession, channel_vars: Dict[str, str]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The Agent of a call and how it was chosen: (context_name, routing_method).
+
+        AI_AGENT (new) takes precedence over the legacy AI_CONTEXT variable. An
+        outbound session seeded from its attempt metadata keeps the campaign's
+        Agent when neither variable can be read: the channel may already be
+        gone, and the default Agent would be the wrong one for the lead. With
+        nothing else, the agents.db default agent slug applies (None when no
+        agents.db — preserves the existing YAML/headless behavior).
+        """
+        if channel_vars.get('AI_AGENT'):
+            return channel_vars['AI_AGENT'], 'ai_agent'
+        if channel_vars.get('AI_CONTEXT'):
+            if not getattr(self, "_legacy_context_warning_emitted", False):
+                self._legacy_context_warning_emitted = True
+                logger.warning(
+                    "AI_CONTEXT is deprecated; use AI_AGENT with the Agent slug",
+                    compatibility="display-name-first Agent lookup remains available in v7.4",
+                )
+            return channel_vars['AI_CONTEXT'], 'ai_context'
+        seeded = str(getattr(session, "context_name", "") or "").strip()
+        if getattr(session, "is_outbound", False) and getattr(session, "outbound_attempt_id", None) and seeded:
+            return seeded, getattr(session, "routing_method", None) or 'ai_context'
+        default_slug = self.transport_orchestrator.agent_store.default_slug()
+        if default_slug:
+            return default_slug, 'default'   # neither var set; used agents.db default agent
+        return None, None                    # no DB default + no vars (headless/YAML edge)
+
     async def _resolve_audio_profile(self, session: CallSession, channel_id: str) -> None:
         """
         P1: Resolve audio profile using TransportOrchestrator.
@@ -16891,26 +20805,10 @@ class Engine:
         # AI_AGENT (new) takes precedence over the legacy AI_CONTEXT variable.
         # When neither is set, fall back to the agents.db default agent slug
         # (None when no agents.db — preserves the existing YAML/headless behavior).
-        resolved_context = (
-            channel_vars.get('AI_AGENT')
-            or channel_vars.get('AI_CONTEXT')
-            or self.transport_orchestrator.agent_store.default_slug()
-        )
+        # Called through the class so a partial engine stand-in (tests) resolves the same way.
+        resolved_context, routing_method = Engine._resolve_context_from_channel_vars(self, session, channel_vars)
         session.context_name = resolved_context
-        if channel_vars.get('AI_AGENT'):
-            session.routing_method = 'ai_agent'
-        elif channel_vars.get('AI_CONTEXT'):
-            session.routing_method = 'ai_context'
-            if not getattr(self, "_legacy_context_warning_emitted", False):
-                self._legacy_context_warning_emitted = True
-                logger.warning(
-                    "AI_CONTEXT is deprecated; use AI_AGENT with the Agent slug",
-                    compatibility="display-name-first Agent lookup remains available in v7.4",
-                )
-        elif resolved_context:
-            session.routing_method = 'default'   # neither var set; used agents.db default agent
-        else:
-            session.routing_method = None        # no DB default + no vars (headless/YAML edge)
+        session.routing_method = routing_method
         await self._save_session(session)
         logger.debug(
             "Stored context_name in session",
@@ -17279,6 +21177,7 @@ class Engine:
                                 prompt_to_apply = self._append_outbound_custom_vars_to_prompt(
                                     prompt_to_apply,
                                     getattr(session, "outbound_custom_vars", {}) or {},
+                                    context_config,
                                 )
                             session.provider_overrides["prompt"] = prompt_to_apply
                             logger.info(
@@ -19040,7 +22939,7 @@ class Engine:
                                     prompt_to_apply = self._apply_prompt_template_substitution(str(prompt_tpl), session)
                                     if getattr(session, "is_outbound", False) and getattr(session, "outbound_custom_vars", None):
                                         prompt_to_apply = self._append_outbound_custom_vars_to_prompt(
-                                            prompt_to_apply, getattr(session, "outbound_custom_vars", {}) or {}
+                                            prompt_to_apply, getattr(session, "outbound_custom_vars", {}) or {}, ctx_cfg
                                         )
                                     session.provider_overrides["prompt"] = prompt_to_apply
                                 await self._save_session(session)
@@ -19680,7 +23579,8 @@ class Engine:
     async def _start_health_server(self):
         """Start aiohttp health/metrics server (defaults to 127.0.0.1:15000)."""
         try:
-            app = web.Application()
+            # A reference voice sample (up to 10 MB) is uploaded through this server.
+            app = web.Application(client_max_size=16 * 1024 * 1024)
             app.router.add_get('/live', self._live_handler)
             app.router.add_get('/ready', self._ready_handler)
             app.router.add_get('/health', self._health_handler)
@@ -19688,11 +23588,17 @@ class Engine:
             app.router.add_post('/reload', self._reload_handler)
             app.router.add_get('/mcp/status', self._mcp_status_handler)
             app.router.add_post('/mcp/test/{server_id}', self._mcp_test_handler)
+            # Provider checks run here, next to the calls: the Admin UI container may
+            # sit in another network than the engine host's endpoints.
+            app.router.add_post('/providers/test', self._provider_test_handler)
+            app.router.add_post('/providers/{name}/voices', self._provider_voice_register_handler)
+            app.router.add_get('/providers/{name}/voices', self._provider_voices_list_handler)
             # Read-only tool catalog for Admin UI: includes built-in, HTTP, and MCP tool wrappers
             # registered in the engine's tool registry. This is intentionally unauthenticated
             # (similar to /mcp/status) and should not include secrets or PII.
             app.router.add_get('/tools/definitions', self._tools_definitions_handler)
             app.router.add_get('/sessions/stats', self._sessions_stats_handler)
+            app.router.add_post('/sessions/{call_id}/cleanup', self._session_cleanup_handler)
             app.router.add_get('/config/state', self._config_state_handler)
             runner = web.AppRunner(app)
             await runner.setup()
@@ -19803,6 +23709,42 @@ class Engine:
             logger.debug("Sessions stats handler failed", error=str(exc), exc_info=True)
             return web.json_response({"active_calls": 0, "error": "internal_error"}, status=500)
 
+    async def _session_cleanup_handler(self, request):
+        """POST /sessions/{call_id}/cleanup: end one call session by hand.
+
+        For an operator who sees a call on the dashboard that no longer exists in
+        Asterisk. Runs the same path as the reconciler: normal cleanup for a session
+        that never saw it, plain removal for one that was resurrected after its
+        cleanup; ``?force=1`` also removes a session whose cleanup is still running.
+        SECURITY: Requires localhost or HEALTH_API_TOKEN.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"ok": False, "error": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        call_id = str(request.match_info.get("call_id") or "").strip()
+        if not call_id:
+            return web.json_response({"ok": False, "error": "call_id required"}, status=400)
+        force = str(request.query.get("force", "")).strip().lower() in ("1", "true", "yes")
+        try:
+            session = await self.session_store.get_by_call_id(call_id)
+            if session is None:
+                return web.json_response({"ok": False, "error": "no such session", "call_id": call_id}, status=404)
+            removed = await self._reap_orphaned_session(session, reason="operator request", force=force)
+            return web.json_response(
+                {
+                    "ok": removed,
+                    "call_id": call_id,
+                    "removed": removed,
+                    "cleanup_running": call_id in _cleanup_in_progress,
+                },
+                status=200 if removed else 409,
+            )
+        except Exception as exc:
+            logger.error("Session cleanup handler failed", call_id=call_id, error=str(exc), exc_info=True)
+            return web.json_response({"ok": False, "error": "internal_error", "call_id": call_id}, status=500)
+
     async def _mcp_status_handler(self, request):
         """Return MCP server/tool status for Admin UI (sanitized)."""
         try:
@@ -19836,6 +23778,172 @@ class Engine:
         except Exception as exc:
             logger.debug("MCP test handler failed", error=str(exc), exc_info=True)
             return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+
+    def _saved_provider_blocks(self) -> Dict[str, Any]:
+        """Provider blocks as saved on disk, falling back to the loaded config.
+
+        The Admin UI saves a block before it tests it, and the engine may not
+        have reloaded yet; the file is what the operator means.
+        """
+        try:
+            from .config.loaders import load_yaml_with_local_override, resolve_config_path
+
+            raw = load_yaml_with_local_override(resolve_config_path("config/ai-agent.yaml"))
+            providers = raw.get("providers") if isinstance(raw, dict) else None
+            if isinstance(providers, dict):
+                return providers
+        except Exception:
+            logger.debug("Could not read saved provider blocks; using the loaded config", exc_info=True)
+        providers = getattr(self.config, "providers", None) or {}
+        return dict(providers) if isinstance(providers, dict) else {}
+
+    async def _provider_test_handler(self, request):
+        """Probe a provider block from the engine's own network position.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN. A self-hosted host
+        is probed only when the saved block names it (see probes.providers).
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
+        name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+        config = payload.get("config") if isinstance(payload, dict) else None
+        if not name or not isinstance(config, dict):
+            return web.json_response(
+                {"success": False, "message": 'Expected {"name": "<provider key>", "config": {...}}'},
+                status=400,
+            )
+        from .probes.providers import probe_provider
+
+        result = await probe_provider(name, config, saved_providers=self._saved_provider_blocks())
+        result["source"] = "ai_engine"
+        return web.json_response(result)
+
+    def _saved_provider_block(self, name: str) -> Optional[Dict[str, Any]]:
+        blocks = self._saved_provider_blocks()
+        block = blocks.get(name)
+        if isinstance(block, dict):
+            return block
+        for key, value in blocks.items():
+            if str(key).lower() == name.lower() and isinstance(value, dict):
+                return value
+        return None
+
+    async def _provider_voice_register_handler(self, request):
+        """Register a reference voice on a saved self-hosted speech provider.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN. The target host is
+        the saved block's own. The sample arrives as a multipart upload
+        (``audio_sample``, relayed from the operator's browser), or as JSON
+        naming a file the Admin UI staged into this container
+        (``staged_file``) or a file inside the provider's voices directory
+        (``file``, for scripts); a name is always a bare file name.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        name = str(request.match_info.get("name") or "").strip()
+        block = self._saved_provider_block(name) if name else None
+        if block is None:
+            return web.json_response(
+                {"success": False, "message": f"Provider '{name}' is not saved; save the provider first"},
+                status=404,
+            )
+        from .probes.voices import (
+            VoiceRegistrationError,
+            register_voice,
+            register_voice_bytes,
+            take_staged_sample,
+        )
+
+        content_type = str(getattr(request, "content_type", "") or "").lower()
+        if content_type.startswith("multipart/"):
+            try:
+                form = await request.post()
+            except Exception as exc:
+                return web.json_response({"success": False, "message": f"Malformed upload: {exc}"}, status=400)
+            sample = form.get("audio_sample")
+            if sample is None or not hasattr(sample, "file"):
+                return web.json_response(
+                    {"success": False, "message": "audio_sample (the sample file) is required"}, status=400
+                )
+            data = sample.file.read()
+            result = await register_voice_bytes(
+                name,
+                block,
+                sample=data,
+                filename=str(getattr(sample, "filename", "") or ""),
+                name=str(form.get("name") or "") or None,
+                ref_text=str(form.get("ref_text") or ""),
+                consent=str(form.get("consent") or "") or None,
+            )
+        else:
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.json_response({"success": False, "message": "Request body must be JSON"}, status=400)
+            if not isinstance(payload, dict):
+                return web.json_response({"success": False, "message": "Request body must be a JSON object"}, status=400)
+            common = {
+                "name": str(payload.get("name") or "") or None,
+                "ref_text": str(payload.get("ref_text") or ""),
+                "consent": str(payload.get("consent") or "") or None,
+            }
+            if payload.get("staged_file"):
+                try:
+                    data, staged_name = take_staged_sample(str(payload["staged_file"]))
+                except VoiceRegistrationError as exc:
+                    return web.json_response({"success": False, "message": str(exc)}, status=400)
+                result = await register_voice_bytes(
+                    name,
+                    block,
+                    sample=data,
+                    filename=str(payload.get("filename") or staged_name),
+                    **common,
+                )
+            elif payload.get("file"):
+                result = await register_voice(name, block, file=str(payload["file"]), **common)
+            else:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "message": 'Expected a multipart upload (audio_sample) or JSON with "staged_file" or "file"',
+                    },
+                    status=400,
+                )
+        result["source"] = "ai_engine"
+        return web.json_response(result)
+
+    async def _provider_voices_list_handler(self, request):
+        """List the voices a saved self-hosted speech provider's server knows.
+
+        SECURITY: Requires localhost or HEALTH_API_TOKEN.
+        """
+        if not self._is_request_authorized(request):
+            return web.json_response(
+                {"success": False, "message": "Forbidden: requires localhost or valid HEALTH_API_TOKEN"},
+                status=403,
+            )
+        name = str(request.match_info.get("name") or "").strip()
+        block = self._saved_provider_block(name) if name else None
+        if block is None:
+            return web.json_response(
+                {"success": False, "message": f"Provider '{name}' is not saved; save the provider first"},
+                status=404,
+            )
+        from .probes.voices import list_voices
+
+        result = await list_voices(name, block)
+        result["source"] = "ai_engine"
+        return web.json_response(result)
 
     async def _execute_provider_tool(
         self,
@@ -20508,6 +24616,42 @@ class Engine:
         
         return results
 
+    def _post_call_tools_for_context(
+        self,
+        tool_registry: Any,
+        context_name: Optional[str],
+        routing_method: Optional[str] = None,
+    ) -> List[Any]:
+        """Post-call tools of an agent context: its own plus the global ones minus its opt-outs."""
+        from src.tools.base import ToolPhase
+
+        ctx_config = None
+        if context_name:
+            ctx_config = self.transport_orchestrator.get_context_config(context_name, routing_method)
+        post_call_tool_names = list(getattr(ctx_config, 'post_call_tools', None) or []) if ctx_config else []
+        disabled_global = list(getattr(ctx_config, 'disable_global_post_call_tools', None) or []) if ctx_config else []
+        return tool_registry.get_tools_for_context(
+            phase=ToolPhase.POST_CALL,
+            context_tool_names=post_call_tool_names,
+            disabled_global_tools=disabled_global,
+        )
+
+    @staticmethod
+    def _post_call_tool_runs_on_failed_dial(tool: Any) -> bool:
+        """Whether a post-call tool opted in to outbound attempts that never became a call."""
+        probe = getattr(tool, "runs_on_failed_dial", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug(
+                "runs_on_failed_dial failed",
+                tool=getattr(getattr(tool, "definition", None), "name", None),
+                exc_info=True,
+            )
+            return False
+
     async def _execute_post_call_tools(
         self,
         call_id: str,
@@ -20521,6 +24665,10 @@ class Engine:
         
         Post-call tools send data to external systems (webhooks, CRM updates).
         They run asynchronously and do not block call cleanup.
+
+        An outbound attempt that never became a call has no session and never
+        gets here: ``_outbound_post_call_tools_for_attempt`` reports it from
+        the attempt metadata instead.
         
         Args:
             call_id: Call identifier
@@ -20528,25 +24676,13 @@ class Engine:
             call_duration_seconds: Pre-calculated call duration in seconds
             call_outcome: How the call ended (caller_hangup, agent_hangup, transferred)
         """
-        from src.tools.base import ToolPhase
         from src.tools.context import PostCallContext
         tool_registry = self._tool_registry_for_session(session)
         
         try:
-            # Get context config for this call
-            ctx_config = None
-            if session.context_name:
-                ctx_config = self.transport_orchestrator.get_context_config(
-                    session.context_name, getattr(session, "routing_method", None))
-
-            # Get post-call tools for this context (context-specific + global minus opt-outs)
-            post_call_tool_names = list(getattr(ctx_config, 'post_call_tools', None) or []) if ctx_config else []
-            disabled_global = list(getattr(ctx_config, 'disable_global_post_call_tools', None) or []) if ctx_config else []
-            
-            tools_to_run = tool_registry.get_tools_for_context(
-                phase=ToolPhase.POST_CALL,
-                context_tool_names=post_call_tool_names,
-                disabled_global_tools=disabled_global,
+            # Post-call tools for this context (context-specific + global minus opt-outs)
+            tools_to_run = self._post_call_tools_for_context(
+                tool_registry, session.context_name, getattr(session, "routing_method", None)
             )
             
             if not tools_to_run:
@@ -20562,6 +24698,7 @@ class Engine:
                        call_outcome=call_outcome)
             
             # Build post-call context
+            session_error = getattr(session, 'error_message', None)
             post_call_ctx = PostCallContext(
                 call_id=call_id,
                 caller_number=session.caller_number or "",
@@ -20580,176 +24717,200 @@ class Engine:
                 pre_call_results=dict(getattr(session, 'pre_call_results', {}) or {}),
                 campaign_id=getattr(session, 'outbound_campaign_id', None),
                 lead_id=getattr(session, 'outbound_lead_id', None),
+                custom_vars=dict(getattr(session, 'outbound_custom_vars', {}) or {}),
+                caller_id=str(getattr(session, 'outbound_caller_id', None) or '') or None,
+                caller_id_source=str(getattr(session, 'outbound_caller_id_source', None) or '') or None,
+                attempt_id=str(getattr(session, 'outbound_attempt_id', None) or '') or None,
+                error_message=str(session_error) if session_error else None,
                 config=self._tool_config_for_session(session),
                 summary_generator=self._post_call_summary_generator(),
             )
-            
-            # Capture execution metadata in call_records.post_call_tool_calls
-            # so the admin UI can show what happened. We write a `pending`
-            # placeholder per tool BEFORE scheduling (so a killed engine still
-            # shows what was supposed to run), then update with the result.
-            try:
-                from src.core.call_history import get_call_history_store
-                history_store = get_call_history_store()
-            except Exception:
-                history_store = None
-            phase = "post_call"
 
-            async def run_post_call_tool(tool, started_at_iso: str):
-                tool_name = tool.definition.name
-                tool_kind = type(tool).__name__
-                tool_start = time.time()
-                # Per-tool budget: configured timeout + 1s grace; defaults to 6s.
-                timeout_ms = getattr(tool.definition, "timeout_ms", None) or 5000
-                tool_timeout = timeout_ms / 1000.0 + 1.0
-                status = "ok"
-                error_message = None
-                try:
-                    await asyncio.wait_for(tool.execute(post_call_ctx), timeout=tool_timeout)
-                except asyncio.TimeoutError:
-                    status = "timeout"
-                    error_message = f"exceeded {tool_timeout:.1f}s budget"
-                    logger.warning(
-                        "Post-call tool timed out",
-                        call_id=call_id,
-                        tool=tool_name,
-                        timeout_s=tool_timeout,
-                    )
-                except Exception as e:
-                    status = "error"
-                    error_message = f"{e.__class__.__name__}: {e}"
-                    logger.error(
-                        "Post-call tool failed",
-                        call_id=call_id,
-                        tool=tool_name,
-                        error=str(e),
-                        exc_info=True,
-                    )
-                duration_ms = round((time.time() - tool_start) * 1000, 2)
-                logger.info(
-                    "Post-call tool completed",
-                    call_id=call_id,
-                    tool=tool_name,
-                    duration_ms=duration_ms,
-                    status=status,
-                )
-                # Merge any tool-specific diagnostics (HTTP status, body preview, etc.)
-                tool_extra = {}
-                try:
-                    if hasattr(tool, "get_last_result"):
-                        try:
-                            last = tool.get_last_result(call_id=call_id)
-                        except TypeError:
-                            # Backward-compat: third-party overrides without call_id arg
-                            last = tool.get_last_result()
-                    else:
-                        last = None
-                    if isinstance(last, dict):
-                        # Tool's recorded status wins for skipped/error/timeout — the tool
-                        # knows about non-2xx HTTP responses that didn't raise an exception
-                        # (GenericWebhookTool catches them internally). Without this, a 502
-                        # from the wrapper would still show as 'ok' in the modal.
-                        tool_reported = last.get("status")
-                        if tool_reported in ("skipped", "error", "timeout"):
-                            status = tool_reported
-                        for k in (
-                            "http_status",
-                            "response_summary",
-                            "started_at",
-                            "finished_at",
-                            "duration_ms",
-                            "summary_provider",
-                            "summary_model",
-                            "summary_status",
-                            "summary_duration_ms",
-                            "summary_error_code",
-                        ):
-                            if last.get(k) is not None:
-                                tool_extra[k] = last[k]
-                        if last.get("error_message") and not error_message:
-                            error_message = last["error_message"]
-                except Exception:
-                    logger.debug("get_last_result failed", call_id=call_id, tool=tool_name, exc_info=True)
-                # Engine-side fallback for finished_at — tools that don't report it
-                # via get_last_result still get a real timestamp instead of NULL.
-                finished_at_iso = datetime.now(timezone.utc).isoformat()
-                # Persist final state.
-                if history_store is not None:
-                    try:
-                        await history_store.update_phase_tool(
-                            call_id=call_id,
-                            phase=phase,
-                            tool_name=tool_name,
-                            started_at=started_at_iso,
-                            updates={
-                                "kind": tool_kind,
-                                "phase": phase,
-                                "status": status,
-                                "duration_ms": tool_extra.get("duration_ms", duration_ms),
-                                "started_at": tool_extra.get("started_at", started_at_iso),
-                                "finished_at": tool_extra.get("finished_at") or finished_at_iso,
-                                "http_status": tool_extra.get("http_status"),
-                                "response_summary": tool_extra.get("response_summary"),
-                                "summary_provider": tool_extra.get("summary_provider"),
-                                "summary_model": tool_extra.get("summary_model"),
-                                "summary_status": tool_extra.get("summary_status"),
-                                "summary_duration_ms": tool_extra.get("summary_duration_ms"),
-                                "summary_error_code": tool_extra.get("summary_error_code"),
-                                "error_message": error_message,
-                                "attempt": 1,
-                            },
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to update post-call tool history",
-                            call_id=call_id, tool=tool_name, exc_info=True,
-                        )
-
-            # Write `pending` placeholders BEFORE scheduling tasks. This way the
-            # row reflects what was supposed to run even if the engine dies before
-            # any task completes. Captured `started_at` is the matching key for
-            # the later update_phase_tool call.
-            tool_starts = {}
-            if history_store is not None:
-                for tool in tools_to_run:
-                    started_at_iso = datetime.now(timezone.utc).isoformat()
-                    tool_starts[tool.definition.name] = started_at_iso
-                    try:
-                        await history_store.append_phase_tool(
-                            call_id=call_id,
-                            phase=phase,
-                            record={
-                                "name": tool.definition.name,
-                                "kind": type(tool).__name__,
-                                "phase": phase,
-                                "status": "pending",
-                                "started_at": started_at_iso,
-                                "finished_at": None,
-                                "duration_ms": None,
-                                "attempt": 1,
-                            },
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to record pending post-call tool",
-                            call_id=call_id, tool=tool.definition.name, exc_info=True,
-                        )
-
-            # Create fire-and-forget tasks for all post-call tools
-            for tool in tools_to_run:
-                started_at_iso = tool_starts.get(tool.definition.name) or datetime.now(timezone.utc).isoformat()
-                self._fire_and_forget(
-                    run_post_call_tool(tool, started_at_iso),
-                    name=f"post-call-{tool.definition.name}-{call_id}"
-                )
-
-            logger.info("Post-call tools fired", call_id=call_id, count=len(tools_to_run))
+            await self._run_post_call_tools(call_id, tools_to_run, post_call_ctx)
             
         except Exception as e:
             logger.error("Post-call tool execution setup failed",
                         call_id=call_id,
                         error=str(e),
                         exc_info=True)
+
+    async def _run_post_call_tools(
+        self,
+        call_id: str,
+        tools_to_run: List[Any],
+        post_call_ctx: Any,
+        *,
+        record_history: bool = True,
+    ) -> None:
+        """Fire the given post-call tools with one shared context (fire-and-forget).
+
+        With ``record_history`` every tool gets a ``pending`` placeholder in
+        the call record's ``post_call_tool_calls`` before it is scheduled and
+        its result afterwards. An outbound attempt that never became a call
+        has no call record and passes False.
+        """
+        # Capture execution metadata in call_records.post_call_tool_calls
+        # so the admin UI can show what happened. We write a `pending`
+        # placeholder per tool BEFORE scheduling (so a killed engine still
+        # shows what was supposed to run), then update with the result.
+        history_store = None
+        if record_history:
+            try:
+                from src.core.call_history import get_call_history_store
+                history_store = get_call_history_store()
+            except Exception:
+                history_store = None
+        phase = "post_call"
+
+        async def run_post_call_tool(tool, started_at_iso: str):
+            tool_name = tool.definition.name
+            tool_kind = type(tool).__name__
+            tool_start = time.time()
+            # Per-tool budget: configured timeout + 1s grace; defaults to 6s.
+            timeout_ms = getattr(tool.definition, "timeout_ms", None) or 5000
+            tool_timeout = timeout_ms / 1000.0 + 1.0
+            status = "ok"
+            error_message = None
+            try:
+                await asyncio.wait_for(tool.execute(post_call_ctx), timeout=tool_timeout)
+            except asyncio.TimeoutError:
+                status = "timeout"
+                error_message = f"exceeded {tool_timeout:.1f}s budget"
+                logger.warning(
+                    "Post-call tool timed out",
+                    call_id=call_id,
+                    tool=tool_name,
+                    timeout_s=tool_timeout,
+                )
+            except Exception as e:
+                status = "error"
+                error_message = f"{e.__class__.__name__}: {e}"
+                logger.error(
+                    "Post-call tool failed",
+                    call_id=call_id,
+                    tool=tool_name,
+                    error=str(e),
+                    exc_info=True,
+                )
+            duration_ms = round((time.time() - tool_start) * 1000, 2)
+            logger.info(
+                "Post-call tool completed",
+                call_id=call_id,
+                tool=tool_name,
+                duration_ms=duration_ms,
+                status=status,
+            )
+            # Merge any tool-specific diagnostics (HTTP status, body preview, etc.)
+            tool_extra = {}
+            try:
+                if hasattr(tool, "get_last_result"):
+                    try:
+                        last = tool.get_last_result(call_id=call_id)
+                    except TypeError:
+                        # Backward-compat: third-party overrides without call_id arg
+                        last = tool.get_last_result()
+                else:
+                    last = None
+                if isinstance(last, dict):
+                    # Tool's recorded status wins for skipped/error/timeout — the tool
+                    # knows about non-2xx HTTP responses that didn't raise an exception
+                    # (GenericWebhookTool catches them internally). Without this, a 502
+                    # from the wrapper would still show as 'ok' in the modal.
+                    tool_reported = last.get("status")
+                    if tool_reported in ("skipped", "error", "timeout"):
+                        status = tool_reported
+                    for k in (
+                        "http_status",
+                        "response_summary",
+                        "started_at",
+                        "finished_at",
+                        "duration_ms",
+                        "summary_provider",
+                        "summary_model",
+                        "summary_status",
+                        "summary_duration_ms",
+                        "summary_error_code",
+                    ):
+                        if last.get(k) is not None:
+                            tool_extra[k] = last[k]
+                    if last.get("error_message") and not error_message:
+                        error_message = last["error_message"]
+            except Exception:
+                logger.debug("get_last_result failed", call_id=call_id, tool=tool_name, exc_info=True)
+            # Engine-side fallback for finished_at — tools that don't report it
+            # via get_last_result still get a real timestamp instead of NULL.
+            finished_at_iso = datetime.now(timezone.utc).isoformat()
+            # Persist final state.
+            if history_store is not None:
+                try:
+                    await history_store.update_phase_tool(
+                        call_id=call_id,
+                        phase=phase,
+                        tool_name=tool_name,
+                        started_at=started_at_iso,
+                        updates={
+                            "kind": tool_kind,
+                            "phase": phase,
+                            "status": status,
+                            "duration_ms": tool_extra.get("duration_ms", duration_ms),
+                            "started_at": tool_extra.get("started_at", started_at_iso),
+                            "finished_at": tool_extra.get("finished_at") or finished_at_iso,
+                            "http_status": tool_extra.get("http_status"),
+                            "response_summary": tool_extra.get("response_summary"),
+                            "summary_provider": tool_extra.get("summary_provider"),
+                            "summary_model": tool_extra.get("summary_model"),
+                            "summary_status": tool_extra.get("summary_status"),
+                            "summary_duration_ms": tool_extra.get("summary_duration_ms"),
+                            "summary_error_code": tool_extra.get("summary_error_code"),
+                            "error_message": error_message,
+                            "attempt": 1,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to update post-call tool history",
+                        call_id=call_id, tool=tool_name, exc_info=True,
+                    )
+
+        # Write `pending` placeholders BEFORE scheduling tasks. This way the
+        # row reflects what was supposed to run even if the engine dies before
+        # any task completes. Captured `started_at` is the matching key for
+        # the later update_phase_tool call.
+        tool_starts = {}
+        if history_store is not None:
+            for tool in tools_to_run:
+                started_at_iso = datetime.now(timezone.utc).isoformat()
+                tool_starts[tool.definition.name] = started_at_iso
+                try:
+                    await history_store.append_phase_tool(
+                        call_id=call_id,
+                        phase=phase,
+                        record={
+                            "name": tool.definition.name,
+                            "kind": type(tool).__name__,
+                            "phase": phase,
+                            "status": "pending",
+                            "started_at": started_at_iso,
+                            "finished_at": None,
+                            "duration_ms": None,
+                            "attempt": 1,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to record pending post-call tool",
+                        call_id=call_id, tool=tool.definition.name, exc_info=True,
+                    )
+
+        # Create fire-and-forget tasks for all post-call tools
+        for tool in tools_to_run:
+            started_at_iso = tool_starts.get(tool.definition.name) or datetime.now(timezone.utc).isoformat()
+            self._fire_and_forget(
+                run_post_call_tool(tool, started_at_iso),
+                name=f"post-call-{tool.definition.name}-{call_id}"
+            )
+
+        logger.info("Post-call tools fired", call_id=call_id, count=len(tools_to_run))
 
     def _post_call_summary_generator(self):
         """Return the provider-backed summary callback for post-call contexts."""

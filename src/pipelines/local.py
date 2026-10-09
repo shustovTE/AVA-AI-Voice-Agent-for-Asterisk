@@ -16,6 +16,7 @@ import audioop
 from ..audio.resampler import resample_audio
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from uuid import uuid4
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -106,6 +107,10 @@ class _LocalSessionState:
     stopping: bool = False
     receiver_restart_count: int = 0
     last_final_result_ts: float = 0.0
+    # Whether the server decodes whole utterances (``stt_utterance``): True or
+    # False once its ``mode_ready`` or a result said so, None for an older
+    # server that never says.
+    stt_utterances: Optional[bool] = None
 
 
 class _LocalAdapterBase:
@@ -149,7 +154,16 @@ class _LocalAdapterBase:
             await self.close_call(call_id)
         logger.debug("Local adapter stopped", component=self.component_key)
 
-    # validate_connectivity removed - uses smart generic base class implementation
+    async def validate_connectivity(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Probe the address this adapter actually dials.
+
+        The generic validator is handed a pipeline's role options alone, and
+        ``ws_url`` normally lives in the provider block. Without the provider
+        defaults merged in, every check fell back to a hardcoded loopback
+        address and reported a failure on a healthy server.
+        """
+        return await super().validate_connectivity(self._compose_options(options or {}))
+
 
     async def open_call(self, call_id: str, options: Dict[str, Any]) -> None:
         if self._closed:
@@ -255,6 +269,10 @@ class _LocalAdapterBase:
             for key in ("segment_energy_threshold", "segment_silence_ms"):
                 if merged.get(key) is not None:
                     set_mode_payload[key] = merged[key]
+            if bool(merged.get("utterances")):
+                # The engine cuts the utterances with its own VAD and sends
+                # each one whole (``stt_utterance``); nothing streams.
+                set_mode_payload["stt_segmenter"] = "client"
         elif mode == "tts":
             output_encoding, output_rate = _tts_output_contract(merged)
             set_mode_payload["output_encoding"] = output_encoding
@@ -316,7 +334,9 @@ class _LocalAdapterBase:
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         merged = _merge_dicts(dict(self._provider_defaults or {}), self._pipeline_defaults)
         merged = _merge_dicts(merged, runtime_options)
-        merged.setdefault("ws_url", merged.get("ws_url") or _DEFAULT_WS_URL)
+        # Assignment, not setdefault: the key is present but null whenever the
+        # provider block clears it, and setdefault would leave that null in place.
+        merged["ws_url"] = merged.get("ws_url") or _DEFAULT_WS_URL
         merged.setdefault("connect_timeout_sec", merged.get("connect_timeout_sec", 5.0))
         merged.setdefault("response_timeout_sec", merged.get("response_timeout_sec", 5.0))
         merged.setdefault("mode", merged.get("mode", self._default_mode))
@@ -533,6 +553,8 @@ class _LocalAdapterBase:
             ack_call_id = message.get("call_id")
             if ack_call_id:
                 session.call_id = ack_call_id
+            if "stt_utterances" in message:
+                session.stt_utterances = bool(message.get("stt_utterances"))
             session.handshake_complete = True
             logger.info(
                 "Local adapter handshake complete",
@@ -608,6 +630,13 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
     """# Milestone7: STT adapter backed by the local AI server."""
 
     supports_streaming = True
+    # The server decodes a whole utterance cut by the engine's VAD (``stt_utterance``).
+    supports_utterances = True
+    # Recognizers that hand back a result only when a phrase ends (GigaAM / NeMo through onnx-asr
+    # behind the Silero VAD gate, the T-one streaming CTC pipeline): the buffered path sends 160 ms
+    # chunks and waits for a final per chunk, so it stalls for the whole response timeout each time
+    # and the dialog never receives a transcript. The engine keeps such a provider streaming.
+    STREAMING_ONLY_BACKENDS = frozenset({"onnx_asr", "tone"})
 
     def __init__(
         self,
@@ -624,6 +653,11 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             default_mode="stt",
         )
         self._resample_states: Dict[str, Optional[tuple]] = {}
+
+    def requires_streaming(self, options: Optional[Dict[str, Any]] = None) -> bool:
+        """True when the configured local STT backend cannot serve the buffered (chunked) path."""
+        backend = (options or {}).get("stt_backend") or self._provider_defaults.get("stt_backend") or ""
+        return str(backend).strip().lower() in self.STREAMING_ONLY_BACKENDS
 
     async def start_stream(
         self,
@@ -768,6 +802,84 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             pcm16_bytes=len(pcm16),
         )
 
+    def utterances_supported(self, call_id: str) -> Optional[bool]:
+        """Whether this call's server takes ``stt_utterance``; None until it has said."""
+        session = self._sessions.get(call_id)
+        return session.stt_utterances if session is not None else None
+
+    async def send_utterance(
+        self,
+        call_id: str,
+        audio: bytes,
+        *,
+        sample_rate_hz: int = 16000,
+        utterance_id: Optional[str] = None,
+        fmt: str = "pcm16_16k",
+    ) -> None:
+        """Send one whole caller utterance for the server to decode as it is.
+
+        The engine's Silero VAD cut it (``vad.silero_stt_utterances``), so the
+        server skips its own voice activity detection and answers with one
+        final ``stt_result`` that carries the ``utterance_id`` back.
+        """
+        if not audio:
+            return
+        session = self._sessions.get(call_id)
+        if not session or session.send_lock is None:
+            logger.debug(
+                "STT session not found for utterance; dropping it",
+                component=self.component_key,
+                call_id=call_id,
+                utterance_id=utterance_id,
+            )
+            return
+        self._ensure_stream_receiver(session, session.options, reason="utterance_send")
+        pcm16 = self._to_pcm16_16k(audio, fmt, call_id=call_id)
+        if not pcm16:
+            return
+        payload: Dict[str, Any] = {
+            "type": "stt_utterance",
+            "mode": "stt",
+            "call_id": call_id,
+            "rate": 16000,
+            "format": "pcm16le",
+            "data": base64.b64encode(pcm16).decode("ascii"),
+            "duration_ms": int(len(pcm16) / 2.0 / 16.0),
+        }
+        if utterance_id:
+            payload["utterance_id"] = str(utterance_id)
+        try:
+            async with session.send_lock:
+                await self._send_json_with_retry(call_id, payload, session.options)
+            active_session = self._sessions.get(call_id)
+            if active_session is not None:
+                self._ensure_stream_receiver(
+                    active_session, active_session.options, reason="session_reconnect"
+                )
+        except (ConnectionClosed, ConnectionClosedError) as exc:
+            logger.warning(
+                "STT utterance send hit a closed connection; the utterance is lost",
+                component=self.component_key,
+                call_id=call_id,
+                error=str(exc),
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "STT utterance send failed",
+                component=self.component_key,
+                call_id=call_id,
+                error=str(exc),
+            )
+            return
+        logger.debug(
+            "STT utterance sent to local-ai-server",
+            component=self.component_key,
+            call_id=call_id,
+            utterance_id=utterance_id,
+            pcm16_bytes=len(pcm16),
+        )
+
     async def iter_results(self, call_id: str) -> AsyncIterator[str]:
         session = self._sessions.get(call_id)
         if not session or session.result_queue is None:
@@ -859,6 +971,22 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     continue
                 if message.get("type") != "stt_result":
                     continue
+                error = str(message.get("error") or "").strip()
+                if error:
+                    if error == "utterances_unsupported":
+                        # The server takes only a stream: the engine falls back to
+                        # streaming each utterance with a closing silence.
+                        session.stt_utterances = False
+                    logger.warning(
+                        "Local STT result carries an error",
+                        component=self.component_key,
+                        call_id=session.call_id,
+                        error=error,
+                        utterance_id=message.get("utterance_id"),
+                    )
+                    continue
+                if "stt_utterances" in message:
+                    session.stt_utterances = bool(message.get("stt_utterances"))
                 if message.get("is_partial", False):
                     logger.debug(
                         "Local STT partial received",
@@ -873,7 +1001,9 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     "Local STT final received by adapter",
                     component=self.component_key,
                     call_id=session.call_id,
+                    transcript_chars=len(text),
                     transcript_preview=text[:80],
+                    transcript_tail=text[-40:] if len(text) > 80 else None,
                     receiver_restart_count=session.receiver_restart_count,
                 )
                 try:
@@ -1047,12 +1177,14 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
             call_id=call_id,
             transcript_preview=(transcript or "")[:80],
         )
+        request_id = f"llm-{uuid4().hex}"
         payload = {
             "type": "llm_request",
             "call_id": call_id,
             "mode": "llm",
             "text": transcript,
             "context": context.get("messages") or context,
+            "request_id": request_id,
         }
 
         # Use retry logic for LLM send
@@ -1107,6 +1239,16 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
                     continue
                 if message.get("type") != "llm_response":
                     continue
+                answered = message.get("request_id")
+                if answered and str(answered) != request_id:
+                    # The answer to a request this call cancelled: not ours.
+                    logger.debug(
+                        "Stale local LLM response skipped",
+                        component=self.component_key,
+                        call_id=call_id,
+                        request_id=answered,
+                    )
+                    continue
 
                 response = message.get("text", "").strip()
                 latency_ms = (time.perf_counter() - started_at) * 1000.0
@@ -1127,6 +1269,35 @@ class LocalLLMAdapter(_LocalAdapterBase, LLMComponent):
                 exc_info=True,
             )
             return LLMResponse(text="")
+
+    async def cancel_generation(self, call_id: str) -> None:
+        """Stop the server generating an answer this call no longer wants.
+
+        The engine cancels its wait when the caller goes on talking before the
+        reply; the server keeps generating until told, and its late answer is
+        skipped by the request id. Best effort: a closed session is fine.
+        """
+        session = self._sessions.get(call_id)
+        if not session or session.websocket.state.name != "OPEN":
+            return
+        try:
+            await self._send_json(
+                session,
+                {
+                    "type": "barge_in",
+                    "call_id": call_id,
+                    "reason": "superseded",
+                    "rollback_assistant": False,
+                    "request_id": f"cancel-{uuid4().hex}",
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Local LLM cancel failed",
+                component=self.component_key,
+                call_id=call_id,
+                exc_info=True,
+            )
 
     async def generate_stream(
         self,

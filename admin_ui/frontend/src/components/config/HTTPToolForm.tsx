@@ -36,7 +36,32 @@ interface ToolParameter {
     type: string;
     description: string;
     required: boolean;
+    /** Allowed values: the schema the LLM sees carries them as a JSON `enum`. */
+    enum?: string[];
+    /** Editor-only draft of the comma-separated values; never saved. */
+    enum_text?: string;
 }
+
+const isEnumParameter = (param: ToolParameter) =>
+    param.enum_text !== undefined || Array.isArray(param.enum);
+
+const parseEnumText = (text: string) =>
+    Array.from(
+        new Set(
+            text
+                .split(',')
+                .map(value => value.trim())
+                .filter(Boolean)
+        )
+    );
+
+/** What gets saved: the draft text becomes the `enum` list; an empty list means a plain string. */
+const normalizeParameters = (params: ToolParameter[] | undefined) =>
+    params?.map(param => {
+        const { enum_text, enum: values, ...rest } = param;
+        const allowed = enum_text !== undefined ? parseEnumText(enum_text) : values || [];
+        return allowed.length > 0 ? { ...rest, enum: allowed } : rest;
+    });
 
 interface HTTPToolConfig {
     kind: string;
@@ -58,6 +83,10 @@ interface HTTPToolConfig {
     summary_provider?: string;
     summary_timeout_ms?: number;
     summary_prompt?: string;
+    // Post-call: also send for an outbound attempt that never became a call
+    // (no answer, busy, rejected originate, answering machine, consent
+    // declined). The engine's default is true.
+    send_on_failed_dial?: boolean;
     // In-call specific fields
     description?: string;
     parameters?: ToolParameter[];
@@ -274,6 +303,7 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
             summary_max_words: phase === 'post_call' ? 100 : undefined,
             summary_timeout_ms: phase === 'post_call' ? 15000 : undefined,
             summary_prompt: phase === 'post_call' ? DEFAULT_SUMMARY_PROMPT : undefined,
+            send_on_failed_dial: phase === 'post_call' ? true : undefined,
             // In-call specific fields
             description: phase === 'in_call' ? '' : undefined,
             parameters: phase === 'in_call' ? [] : undefined,
@@ -355,7 +385,11 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
             }
         }
 
-        const { key, ...data } = committedToolForm;
+        const { key, ...rawData } = committedToolForm;
+        const data =
+            rawData.parameters !== undefined
+                ? { ...rawData, parameters: normalizeParameters(rawData.parameters) }
+                : rawData;
         const updated = { ...config };
 
         if (editingTool !== 'new_tool' && editingTool !== key) {
@@ -1184,15 +1218,22 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                                     />
                                                     <select
                                                         className={editorSmallInputClass}
-                                                        value={param.type}
+                                                        aria-label={`Parameter ${idx + 1} type`}
+                                                        value={isEnumParameter(param) ? 'enum' : param.type}
                                                         onChange={e => {
                                                             const params = [
                                                                 ...(toolForm.parameters || []),
                                                             ];
-                                                            params[idx] = {
-                                                                ...params[idx],
-                                                                type: e.target.value,
-                                                            };
+                                                            const { enum: _values, enum_text: _text, ...rest } =
+                                                                params[idx];
+                                                            params[idx] =
+                                                                e.target.value === 'enum'
+                                                                    ? {
+                                                                          ...rest,
+                                                                          type: 'string',
+                                                                          enum_text: (params[idx].enum || []).join(', '),
+                                                                      }
+                                                                    : { ...rest, type: e.target.value };
                                                             setToolForm({
                                                                 ...toolForm,
                                                                 parameters: params,
@@ -1202,6 +1243,7 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                                         <option value="string">string</option>
                                                         <option value="number">number</option>
                                                         <option value="boolean">boolean</option>
+                                                        <option value="enum">enum (one of a list)</option>
                                                     </select>
                                                     <input
                                                         className={`${editorSmallInputClass} col-span-2`}
@@ -1221,6 +1263,27 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                                             });
                                                         }}
                                                     />
+                                                    {isEnumParameter(param) && (
+                                                        <input
+                                                            className={`${editorSmallInputClass} col-span-4`}
+                                                            placeholder="Allowed values, comma-separated (e.g., morning, afternoon, evening)"
+                                                            title="The LLM must pick one of these values; the engine rejects any other. Sent to the LLM as the parameter's enum. With no values the parameter is saved as a plain string."
+                                                            value={param.enum_text ?? (param.enum || []).join(', ')}
+                                                            onChange={e => {
+                                                                const params = [
+                                                                    ...(toolForm.parameters || []),
+                                                                ];
+                                                                params[idx] = {
+                                                                    ...params[idx],
+                                                                    enum_text: e.target.value,
+                                                                };
+                                                                setToolForm({
+                                                                    ...toolForm,
+                                                                    parameters: params,
+                                                                });
+                                                            }}
+                                                        />
+                                                    )}
                                                 </div>
                                                 <label className="flex items-center gap-1 text-xs">
                                                     <input
@@ -1656,6 +1719,19 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                     {/* Post-call specific: Payload Template + Summary */}
                     {phase === 'post_call' && (
                         <>
+                            <div className="border border-border rounded-lg p-3 bg-card/30">
+                                <FormSwitch
+                                    label="Send for Failed Outbound Dials"
+                                    description="Also send this webhook when an outbound dial never reaches the agent (no answer, busy, rejected, answering machine, consent declined). Same payload: {call_outcome} names the result, {error_message} the reason, {attempt_id} the attempt; the transcript is empty and {call_duration} is 0. Off: only calls the agent actually had."
+                                    checked={toolForm.send_on_failed_dial ?? true}
+                                    onChange={e =>
+                                        setToolForm({
+                                            ...toolForm,
+                                            send_on_failed_dial: e.target.checked,
+                                        })
+                                    }
+                                />
+                            </div>
                             <div className="border border-border rounded-lg p-3 bg-card/30">
                                 <FormSwitch
                                     label="Generate AI Summary"

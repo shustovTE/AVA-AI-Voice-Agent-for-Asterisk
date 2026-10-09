@@ -73,3 +73,102 @@ def test_agent_without_override_inherits_global_markers():
     ]["end_call"]
     assert markers == ["goodbye"]
     assert session.hangup_marker_policy["source"] == "global"
+
+
+def _farewell_policy(flag=True, markers=None):
+    return {
+        "mode": "normal",
+        "hangup_on_assistant_farewell": flag,
+        "markers": {"assistant_farewell": markers or ["до свидания"]},
+    }
+
+
+def _farewell_engine(policy):
+    from unittest.mock import AsyncMock, Mock
+
+    engine = Engine.__new__(Engine)
+    engine._tool_config_for_session = lambda session: {
+        "tools": {"hangup_call": {"policy": policy}}
+    }
+    engine.session_store = SimpleNamespace(upsert_call=AsyncMock())
+    engine._schedule_terminal_fallback = Mock()
+    return engine
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_assistant_farewell_marker_hangs_up_after_audio():
+    engine = _farewell_engine(_farewell_policy())
+    session = SimpleNamespace(cleanup_after_tts=False)
+
+    await engine._maybe_hangup_on_assistant_farewell(
+        "call-1", session, "Понял вас, извините за беспокойство. До свидания."
+    )
+
+    assert session.cleanup_after_tts is True
+    engine.session_store.upsert_call.assert_awaited_once_with(session)
+    engine._schedule_terminal_fallback.assert_called_once()
+    kwargs = engine._schedule_terminal_fallback.call_args.kwargs
+    assert kwargs["reason"] == "assistant_farewell_marker"
+    assert kwargs["call_outcome"] == "agent_hangup"
+
+
+@pytest.mark.asyncio
+async def test_assistant_farewell_requires_policy_opt_in():
+    engine = _farewell_engine(_farewell_policy(flag=False))
+    session = SimpleNamespace(cleanup_after_tts=False)
+
+    await engine._maybe_hangup_on_assistant_farewell(
+        "call-1", session, "До свидания."
+    )
+
+    assert session.cleanup_after_tts is False
+    engine._schedule_terminal_fallback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_assistant_farewell_ignores_mid_sentence_mentions():
+    engine = _farewell_engine(_farewell_policy())
+    session = SimpleNamespace(cleanup_after_tts=False)
+
+    await engine._maybe_hangup_on_assistant_farewell(
+        "call-1",
+        session,
+        "До свидания скажу в самом конце, а пока давайте обсудим смету и сроки ремонта",
+    )
+
+    assert session.cleanup_after_tts is False
+    engine._schedule_terminal_fallback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_assistant_farewell_does_not_double_schedule():
+    engine = _farewell_engine(_farewell_policy())
+    session = SimpleNamespace(cleanup_after_tts=True)
+
+    await engine._maybe_hangup_on_assistant_farewell(
+        "call-1", session, "До свидания."
+    )
+
+    engine._schedule_terminal_fallback.assert_not_called()
+    engine.session_store.upsert_call.assert_not_awaited()
+
+
+def test_pipeline_farewell_without_tool_honors_assistant_farewell_flag():
+    policy = _farewell_policy()
+
+    # Flag on: the agent's own farewell is sufficient, no caller end intent.
+    assert Engine._is_pipeline_farewell_without_tool(
+        "что?",
+        "Хорошо, тогда всего доброго. До свидания.",
+        policy,
+    )
+
+    # Flag off: the legacy pairing rule still applies.
+    assert not Engine._is_pipeline_farewell_without_tool(
+        "что?",
+        "Хорошо, тогда всего доброго. До свидания.",
+        _farewell_policy(flag=False),
+    )

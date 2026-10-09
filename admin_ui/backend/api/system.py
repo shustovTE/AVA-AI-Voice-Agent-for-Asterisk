@@ -86,6 +86,26 @@ def _is_truthy_env(value: Optional[str]) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+_COMPOSE_FILE = "docker-compose.yml"
+_COMPOSE_EXAMPLE_FILE = "docker-compose.example.yml"
+
+
+def _base_compose_file(project_root: Optional[str] = None) -> str:
+    """The operator's docker-compose.yml when it exists, else the tracked template it is copied from."""
+    root = project_root or os.getenv("PROJECT_ROOT", "/app/project")
+    if os.path.exists(os.path.join(root, _COMPOSE_FILE)):
+        return _COMPOSE_FILE
+    if os.path.exists(os.path.join(root, _COMPOSE_EXAMPLE_FILE)):
+        return _COMPOSE_EXAMPLE_FILE
+    return _COMPOSE_FILE
+
+
+def _base_compose_flags(project_root: Optional[str] = None) -> List[str]:
+    """`-f` flags a plain `docker compose` needs: none while docker-compose.yml is there to be auto-discovered."""
+    base = _base_compose_file(project_root)
+    return [] if base == _COMPOSE_FILE else ["-f", base]
+
+
 def _compose_files_flags_for_service(service_name: str) -> str:
     """
     Return compose file flags for service operations.
@@ -100,13 +120,15 @@ def _compose_files_flags_for_service(service_name: str) -> str:
         "admin-ui": "admin_ui",
     }.get(service_name, service_name)
 
+    project_root = os.getenv("PROJECT_ROOT", "/app/project")
+    base_flags = " ".join(_base_compose_flags(project_root))
+
     if svc != "local_ai_server":
-        return ""
+        return base_flags
 
     if not _is_truthy_env(_dotenv_value("GPU_AVAILABLE")):
-        return ""
+        return base_flags
 
-    project_root = os.getenv("PROJECT_ROOT", "/app/project")
     gpu_compose = os.path.join(project_root, "docker-compose.gpu.yml")
     if not os.path.exists(gpu_compose):
         logger.warning(
@@ -114,9 +136,9 @@ def _compose_files_flags_for_service(service_name: str) -> str:
             _sanitize_for_log(gpu_compose),
             _sanitize_for_log(svc),
         )
-        return ""
+        return base_flags
 
-    return "-f docker-compose.yml -f docker-compose.gpu.yml"
+    return f"-f {_base_compose_file(project_root)} -f docker-compose.gpu.yml"
 
 
 def _compose_files_flags_for_recovery(
@@ -130,8 +152,9 @@ def _compose_files_flags_for_recovery(
         "ai-engine": "ai_engine",
         "admin-ui": "admin_ui",
     }.get(service_name, service_name)
+    base_flag = f"-f {_base_compose_file(project_root)}"
     if svc != "local_ai_server":
-        return "-f docker-compose.yml"
+        return base_flag
 
     previous_values = {}
     for entry in previous_environment:
@@ -139,7 +162,7 @@ def _compose_files_flags_for_recovery(
         if separator:
             previous_values[key] = value
 
-    flags = "-f docker-compose.yml"
+    flags = base_flag
     if not _is_truthy_env(previous_values.get("GPU_AVAILABLE")):
         return flags
 
@@ -3372,7 +3395,7 @@ async def start_containers(action: ContainerAction = None):
     import subprocess
     project_root = os.getenv("PROJECT_ROOT", "/app/project")
     
-    cmd = ["docker", "compose", "up", "-d"]
+    cmd = ["docker", "compose", *_base_compose_flags(project_root), "up", "-d"]
     if action and action.containers:
         cmd.extend(action.containers)
     
@@ -3392,7 +3415,7 @@ async def stop_containers(action: ContainerAction = None):
     import subprocess
     project_root = os.getenv("PROJECT_ROOT", "/app/project")
     
-    cmd = ["docker", "compose", "stop"]
+    cmd = ["docker", "compose", *_base_compose_flags(), "stop"]
     if action and action.containers:
         cmd.extend(action.containers)
     
@@ -3414,9 +3437,9 @@ async def restart_all_containers():
     
     try:
         # Stop
-        subprocess.run(["docker", "compose", "stop"], cwd=project_root, timeout=60)
+        subprocess.run(["docker", "compose", *_base_compose_flags(project_root), "stop"], cwd=project_root, timeout=60)
         # Start
-        result = subprocess.run(["docker", "compose", "up", "-d"], cwd=project_root, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(["docker", "compose", *_base_compose_flags(project_root), "up", "-d"], cwd=project_root, capture_output=True, text=True, timeout=120)
         return {
             "success": result.returncode == 0,
             "output": result.stdout or result.stderr

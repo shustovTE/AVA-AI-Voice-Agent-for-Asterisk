@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS agents (
     notes TEXT,
     email_recipient TEXT,
     email_from TEXT,
-    email_enabled INTEGER             -- tri-state: NULL=inherit, 0=off, 1=on
+    email_enabled INTEGER,            -- tri-state: NULL=inherit, 0=off, 1=on
+    lead_context_enabled INTEGER      -- tri-state: NULL=default (on), 0=off, 1=on
 );
 CREATE INDEX IF NOT EXISTS idx_agents_slug ON agents(slug);
 CREATE INDEX IF NOT EXISTS idx_agents_mgmt ON agents(is_operator_managed);
@@ -57,7 +58,7 @@ class AgentsStore:
                "greeting","prompt","tools_json","tool_configs_json","hangup_policy_json","mcp_json","audio_profile","extra_json",
                "is_operator_managed","is_active","is_default","source_file",
                "created_at","updated_at","notes",
-               "email_recipient","email_from","email_enabled"]
+               "email_recipient","email_from","email_enabled","lead_context_enabled"]
 
     def __init__(self, db_path: str = None):
         # Honor AGENTS_DB_PATH so a relocated DB is written/read consistently with
@@ -99,12 +100,14 @@ class AgentsStore:
                     self.conn.execute("ALTER TABLE agents ADD COLUMN tool_configs_json TEXT")
                 if "hangup_policy_json" not in existing:
                     self.conn.execute("ALTER TABLE agents ADD COLUMN hangup_policy_json TEXT")
+                if "lead_context_enabled" not in existing:
+                    self.conn.execute("ALTER TABLE agents ADD COLUMN lead_context_enabled INTEGER")
         except sqlite3.Error as exc:
             migration_error = exc
 
         required = {
             "email_recipient", "email_from", "email_enabled",
-            "tool_configs_json", "hangup_policy_json",
+            "tool_configs_json", "hangup_policy_json", "lead_context_enabled",
         }
         actual = {
             str(r[1]) for r in self.conn.execute("PRAGMA table_info(agents)").fetchall()
@@ -209,7 +212,8 @@ class AgentsStore:
                role_label=None, voice=None, greeting=None, tools_json=None,
                tool_configs_json=None, hangup_policy_json=None, mcp_json=None, audio_profile=None, extra_json=None,
                is_operator_managed=1, source_file=None, notes=None,
-               email_recipient=None, email_from=None, email_enabled=None) -> dict:
+               email_recipient=None, email_from=None, email_enabled=None,
+               lead_context_enabled=None) -> dict:
         slug = slug or slugify(display_name)
         if not slug or not _SLUG_RE.sub("", slug) == slug:
             raise ValueError(f"invalid slug: {slug!r}")
@@ -222,12 +226,12 @@ class AgentsStore:
                 """INSERT INTO agents (id,slug,display_name,extension,role_label,provider,
                    voice,greeting,prompt,tools_json,tool_configs_json,hangup_policy_json,mcp_json,audio_profile,extra_json,
                    is_operator_managed,is_active,is_default,source_file,created_at,updated_at,notes,
-                   email_recipient,email_from,email_enabled)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,?,?,?,?,?,?,?)""",
+                   email_recipient,email_from,email_enabled,lead_context_enabled)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,?,?,?,?,?,?,?,?)""",
                 (str(uuid.uuid4()), slug, display_name, extension, role_label, provider,
                  voice, greeting, prompt, tools_json, tool_configs_json, hangup_policy_json, mcp_json, audio_profile, extra_json,
                  is_operator_managed, source_file, now, now, notes,
-                 email_recipient, email_from, email_enabled))
+                 email_recipient, email_from, email_enabled, lead_context_enabled))
         self._ensure_default_invariant()
         return self.get_by_slug(slug)
 

@@ -45,6 +45,10 @@ class PlaybackRef:
     media_uri: str
     audio_file: str
     timestamp: float = field(default_factory=time.time)
+    # How long the audio should take to play. Lets a PlaybackFinished that
+    # arrives before the audio could possibly have played be recognised as
+    # spurious instead of reopening the caller's microphone mid-prompt.
+    expected_duration_sec: Optional[float] = None
 
 
 @dataclass
@@ -131,7 +135,7 @@ class CallSession:
     cleanup_after_tts: bool = False
     cleanup_in_progress: bool = False
     cleanup_completed: bool = False
-    call_outcome: str = ""  # caller_hangup | agent_hangup | transferred | no_input_timeout
+    call_outcome: str = ""  # caller_hangup | agent_hangup | transferred | no_input_timeout | max_duration
     pending_local_channel_id: Optional[str] = None
     pending_external_media_id: Optional[str] = None
     ssrc: Optional[int] = None
@@ -205,6 +209,10 @@ class CallSession:
     outbound_lead_id: Optional[str] = None
     outbound_attempt_id: Optional[str] = None
     outbound_custom_vars: Dict[str, Any] = field(default_factory=dict)
+    # The identity the call was placed from (the lead's Caller ID override or
+    # the global outbound extension) and which of the two it was: "lead" or "global".
+    outbound_caller_id: Optional[str] = None
+    outbound_caller_id_source: Optional[str] = None
 
     # External dialer ownership (VICIdial Remote Agent integration).
     # These are call-local snapshots so an operator edit cannot change the

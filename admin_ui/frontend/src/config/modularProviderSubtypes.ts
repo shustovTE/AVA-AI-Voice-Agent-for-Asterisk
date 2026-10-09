@@ -9,10 +9,10 @@
 export interface SubtypeField {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'combobox' | 'password';
+  type: 'text' | 'number' | 'combobox' | 'password' | 'boolean';
   required?: boolean;
   placeholder?: string;
-  default?: string | number;
+  default?: string | number | boolean;
   suggestions?: string[];
   tooltip?: string;
 }
@@ -43,6 +43,9 @@ const LLM_SUBTYPES: ProviderSubtype[] = [
       { key: 'temperature', label: 'Temperature', type: 'number', required: false, default: 0.7 },
       { key: 'max_tokens', label: 'Max Tokens', type: 'number', required: false, default: 200 },
       { key: 'response_timeout_sec', label: 'Response Timeout (sec)', type: 'number', required: false, default: 15, tooltip: 'Max wait time for LLM response. Increase for complex prompts or slow endpoints.' },
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes this LLM\'s Chat Completions requests, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the adapter instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional, works with or without a proxy. How long an idle connection to the endpoint is kept for reuse; empty keeps the 15 second default. One request is made per caller turn, and the pause between turns usually exceeds 15 seconds, so the default pays a fresh TCP+TLS handshake almost every reply. A window of 120-300 outlasts a turn; the log then shows connection=reused.' },
+      { key: 'warm_up', label: 'Warm Up Prompt', type: 'boolean', required: false, tooltip: 'Optional, off by default. While the greeting plays, sends one 1-token request with the call\'s prompt, tools and greeting through the same connection the replies will use, so the first reply finds the TLS connection open and the prompt prefix cached on endpoints with prefix caching (vLLM, OpenAI, Mistral). Each call opens its own connection, so without it the first reply pays a handshake and a full prompt prefill. On a metered API it costs one extra prompt per call. The log shows LLM prompt warm-up completed, then connection=reused on the first reply.' },
     ],
   },
   {
@@ -56,6 +59,9 @@ const LLM_SUBTYPES: ProviderSubtype[] = [
       { key: 'temperature', label: 'Temperature', type: 'number', required: false, default: 0.3 },
       { key: 'max_tokens', label: 'Max Tokens', type: 'number', required: false, default: 200 },
       { key: 'response_timeout_sec', label: 'Response Timeout (sec)', type: 'number', required: false, default: 30, tooltip: 'Max wait time for a DeepSeek response.' },
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes this LLM\'s Chat Completions requests, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the adapter instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional, works with or without a proxy. How long an idle connection to the endpoint is kept for reuse; empty keeps the 15 second default. One request is made per caller turn, and the pause between turns usually exceeds 15 seconds, so the default pays a fresh TCP+TLS handshake almost every reply. A window of 120-300 outlasts a turn; the log then shows connection=reused.' },
+      { key: 'warm_up', label: 'Warm Up Prompt', type: 'boolean', required: false, tooltip: 'Optional, off by default. While the greeting plays, sends one 1-token request with the call\'s prompt, tools and greeting through the same connection the replies will use, so the first reply finds the TLS connection open and the prompt prefix cached on endpoints with prefix caching (vLLM, OpenAI, Mistral). Each call opens its own connection, so without it the first reply pays a handshake and a full prompt prefill. On a metered API it costs one extra prompt per call. The log shows LLM prompt warm-up completed, then connection=reused on the first reply.' },
     ],
   },
   {
@@ -165,13 +171,22 @@ const STT_SUBTYPES: ProviderSubtype[] = [
   {
     id: 'local',
     label: 'Local AI Server',
-    description: 'STT running inside the local-ai-server container (Vosk, Sherpa, Kroko, Faster-Whisper)',
+    description: 'STT running inside the local-ai-server container (Vosk, Sherpa, Kroko, Faster-Whisper, Whisper.cpp, T-one, GigaAM v3 / NeMo via onnx-asr)',
     yamlType: 'local',
     fields: [
       { key: 'ws_url', label: 'WebSocket URL', type: 'text', required: true, default: 'ws://127.0.0.1:8765', placeholder: 'ws://127.0.0.1:8765' },
       { key: 'auth_token', label: 'Auth Token', type: 'password', required: false },
-      { key: 'stt_backend', label: 'STT Backend', type: 'combobox', required: false, default: 'vosk', suggestions: ['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp'] },
+      { key: 'stt_backend', label: 'STT Backend', type: 'combobox', required: false, default: 'vosk', suggestions: ['vosk', 'sherpa', 'kroko', 'faster_whisper', 'whisper_cpp', 'tone', 'onnx_asr'] },
       { key: 'chunk_ms', label: 'Chunk Size (ms)', type: 'number', required: false, default: 320 },
+      {
+        key: 'stt_input_resampler',
+        label: 'Input Upsampler (8 → 16 kHz)',
+        type: 'combobox',
+        required: false,
+        default: 'fir',
+        suggestions: ['fir', 'linear'],
+        tooltip: 'How 8 kHz caller audio is brought to the 16 kHz the recognizer decodes: fir (polyphase windowed-sinc, flat telephone band, no spectral images; recommended) or linear (the previous interpolation, which mirrors the band above 4 kHz).',
+      },
     ],
   },
 ];
@@ -198,8 +213,12 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
       { key: 'tts_base_url', label: 'TTS API Base URL', type: 'text', required: false, default: 'https://api.openai.com/v1/audio/speech' },
       { key: 'tts_model', label: 'Model', type: 'combobox', required: false, default: 'tts-1', suggestions: ['tts-1', 'tts-1-hd', 'gpt-4o-mini-tts'] },
       { key: 'voice', label: 'Voice', type: 'combobox', required: false, default: 'alloy', suggestions: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer'] },
+      { key: 'tts_response_format', label: 'Response Format', type: 'combobox', required: false, default: 'wav', suggestions: ['wav', 'pcm'], tooltip: 'The response_format the endpoint is asked for. wav carries its sample rate in a header; pcm is headerless and is read at the PCM Sample Rate below (Fish Speech S2-Pro on vLLM-Omni: pcm at 44100).' },
       { key: 'api_key', label: 'API Key', type: 'password', required: true, placeholder: '${OPENAI_API_KEY}' },
       OUTPUT_RESAMPLER_FIELD,
+      { key: 'tts_streaming', label: 'Stream Reply', type: 'boolean', required: false, tooltip: 'Optional, off by default. Sends stream: true and plays the reply while it is still being generated, so the caller waits for the first frames of a sentence instead of the whole sentence. For self-hosted OpenAI-compatible endpoints such as vLLM-Omni; only pcm and wav bodies are understood.' },
+      { key: 'tts_pcm_sample_rate_hz', label: 'PCM Sample Rate (Hz)', type: 'number', required: false, default: 24000, tooltip: 'Rate of a pcm response, which carries no header: OpenAI 24000, Fish Speech S2-Pro on vLLM-Omni 44100. A wav response is read from its header.' },
+      { key: 'tts_text_prefix', label: 'Text Prefix', type: 'text', required: false, placeholder: '<|speaker:0|>', tooltip: 'Optional. Put in front of the text of every request unless already there, e.g. the <|speaker:0|> tag that keeps Fish Speech on the reference voice. Extra request-body fields (stream_format, extra_params) are set in YAML as tts_extra_body.' },
     ],
   },
   {
@@ -223,8 +242,10 @@ const TTS_SUBTYPES: ProviderSubtype[] = [
       { key: 'api_key', label: 'API Key', type: 'password', required: true, placeholder: '${ELEVENLABS_API_KEY}' },
       { key: 'voice_id', label: 'Voice ID', type: 'text', required: false, default: '21m00Tcm4TlvDq8ikWAM', placeholder: 'Rachel voice ID' },
       { key: 'model_id', label: 'Model', type: 'combobox', required: false, default: 'eleven_turbo_v2_5', suggestions: ['eleven_turbo_v2_5', 'eleven_multilingual_v2', 'eleven_monolingual_v1'] },
-      { key: 'output_format', label: 'Output Format', type: 'combobox', required: false, default: 'ulaw_8000', suggestions: ['ulaw_8000', 'pcm_16000', 'pcm_24000', 'mp3_44100'] },
+      { key: 'output_format', label: 'Output Format', type: 'combobox', required: false, default: 'ulaw_8000', suggestions: ['ulaw_8000', 'alaw_8000', 'pcm_8000', 'pcm_16000', 'pcm_22050', 'pcm_24000', 'pcm_32000', 'pcm_44100', 'pcm_48000'], tooltip: 'Format requested from ElevenLabs. The engine decodes the raw formats only: 16-bit PCM at any rate the API offers (pcm_44100 needs the Pro tier), and the 8 kHz telephony codecs ulaw_8000 and alaw_8000; mp3 and opus are refused because the engine ships no decoder. ulaw_8000 or pcm_8000 suits an 8 kHz call; a wideband (16 kHz) call is switched to pcm_16000 automatically when an 8 kHz format is set. A rate other than the call\'s is resampled by the engine, which turns streaming off for that provider.' },
       OUTPUT_RESAMPLER_FIELD,
+      { key: 'proxy', label: 'HTTP Proxy', type: 'text', required: false, placeholder: 'http://xray:8080', tooltip: 'Optional. Routes ElevenLabs traffic, and nothing else, through an HTTP proxy such as a local Xray or 3x-ui HTTP inbound. Empty means a direct connection. Only http:// and https:// work, because SOCKS is not supported. Credentials may be written inline as http://user:pass@host:port and are never logged. A malformed value fails the call instead of quietly connecting directly.' },
+      { key: 'keepalive_timeout_sec', label: 'Keepalive Timeout (sec)', type: 'number', required: false, placeholder: '15', tooltip: 'Optional. How long an idle connection to ElevenLabs is kept for reuse; empty keeps the 15 second default. Audio streams one sentence at a time, so a dropped connection makes the next sentence pay a fresh TLS handshake, and through a proxy that costs several extra round trips. A window of 60-180 outlasts a caller pause.' },
     ],
   },
   {

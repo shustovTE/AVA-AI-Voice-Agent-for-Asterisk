@@ -43,6 +43,7 @@ export interface Agent {
     email_recipient?: string;
     email_from?: string;
     email_enabled?: boolean | null;
+    lead_context_enabled?: boolean | null;
 }
 
 interface AgentTemplate {
@@ -81,6 +82,8 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
     const [emailFrom, setEmailFrom] = useState('');
     // Tri-state as a select value: '' = inherit (null), 'enabled' = true, 'disabled' = false.
     const [emailEnabled, setEmailEnabled] = useState('');
+    // Outbound '## Lead Context' block toggle; a NULL/legacy row means "on".
+    const [leadContextEnabled, setLeadContextEnabled] = useState(true);
 
     // Tool/engine config — single source of truth, round-tripped losslessly via the helper.
     const [toolState, setToolState] = useState<AgentToolState>(() => parseAgentConfig(null));
@@ -150,6 +153,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
             setEmailEnabled(
                 agent.email_enabled == null ? '' : (agent.email_enabled ? 'enabled' : 'disabled'),
             );
+            setLeadContextEnabled(agent.lead_context_enabled !== false);
             setToolState(parseAgentConfig(agent));
         } else {
             setDisplayName('');
@@ -166,6 +170,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
             setEmailRecipient('');
             setEmailFrom('');
             setEmailEnabled('');
+            setLeadContextEnabled(true);
             setToolState(parseAgentConfig(null));
             setSelectedTemplate('');
         }
@@ -363,6 +368,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                 // Tri-state: '' means inherit — send explicit null (PATCH clears the column),
                 // never false. 'enabled' -> true, 'disabled' -> false.
                 email_enabled: emailEnabled === '' ? null : emailEnabled === 'enabled',
+                lead_context_enabled: leadContextEnabled,
             };
 
             if (isNew) {
@@ -414,7 +420,7 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
     };
 
     const updateNoInputNumberOverride = (
-        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins',
+        key: 'initial_timeout_sec' | 'grace_timeout_sec' | 'max_check_ins' | 'stall_timeout_sec' | 'max_call_duration_sec',
         raw: string,
         minimum: number,
         maximum: number,
@@ -696,6 +702,30 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                     />
                 </div>
 
+                <div className="mb-4 flex items-center justify-between p-3 border border-border rounded-lg bg-card/50">
+                    <div>
+                        <div className="flex items-center gap-1.5">
+                            <label htmlFor="agent-lead-context-enabled" className="text-sm font-medium">
+                                Lead Context block
+                            </label>
+                            <HelpTooltip content="Outbound campaigns append the lead's custom variables to the prompt as a read-only '## Lead Context' JSON block. Custom variables are always available as {variable} placeholders in the prompt and greeting; turn the block off when the placeholders already cover them and the block would only duplicate data." />
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1">
+                            Append outbound lead custom variables after the prompt.
+                        </p>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                            id="agent-lead-context-enabled"
+                            type="checkbox"
+                            className="sr-only peer"
+                            checked={leadContextEnabled}
+                            onChange={(e) => setLeadContextEnabled(e.target.checked)}
+                        />
+                        <div className="w-9 h-5 bg-muted peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-ring rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-background after:border-border after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                    </label>
+                </div>
+
                 <div className="mb-4">
                     <FormLabel htmlFor="agent-notes" tooltip="Internal notes about this agent — not used at runtime.">
                         Notes
@@ -814,6 +844,28 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                             onChange={(e) => updateNoInputOverride('final_message', e.target.value)}
                             tooltip="Spoken immediately before the engine ends an inactive call."
                         />
+                        <FormInput
+                            id="agent-no-input-stall"
+                            label="Stall Timeout (sec)"
+                            type="number"
+                            min="0"
+                            max="7200"
+                            value={noInputNumber('stall_timeout_sec')}
+                            placeholder="Inherit global stall timeout"
+                            onChange={(e) => updateNoInputNumberOverride('stall_timeout_sec', e.target.value, 0, 7200)}
+                            tooltip="Hang up once nothing has been exchanged for this long, whatever the line carries (hold music, noise, an IVR). Runs for inbound and outbound calls alike; 0 disables it for this agent."
+                        />
+                        <FormInput
+                            id="agent-no-input-max-duration"
+                            label="Max Call Duration (sec)"
+                            type="number"
+                            min="0"
+                            max="86400"
+                            value={noInputNumber('max_call_duration_sec')}
+                            placeholder="Inherit global max call duration"
+                            onChange={(e) => updateNoInputNumberOverride('max_call_duration_sec', e.target.value, 0, 86400)}
+                            tooltip="Hard cap on a call's length counted from its start; the engine hangs up when it is reached whatever the call is doing. Runs for inbound and outbound calls alike; 0 disables it for this agent."
+                        />
                     </div>
                 </details>
 
@@ -924,6 +976,53 @@ const AgentForm: React.FC<AgentFormProps> = ({ isOpen, onClose, onSaved, agent }
                                         Use them only for Agents whose workflow treats that answer as terminal.
                                     </p>
                                 )}
+                            </div>
+                        )}
+                        <div className="flex items-center justify-between gap-4 pt-1">
+                            <div>
+                                <div className="flex items-center gap-1.5">
+                                    <label htmlFor="agent-hangup-on-farewell" className="text-sm font-medium">
+                                        Hang up on assistant farewell
+                                    </label>
+                                    <HelpTooltip content="Ends the call after the AGENT itself speaks one of the Assistant Farewell Markers at the end of an utterance (e.g. «До свидания»). The farewell audio finishes playing first. A caller who interrupts the farewell (barge-in) cancels the hangup and the conversation goes on. A safety net for providers whose platform-side agent does not reliably end the call itself." />
+                                </div>
+                                <p className="text-xs text-muted-foreground mt-1">
+                                    Off by default; matching only at the end of the agent's utterance.
+                                </p>
+                            </div>
+                            <label className="relative inline-flex items-center cursor-pointer">
+                                <input
+                                    id="agent-hangup-on-farewell"
+                                    type="checkbox"
+                                    className="sr-only peer"
+                                    checked={toolState.hangupOnAssistantFarewell}
+                                    onChange={(e) => setToolState((state) => ({
+                                        ...state,
+                                        hangupOnAssistantFarewell: e.target.checked,
+                                    }))}
+                                />
+                                <div className="w-9 h-5 bg-muted peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-ring rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-background after:border-border after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                            </label>
+                        </div>
+                        {toolState.hangupMarkerStrategy !== 'inherit' && toolState.hangupOnAssistantFarewell && (
+                            <div>
+                                <FormLabel
+                                    htmlFor="agent-hangup-farewell-markers"
+                                    tooltip="One phrase per line. Extend adds to the global farewell list, Replace makes this list authoritative. Leave empty to keep the global list («до свидания», «всего доброго», goodbye…)."
+                                >
+                                    Assistant Farewell Markers
+                                </FormLabel>
+                                <textarea
+                                    id="agent-hangup-farewell-markers"
+                                    value={toolState.hangupFarewellMarkers.join('\n')}
+                                    onChange={(e) => setToolState((state) => ({
+                                        ...state,
+                                        hangupFarewellMarkers: e.target.value.split('\n'),
+                                    }))}
+                                    rows={4}
+                                    placeholder={'до свидания\nвсего доброго'}
+                                    className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring resize-y"
+                                />
                             </div>
                         )}
                     </div>

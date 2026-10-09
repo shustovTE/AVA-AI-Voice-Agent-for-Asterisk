@@ -482,6 +482,55 @@ const StreamingPage = () => {
                 </ConfigCard>
             </ConfigSection>
 
+            <ConfigSection title="Interrupted Replies" description="What the conversation history keeps when the caller interrupts a pipeline reply or hangs up.">
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <FormSwitch
+                            label="Keep only the heard part of an interrupted reply"
+                            description="Estimate what the caller heard from the audio that had reached the transport when the barge-in cut the stream: whole sentences plus a proportional prefix of the cut one, marked with an ellipsis. Off: the whole reply (or the sentences queued so far) stays in the history as if it had been spoken."
+                            checked={streamingConfig.pipeline_heard_reply_on_interrupt ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_heard_reply_on_interrupt', e.target.checked)}
+                            tooltip="Pipelines with streaming playback (Downstream Mode: stream). The LLM then sees only what was said; call summaries and post-call webhooks carry the same text."
+                        />
+                        <FormInput
+                            label="Heard-audio lead (ms)"
+                            type="number"
+                            value={streamingConfig.pipeline_heard_reply_lead_ms ?? 200}
+                            onChange={(e) => updateStreamingConfig('pipeline_heard_reply_lead_ms', parseInt(e.target.value))}
+                            tooltip="Audio already sent to the transport but not yet heard when the caller spoke (jitter buffer, network, the caller's reaction). Subtracted from the played position; raise it if the history keeps words the caller did not hear."
+                        />
+                        <FormSwitch
+                            label="Discard a reply the caller talks over before its first sound"
+                            description="Pipelines with Silero VAD: when the caller goes on talking after their turn was released and before the reply's first sound has reached them, the reply is dropped (the LLM request is cancelled, no TTS is requested, an unplayed stream is stopped) and their words are answered together with what they say next, as one turn. Off: caller audio is discarded while the reply is generated and until its first sound reaches the transport. These words are not queued for another answer. Once playback starts, the normal barge-in protection applies."
+                            checked={streamingConfig.pipeline_discard_unheard_reply ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_discard_unheard_reply', e.target.checked)}
+                            tooltip="A turn released on a pause the caller only took to breathe no longer costs a reply to half a sentence. Counted until the first bytes of the reply reach the transport; after that the reply is the caller's to interrupt (Barge-In page)."
+                        />
+                        <FormSwitch
+                            label="Continue a reply cut off by an unintelligible interruption"
+                            description="Pipelines with Silero VAD cutting the caller's utterances: when the speech that interrupted a reply comes back from the recognizer empty (a cough, noise), the model is asked, with the heard part in front of it, to go on from where it stopped. The continuation joins the heard part in the history; the request leaves no trace. Off: the reply stays cut off until the caller says something the recognizer understands."
+                            checked={streamingConfig.pipeline_continue_reply_after_empty_interrupt ?? true}
+                            onChange={(e) => updateStreamingConfig('pipeline_continue_reply_after_empty_interrupt', e.target.checked)}
+                            tooltip="At most two continuations in a row; a third interruption that comes to nothing leaves the reply cut off. The caller speaking before the continuation's first sound discards it, as with any reply, and their words are answered on their own."
+                        />
+                        <FormInput
+                            label="Continuation request"
+                            value={streamingConfig.pipeline_continue_reply_prompt ?? ''}
+                            onChange={(e) => updateStreamingConfig('pipeline_continue_reply_prompt', e.target.value)}
+                            placeholder="(The caller interrupted you, but nothing intelligible was said. Continue your previous reply from where it was cut off, without repeating what you already said. If none of it was heard, say it again.)"
+                            tooltip="Sent to the model in place of a caller turn when a reply is continued; never stored in the history. Blank uses the built-in text shown as the placeholder."
+                        />
+                        <FormInput
+                            label="Last words after hangup (ms)"
+                            type="number"
+                            value={streamingConfig.pipeline_hangup_final_wait_ms ?? 1500}
+                            onChange={(e) => updateStreamingConfig('pipeline_hangup_final_wait_ms', parseInt(e.target.value))}
+                            tooltip="When the caller hangs up right after speaking, the recognizer still holds their words (GigaAM v3 and Sherpa offline return a phrase only after 700 ms of silence). The call's cleanup feeds the recognizer its closing silence and waits up to this long for the result, which is recorded as the caller's last turn with no LLM reply; results the dialog was still holding for the end of the turn are recorded too. 0 turns the wait off."
+                        />
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
             <ConfigSection title="Diagnostics" description="Tools for debugging audio stream issues.">
                 <ConfigCard>
                     <div className="space-y-6">

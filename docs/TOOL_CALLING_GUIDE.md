@@ -556,13 +556,19 @@ in_call_tools:
         type: string
         description: "Time in HH:MM format"
         required: true
+      - name: slot
+        type: string
+        description: "Preferred part of the day"
+        enum: [morning, afternoon, evening]   # the AI must pick one; anything else is rejected
+        required: false
     body_template: |
       {
         "customer_id": "{customer_id}",
         "date": "{date}",
-        "time": "{time}"
+        "time": "{time}",
+        "slot": "{slot}"
       }
-    return_raw_json: false
+    return_raw_json: false   # true: the model receives the whole response JSON instead of the extracted variables
     output_variables:
       available: "data.available"
       next_slot: "data.next_available_slot"
@@ -591,7 +597,7 @@ In-call HTTP tools have access to three types of variables:
 
 1. **Context variables** (auto-injected): `{caller_number}`, `{called_number}`, `{call_id}`, etc.
 2. **Pre-call variables** (from pre-call HTTP lookups): `{customer_id}`, `{customer_name}`, etc.
-3. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool
+3. **AI parameters** (provided at runtime): Whatever the AI passes when invoking the tool. A parameter with `enum` is advertised to the LLM with exactly those allowed values (the Admin UI offers it as the `enum` type, values comma-separated), and a call with any other value is rejected before the request is made.
 
 This means you can use data fetched by pre-call tools in your in-call tool requests. For example, if a pre-call lookup fetches `customer_id`, you can use `{customer_id}` in the in-call tool's body template.
 
@@ -768,7 +774,8 @@ Existing webhook definitions that enable summaries but omit `summary_provider` k
 | `{provider}` | string | AI provider (deepgram, openai_realtime, etc.) |
 | `{call_direction}` | string | "inbound" or "outbound" |
 | `{call_duration}` | number | Duration in seconds |
-| `{call_outcome}` | string | Outcome (completed, transferred, etc.) |
+| `{call_outcome}` | string | Outcome (completed, transferred, etc.; for an outbound dial that never became a call, the attempt outcome: `no_answer`, `busy`, `voicemail_dropped`, …, see below) |
+| `{error_message}` | string | Why the call or the dial failed: the session error, the originate error or the hangup cause (`User busy`); empty otherwise |
 | `{call_start_time}` | string | ISO timestamp |
 | `{call_end_time}` | string | ISO timestamp |
 | `{transcript_json}` | JSON | Full conversation as JSON array |
@@ -776,8 +783,49 @@ Existing webhook definitions that enable summaries but omit `summary_provider` k
 | `{summary_json}` | JSON | AI-generated summary as a JSON string (safe for unquoted insertion) |
 | `{campaign_id}` | string | Outbound campaign ID |
 | `{lead_id}` | string | Outbound lead ID |
+| `{attempt_id}` | string | Outbound dial attempt ID (the attempt shown in Call Scheduling); empty for inbound calls |
+| `{custom_vars_json}` | JSON | The outbound lead's `custom_vars` object; each key is also its own `{placeholder}` |
+| `{caller_id}` | string | The identity an outbound call was placed from, what became `CALLERID(num)`: the lead's Caller ID override or the global outbound extension; empty for inbound calls |
+| `{caller_id_source}` | string | `lead` when `{caller_id}` is the lead's override, `global` when it is the configured extension; empty for inbound calls |
 
 **Note**: `{transcript_json}` is inserted as raw JSON (not quoted), so place it directly in the template without quotes.
+
+`{call_id}`, `{caller_number}`, `{called_number}`, `{caller_name}`, `{context_name}`, `{provider}`, `{call_direction}`, `{campaign_id}`, `{lead_id}`, `{attempt_id}`, `{caller_id}` and `{caller_id_source}` are also substituted in the URL and in header values.
+
+### Outbound Dials That Never Became a Call
+
+Post-call tools used to run only from a call's cleanup, which needs a call session, so an outbound attempt that was rejected by Asterisk, rang out, met a busy line, an answering machine or a declined consent finished in the scheduler and told nobody. Every finished outbound attempt now reaches the post-call webhooks exactly once: an answered call through its normal cleanup, everything else the moment the attempt is finalized. The same webhooks run (the global ones and the ones the lead's Agent lists under `post_call_tools`, minus its `disable_global_post_call_tools`) with the same `payload_template` and the same variables; only the values differ:
+
+| Variable | Value for a dial that never became a call |
+|----------|-------------------------------------------|
+| `{call_id}` | The Asterisk channel id when one was created, otherwise the attempt id |
+| `{attempt_id}` | The attempt id |
+| `{call_outcome}` | `no_answer`, `busy`, `congestion`, `chanunavail`, `canceled`, `error`, `voicemail_dropped`, `machine_detected`, `consent_denied`, `consent_timeout` |
+| `{error_message}` | The originate error or the hangup cause text (`User busy`, `No answer`); empty for an answering machine or a declined consent |
+| `{caller_number}`, `{called_number}` | The lead's number, as for an answered outbound call |
+| `{caller_name}` | The lead's name, or `Outbound <number>` |
+| `{call_direction}` | `outbound` |
+| `{call_duration}` | `0` |
+| `{call_start_time}`, `{call_end_time}` | When the dial was placed and when the attempt was finalized |
+| `{transcript_json}`, `{tool_calls_json}`, `{pre_call_results_json}` | `[]`, `[]`, `{}` |
+| `{summary}`, `{summary_json}` | Empty; `generate_summary` is skipped on an empty transcript |
+| `{campaign_id}`, `{lead_id}`, `{custom_vars_json}` and each custom variable | The lead's, as for an answered call |
+| `{context_name}`, `{provider}` | The lead's Agent and its provider (or the default provider) |
+| `{caller_id}`, `{caller_id_source}` | The identity the dial was placed from, as for an answered call |
+
+Branch on `{call_outcome}` in the receiving automation (an n8n Switch node, for example) where unanswered dials need different handling from conversations. A webhook that must only see conversations opts out:
+
+```yaml
+tools:
+  crm_note:
+    kind: generic_webhook
+    phase: post_call
+    is_global: true
+    url: "https://crm.example.com/notes"
+    send_on_failed_dial: false   # only calls the agent actually had
+```
+
+The switch is **Send for Failed Outbound Dials** in the webhook editor and `send_on_failed_dial` in the managed tools API. These reports are not written to Call History, since there is no call record to attach them to; the engine logs `Executing post-call tools for outbound attempt without a call` with the attempt, the outcome and the tools, then the usual `Post-call tool completed` line per tool. An attempt finalized by the startup cleanup after an engine restart has no metadata left and is not reported.
 
 ### Post-Call Example Configurations
 
@@ -1024,6 +1072,20 @@ tools:
     enabled: true
     require_confirmation: false        # Don't ask "shall I hang up?"
     farewell_message: "Thank you for calling. Goodbye!"
+    # false: the tool has no farewell_message parameter at all. The LLM says
+    # goodbye in its reply, the tool only marks the call and the engine ends
+    # it once that reply has been heard, so nothing is spoken twice. The
+    # farewell_message default above applies only when true.
+    farewell_message_enabled: true
+    # Optional: the text the LLM sees for this tool, in the language of your
+    # prompts. It is sent with every request as the function description, so
+    # say when to end the call and where the goodbye sentence goes (the engine
+    # speaks farewell_message itself after the tool runs, so a goodbye in the
+    # reply text as well is heard twice). Empty keeps the built-in English text.
+    # Any built-in tool takes the same two keys under tools.<name>.
+    description: "Завершить звонок. Вызывай, когда абонент попрощался или подтвердил, что вопросов больше нет. Прощальную фразу передай в farewell_message, а текст ответа оставь пустым: фразу произнесёт инструмент."
+    parameter_descriptions:
+      farewell_message: "Прощальная фраза, которую агент произнесёт перед завершением звонка."
     # Global end-of-call intent markers remain the default for every Agent.
     # Agents can inherit, extend, or replace them in:
     # Admin UI → Agents → Edit Agent → Tools → Hangup Guardrail.

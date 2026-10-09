@@ -45,6 +45,10 @@ const ProvidersPage: React.FC = () => {
     const [editingProvider, setEditingProvider] = useState<string | null>(null);
     const editingProviderRef = useRef<string | null>(null);
     const [providerForm, setProviderForm] = useState<any>({});
+    // Keys the operator removed while editing. A save merges the form over
+    // the saved provider (to preserve settings the form cannot represent),
+    // which would otherwise resurrect exactly the keys just deleted.
+    const [removedProviderKeys, setRemovedProviderKeys] = useState<string[]>([]);
     const [isNewProvider, setIsNewProvider] = useState(false);
     const [testingProvider, setTestingProvider] = useState<string | null>(null);
     const [testResults, setTestResults] = useState<{ [key: string]: { success: boolean; message: string } | undefined }>({});
@@ -121,6 +125,7 @@ const ProvidersPage: React.FC = () => {
             const providerData = refreshed.providers?.[resetProvider];
             if (providerData) {
                 setProviderForm({ ...providerData, name: resetProvider });
+                setRemovedProviderKeys([]);
             }
         }
     };
@@ -229,6 +234,7 @@ const ProvidersPage: React.FC = () => {
         }
 
         setProviderForm({ ...providerData, name });
+        setRemovedProviderKeys([]);
         setIsNewProvider(false);
     };
 
@@ -241,6 +247,7 @@ const ProvidersPage: React.FC = () => {
             enabled: true,
             base_url: ''
         });
+        setRemovedProviderKeys([]);
         setIsNewProvider(true);
     };
 
@@ -649,6 +656,13 @@ const ProvidersPage: React.FC = () => {
 
         const existingData = !isNewProvider && editingProvider ? (config.providers?.[editingProvider] || {}) : {};
         let providerData = { ...existingData, ...providerForm, name: finalName, capabilities };
+        // Deleting a field has to survive the merge above, or the saved provider
+        // keeps sending it (an unknown key reaches an OpenAI-compatible endpoint
+        // verbatim and can fail the request with 422).
+        removedProviderKeys.forEach((key) => {
+            if (key in providerForm) return;
+            delete providerData[key];
+        });
         if (fullAgentKind === 'openai_realtime') {
             // Normalize again at the persistence boundary. Async form updates
             // (for example credential operations) can otherwise reintroduce a
@@ -771,7 +785,7 @@ const ProvidersPage: React.FC = () => {
         // the prior path and a later form Save would write that stale
         // reference back to YAML, pointing at a file that was just removed.
         // (Reported in PR #395 review.)
-        const updateForm = (newValues: any) =>
+        const updateForm = (newValues: any) => {
             setProviderForm((prev: any) => {
                 const next: any = { ...prev };
                 for (const [k, v] of Object.entries(newValues)) {
@@ -780,6 +794,22 @@ const ProvidersPage: React.FC = () => {
                 }
                 return next;
             });
+            const removed = Object.entries(newValues)
+                .filter(([, v]) => v === undefined)
+                .map(([k]) => k);
+            const restored = Object.entries(newValues)
+                .filter(([, v]) => v !== undefined)
+                .map(([k]) => k);
+            if (removed.length || restored.length) {
+                setRemovedProviderKeys((prev) => {
+                    const next = new Set(prev);
+                    removed.forEach((key) => next.add(key));
+                    // Re-adding a key by hand cancels its pending removal.
+                    restored.forEach((key) => next.delete(key));
+                    return Array.from(next);
+                });
+            }
+        };
 
         // Check provider name for specific forms, fallback to type
         const providerName = (providerForm.name || '').toLowerCase();

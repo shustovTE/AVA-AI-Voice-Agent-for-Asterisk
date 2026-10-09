@@ -12,6 +12,7 @@ ARG INCLUDE_SHERPA=true
 ARG INCLUDE_FASTER_WHISPER=false
 ARG INCLUDE_WHISPER_CPP=false
 ARG INCLUDE_TONE=false
+ARG INCLUDE_ONNX_ASR=false
 ARG INCLUDE_PIPER=true
 ARG INCLUDE_KOKORO=true
 ARG INCLUDE_MELOTTS=false
@@ -51,7 +52,8 @@ RUN if [ "$INCLUDE_VOSK" = "true" ]; then \
         pip install --no-cache-dir vosk==0.3.45; \
     fi
 
-RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
+# sherpa-onnx also provides the Silero VAD gate of the onnx_asr backend, so INCLUDE_ONNX_ASR=true pulls it in.
+RUN if [ "$INCLUDE_SHERPA" = "true" ] || [ "$INCLUDE_ONNX_ASR" = "true" ]; then \
         echo "📦 Installing Sherpa-ONNX STT..." && \
         SHERPA_REQUIREMENT="$(grep -m 1 '^sherpa-onnx==' requirements.txt || true)"; \
         if [ -z "$SHERPA_REQUIREMENT" ]; then \
@@ -76,6 +78,19 @@ RUN if [ "$INCLUDE_WHISPER_CPP" = "true" ]; then \
 RUN if [ "$INCLUDE_TONE" = "true" ]; then \
         echo "📦 Installing T-one STT..." && \
         pip install --no-cache-dir "git+https://github.com/voicekit-team/T-one.git@3c5b6c015038173840e62cea99e10cdb1c759116#egg=tone"; \
+    fi
+
+# onnx-asr: GigaAM v3 / NeMo FastConformer RU offline STT (ONNX Runtime, models fetched from Hugging Face).
+# The pin lives in requirements.txt; the extra picks the CPU onnxruntime and the hub downloader.
+RUN if [ "$INCLUDE_ONNX_ASR" = "true" ]; then \
+        echo "📦 Installing onnx-asr STT (GigaAM v3 / NeMo)..." && \
+        ONNX_ASR_REQUIREMENT="$(grep -m 1 '^onnx-asr==' requirements.txt || true)"; \
+        if [ -z "$ONNX_ASR_REQUIREMENT" ]; then \
+            echo "❌ INCLUDE_ONNX_ASR=true but requirements.txt has no onnx-asr entry" >&2; \
+            exit 1; \
+        fi; \
+        ONNX_ASR_SPEC="$(printf '%s' "$ONNX_ASR_REQUIREMENT" | sed 's/^onnx-asr==/onnx-asr[cpu,hub]==/')"; \
+        pip install --no-cache-dir "$ONNX_ASR_SPEC"; \
     fi
 
 RUN if [ "$INCLUDE_PIPER" = "true" ]; then \

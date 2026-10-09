@@ -6,8 +6,8 @@ regardless of which AI provider they're used with.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import Dict, Any, List, Mapping, Optional
 from enum import Enum
 import logging
 
@@ -316,6 +316,15 @@ class Tool(ABC):
         """
         pass
     
+    def configure(self, config: Mapping[str, Any]) -> None:
+        """Receive the tool's ``tools.<name>`` block before any schema is built.
+
+        Built-in tools are registered as bare classes, so this is how a
+        setting that shapes the definition (which parameters exist, for
+        instance) reaches the instance. The default takes nothing.
+        """
+        return None
+
     async def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         """
         Validate parameters before execution.
@@ -359,6 +368,69 @@ class Tool(ABC):
         except Exception as e:
             logger.warning(f"Failed to load config for {self.definition.name}: {e}")
             return {}
+
+
+class DescribedTool(Tool):
+    """A registered tool whose LLM-facing texts come from configuration.
+
+    The schema every request advertises is built from ``definition``, so an
+    operator who wants a tool described in the language of their prompts, or
+    with rules that fit their scenario, needs that text to come from
+    ``tools.<name>`` rather than from the code. This wrapper answers
+    ``definition`` with the wrapped tool's, the description and the named
+    parameter descriptions replaced; everything else, execution included, is
+    the wrapped tool's own.
+    """
+
+    def __init__(
+        self,
+        tool: Tool,
+        *,
+        description: Optional[str] = None,
+        parameter_descriptions: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self._tool = tool
+        self._description = description or None
+        self._parameter_descriptions = dict(parameter_descriptions or {})
+
+    @property
+    def wrapped(self) -> Tool:
+        return self._tool
+
+    @property
+    def definition(self) -> ToolDefinition:
+        base = self._tool.definition
+        parameters = [
+            replace(parameter, description=self._parameter_descriptions[parameter.name])
+            if parameter.name in self._parameter_descriptions
+            else parameter
+            for parameter in base.parameters
+        ]
+        return replace(
+            base,
+            description=self._description or base.description,
+            parameters=parameters,
+        )
+
+    async def execute(
+        self,
+        parameters: Dict[str, Any],
+        context: 'ToolExecutionContext'
+    ) -> Dict[str, Any]:
+        return await self._tool.execute(parameters, context)
+
+    async def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
+        return await self._tool.validate_parameters(parameters)
+
+    def configure(self, config: Mapping[str, Any]) -> None:
+        self._tool.configure(config)
+
+    def __getattr__(self, name: str) -> Any:
+        # Tool-specific helpers the engine may call stay reachable; private
+        # state is never proxied, so a missing attribute cannot recurse.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._tool, name)
 
 
 class PreCallTool(ABC):
@@ -469,6 +541,19 @@ class PostCallTool(ABC):
             - Should complete quickly; long operations should be async
         """
         pass
+
+    def runs_on_failed_dial(self) -> bool:
+        """
+        Whether the tool also runs for an outbound attempt that never became a call.
+
+        A rejected originate, a ring-out, a busy line, an answering machine or
+        a declined consent has no call session, no transcript and no duration.
+        The engine still builds a PostCallContext for it from the attempt (the
+        lead, the campaign, ``call_outcome``, ``error_message``,
+        ``attempt_id``) and runs the post-call tools that answer True here.
+        Tools stay out of it unless they opt in.
+        """
+        return False
 
     def get_last_result(self, call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """

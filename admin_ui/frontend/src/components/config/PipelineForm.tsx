@@ -35,7 +35,7 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     const [statusLoading, setStatusLoading] = useState(false);
     const [showAdvancedSTT, setShowAdvancedSTT] = useState(false);
     const [showLlmExpert, setShowLlmExpert] = useState<boolean>(
-        () => config?.options?.llm?.tools_enabled !== undefined || Boolean(config?.options?.llm?.realtime_model) || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined
+        () => config?.options?.llm?.tools_enabled !== undefined || Boolean(config?.options?.llm?.realtime_model)
     );
     const [showSttExpert, setShowSttExpert] = useState<boolean>(
         () => (Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
@@ -70,10 +70,10 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     }, [config]);
 
     useEffect(() => {
-        if (config?.options?.llm?.tools_enabled !== undefined || config?.options?.llm?.realtime_model || config?.options?.llm?.aggregation_min_words !== undefined || config?.options?.llm?.aggregation_min_chars !== undefined) {
+        if (config?.options?.llm?.tools_enabled !== undefined || config?.options?.llm?.realtime_model) {
             setShowLlmExpert(true);
         }
-    }, [config?.options?.llm?.tools_enabled, config?.options?.llm?.realtime_model, config?.options?.llm?.aggregation_min_words, config?.options?.llm?.aggregation_min_chars]);
+    }, [config?.options?.llm?.tools_enabled, config?.options?.llm?.realtime_model]);
 
     useEffect(() => {
         if ((Array.isArray(config?.options?.stt?.timestamp_granularities) && config.options.stt.timestamp_granularities.length > 0)
@@ -226,6 +226,12 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
     const isOpenAIStt = sttKey.includes('openai');
     const isLocalStt = sttKey.includes('local');
     const isOpenAILlm = llmKey.includes('openai');
+    // Which end-of-turn fields apply depends on the resolved source: the
+    // silence window only ends a turn measured from results ("final"), the
+    // grace and the result wait only follow a speech detector.
+    const endOfTurnSource = String(localConfig.options?.llm?.end_of_turn_source ?? '');
+    const endOfTurnDetector = endOfTurnSource === 'vad' || endOfTurnSource === 'talk_detect';
+    const endOfTurnFinal = endOfTurnSource === 'final';
     const isOpenAITts = ttsKey.includes('openai');
     const isGroqStt = sttKey.includes('groq');
     const isGroqTts = ttsKey.includes('groq');
@@ -433,6 +439,105 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
             </div>
 
             <div className="space-y-4 border-t border-border pt-6">
+                <div className="space-y-3 border border-border rounded-lg p-4">
+                    <div>
+                        <h4 className="text-sm font-medium text-foreground">End of Turn</h4>
+                        <p className="text-xs text-muted-foreground">
+                            Streaming STT returns a result only after its own silence gate, so a window measured from the result cannot bridge a caller who pauses and goes on. A speech detector can decide the turn instead: it is held while the detector hears the caller and released a short grace after they go quiet. The pause a caller may take is then the detector's own stop window, tuned where the detector lives: Silero VAD on the VAD page (Stop ms), Asterisk TALK_DETECT under Barge-In (talk-detect silence). The silence window below only applies without a detector.
+                        </p>
+                        {endOfTurnSource === '' && (
+                            <p className="text-xs text-muted-foreground">
+                                Auto: Silero VAD when it is enabled on the VAD page, else Asterisk talk detection when TALK_DETECT is enabled for pipelines, else the silence window. Every <code>Caller turn ended on silence</code> log line names the source that decided it.
+                            </p>
+                        )}
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <FormInput
+                            label="Silence Window (ms)"
+                            type="number"
+                            min={0}
+                            step={50}
+                            value={localConfig.options?.llm?.end_of_turn_silence_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_silence_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_silence_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="700"
+                            tooltip="Without a speech detector: how long after the last STT result the turn is answered. Raise it when callers are cut off mid-sentence; lower it for snappier replies. 0 answers every result immediately. Not used while Silero VAD or talk detection decides the turn; tune their stop window instead."
+                            disabled={endOfTurnDetector}
+                        />
+                        <FormInput
+                            label="Max Wait (ms)"
+                            type="number"
+                            min={0}
+                            step={500}
+                            value={localConfig.options?.llm?.end_of_turn_max_wait_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_max_wait_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_max_wait_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="Off"
+                            tooltip="Hard cap measured from the caller's first result, so someone who never pauses still gets an answer. Empty or 0 disables the cap, which is the default."
+                        />
+                        <FormSelect
+                            label="End of Turn Source"
+                            value={localConfig.options?.llm?.end_of_turn_source ?? ''}
+                            onChange={(e) => {
+                                const v = String(e.target.value || '');
+                                if (!v) {
+                                    const next = { ...(localConfig.options?.llm || {}) };
+                                    delete next.end_of_turn_source;
+                                    setRoleOptions('llm', next);
+                                    return;
+                                }
+                                updateRoleOptions('llm', { end_of_turn_source: v });
+                            }}
+                            tooltip="Auto takes the first detector available: Silero VAD when it is enabled on the VAD page, Asterisk talk detection when TALK_DETECT is enabled for pipelines, the silence window after each result otherwise. Pin one explicitly; a pinned Silero VAD without the model loaded falls back the same way."
+                            options={[
+                                { value: '', label: 'Auto (default)' },
+                                { value: 'vad', label: 'Silero VAD (engine)' },
+                                { value: 'talk_detect', label: 'Asterisk talk detection' },
+                                { value: 'final', label: 'Silence window after each result' },
+                            ]}
+                        />
+                        <FormInput
+                            label="Quiet Grace (ms)"
+                            type="number"
+                            min={0}
+                            step={50}
+                            disabled={endOfTurnFinal}
+                            value={localConfig.options?.llm?.end_of_turn_talk_detect_grace_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_talk_detect_grace_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="250"
+                            tooltip="Added after the detector (Silero VAD or Asterisk talk detection) reports the caller quiet, or after a result that lands while they already are. It is not the pause itself: the pause is the detector's stop window, and this grace lets a result that is about to arrive join the turn. Keep it short enough not to be felt. Only used when a detector decides the end of turn."
+                        />
+                        <FormInput
+                            label="VAD Result Wait (ms)"
+                            type="number"
+                            min={0}
+                            step={100}
+                            disabled={endOfTurnFinal || endOfTurnSource === 'talk_detect'}
+                            value={localConfig.options?.llm?.end_of_turn_vad_final_wait_ms ?? ''}
+                            onChange={(e) => {
+                                const raw = e.target.value;
+                                if (!raw) { updateRoleOptions('llm', { end_of_turn_vad_final_wait_ms: undefined }); return; }
+                                const parsed = parseInt(raw, 10);
+                                if (Number.isFinite(parsed)) { updateRoleOptions('llm', { end_of_turn_vad_final_wait_ms: Math.max(0, parsed) }); }
+                            }}
+                            placeholder="1000"
+                            tooltip="Upper bound only: with Silero VAD the recognizer is told to finalize the moment the caller stops, and the turn waits up to this long for that result before answering without it. The result normally lands within a recognizer round trip, so this adds no delay in the normal case."
+                        />
+                    </div>
+                </div>
                 {(isOpenAILlm || isOllamaLlm) && (
                     <div className="space-y-3 border border-amber-300/40 rounded-lg p-4 bg-amber-500/5">
                         <FormSwitch
@@ -465,38 +570,6 @@ const PipelineForm: React.FC<PipelineFormProps> = ({ config, providers, onChange
                                     disabled={!showLlmExpert}
                                 />
                             )}
-                            <FormInput
-                                label="LLM Min Words Threshold"
-                                type="number"
-                                min={1}
-                                step={1}
-                                value={localConfig.options?.llm?.aggregation_min_words ?? ''}
-                                onChange={(e) => {
-                                    const raw = e.target.value;
-                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_words: undefined }); return; }
-                                    const parsed = parseInt(raw, 10);
-                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_words: Math.max(1, parsed) }); }
-                                }}
-                                placeholder="Auto"
-                                tooltip="Minimum words to wait before sending transcript to LLM."
-                                disabled={!showLlmExpert}
-                            />
-                            <FormInput
-                                label="LLM Min Chars Threshold"
-                                type="number"
-                                min={1}
-                                step={1}
-                                value={localConfig.options?.llm?.aggregation_min_chars ?? ''}
-                                onChange={(e) => {
-                                    const raw = e.target.value;
-                                    if (!raw) { updateRoleOptions('llm', { aggregation_min_chars: undefined }); return; }
-                                    const parsed = parseInt(raw, 10);
-                                    if (Number.isFinite(parsed)) { updateRoleOptions('llm', { aggregation_min_chars: Math.max(1, parsed) }); }
-                                }}
-                                placeholder="Auto"
-                                tooltip="Minimum characters to wait before sending transcript to LLM."
-                                disabled={!showLlmExpert}
-                            />
                         </div>
                         <div className="mt-2 border-t border-amber-300/30 pt-3 space-y-3">
                             <p className="text-xs text-muted-foreground">

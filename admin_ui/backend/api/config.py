@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode, SequenceNode, ScalarNode
@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional, Union
 from urllib.parse import urlparse
 import settings
+from api import engine_relay
 
 PROJECT_SOURCE_ROOT = Path(settings.PROJECT_ROOT)
 if str(PROJECT_SOURCE_ROOT) not in sys.path:
@@ -37,6 +38,12 @@ except ModuleNotFoundError:
     from src.config_apply import classify_config_change
 
 from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
+from src.probes.providers import (
+    SAFE_BASE_URLS as _SAFE_BASE_URLS,
+    probe_provider,
+    safe_base_url as _safe_base_url,
+    url_host as _url_host,
+)
 
 # A11: Maximum number of backups to keep
 MAX_BACKUPS = 5
@@ -584,39 +591,10 @@ def strip_ansi_codes(text: str) -> str:
     """Remove ANSI escape codes from text for clean log files."""
     return ANSI_ESCAPE.sub('', text)
 
-def _url_host(url: str) -> str:
-    try:
-        return (urlparse(str(url)).hostname or "").lower()
-    except Exception:
-        return ""
-
-
-# SECURITY: Hardcoded base URLs for provider validation requests.
-# Maps hostname → canonical base URL.  This prevents SSRF via user-supplied
-# chat_base_url in YAML config by never forwarding the raw user string.
-_SAFE_BASE_URLS: dict[str, str] = {
-    "api.telnyx.com": "https://api.telnyx.com/v2/ai",
-    "api.openai.com": "https://api.openai.com/v1",
-    "api.groq.com": "https://api.groq.com/openai/v1",
-    "openrouter.ai": "https://openrouter.ai/api/v1",
-    "api.deepseek.com": "https://api.deepseek.com/v1",
-    "api.minimax.io": "https://api.minimax.io/v1",
-    "api.minimaxi.com": "https://api.minimaxi.com/v1",
-    "api.anthropic.com": "https://api.anthropic.com/v1",
-    "api.deepgram.com": "https://api.deepgram.com/v1",
-    "api.elevenlabs.io": "https://api.elevenlabs.io/v1",
-    "generativelanguage.googleapis.com": "https://generativelanguage.googleapis.com/v1beta",
-}
-
-
-def _safe_base_url(user_url: str, fallback: str) -> str:
-    """Return a hardcoded base URL for a known provider host, or *fallback*.
-
-    The returned string is NEVER derived from *user_url* — only the hostname
-    is extracted for lookup.  This breaks the CodeQL taint chain.
-    """
-    host = _url_host(user_url)
-    return _SAFE_BASE_URLS.get(host, fallback)
+# The provider probes, and the URL policy that keeps a self-hosted host from
+# being probed with a credential before it is saved, live in
+# src/probes/providers.py: the engine runs them, and this backend runs the
+# same code only when the engine cannot be reached.
 
 
 def _rotate_backups(base_path: str) -> None:
@@ -1780,483 +1758,138 @@ class SmtpTestRequest(BaseModel):
     smtp_tls_verify: Optional[Union[bool, str]] = None
     smtp_timeout_seconds: Optional[Union[float, str]] = None
 
+_PROBE_ORIGIN_NOTES = {
+    "ai_engine": "checked from ai_engine",
+    "admin_ui": (
+        "ai_engine unreachable, checked from the Admin UI container, "
+        "which may not reach endpoints only the engine host sees"
+    ),
+}
+
+
+def _with_probe_origin(result: Dict[str, Any], source: str) -> Dict[str, Any]:
+    """Say where a verdict was produced; the two vantage points differ."""
+    out = dict(result or {})
+    out["source"] = source
+    message = str(out.get("message") or ("Connection successful" if out.get("success") else "Connection failed"))
+    out["message"] = f"{message} ({_PROBE_ORIGIN_NOTES[source]})"
+    return out
+
+
+def _dotenv_overrides() -> Dict[str, str]:
+    """KEY=VALUE pairs of the project .env, quotes stripped.
+
+    The UI edits that file before the containers are recreated, so it carries
+    newer values than this process' environment.
+    """
+    values: Dict[str, str] = {}
+    try:
+        if os.path.exists(settings.ENV_PATH):
+            with open(settings.ENV_PATH, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key, value = key.strip(), value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                        value = value[1:-1]
+                    if key:
+                        values[key] = value
+    except Exception:
+        logger.debug("Could not read .env for the provider probe", exc_info=True)
+    return values
+
+
 @router.post("/providers/test")
 async def test_provider_connection(request: ProviderTestRequest):
-    """Test connection to a provider based on its configuration"""
+    """Test a provider from where the calls are made.
+
+    The probe runs inside ai_engine (``POST /providers/test`` on its health
+    server). In a split deployment this container sits in another network
+    than the engine: an endpoint on the engine host's loopback, or one behind
+    a proxy only that host reaches, is alive for calls and dead from here, so
+    a probe from here was a false alarm. When the engine cannot be reached the
+    same probe runs in this container and the verdict says so.
+    """
+    payload = {"name": request.name, "config": request.config}
+    result = await engine_relay.post_engine_json("/providers/test", payload, timeout=60.0)
+    if result is not None:
+        return _with_probe_origin(result, "ai_engine")
+
     try:
-        import httpx
-        import os
-        
-        # Helper to read API keys from .env file
-        def get_env_key(key_name: str) -> str:
-            """Read API key from .env file"""
-            if os.path.exists(settings.ENV_PATH):
-                with open(settings.ENV_PATH, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith(f"{key_name}="):
-                            value = line.split('=', 1)[1].strip()
-                            # Strip surrounding single or double quotes (common .env convention)
-                            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                                value = value[1:-1]
-                            return value
-            return ''
-        
-        # Helper to substitute environment variables in config values
-        def substitute_env_vars(item):
-            import re
-            if isinstance(item, dict):
-                return {k: substitute_env_vars(v) for k, v in item.items()}
-            elif isinstance(item, list):
-                return [substitute_env_vars(i) for i in item]
-            elif isinstance(item, str):
-                # Match ${VAR} or ${VAR:-default} or ${VAR:=default}
-                # Capture group 1: Var name, Group 2: Default value (optional)
-                pattern = r'\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?:[:=-]([^}]*))?\}'
-                
-                def replace(match):
-                    var_name = match.group(1)
-                    default_value = match.group(2)
-                    # Check .env file FIRST - this has the latest values from UI edits
-                    # The Admin UI container's os.environ may be stale (from container start)
-                    val = get_env_key(var_name)
-                    if val:
-                        return val
-                    # Fall back to os.environ (for vars not in .env or set at container start)
-                    val = os.getenv(var_name)
-                    if val is not None and val != "":
-                        return val
-                    # Then check if we have a default value
-                    if default_value is not None:
-                        return default_value
-                    # If neither, return empty string (standard shell behavior)
-                    return "" 
-                
-                return re.sub(pattern, replace, item)
-            return item
+        saved_providers = (_read_merged_config_dict() or {}).get("providers") or {}
+    except Exception:
+        saved_providers = {}
+    result = await probe_provider(
+        request.name,
+        request.config,
+        saved_providers=saved_providers,
+        env=_dotenv_overrides(),
+    )
+    return _with_probe_origin(result, "admin_ui")
 
-        # Apply substitution to the config
-        provider_config = substitute_env_vars(request.config)
-        provider_name = request.name.lower()
-        # Saved provider instances may keep credentials in owner-only files.
-        # Resolve the key in memory for this verification request without ever
-        # returning it to the browser or writing it back into YAML.
-        if provider_config.get("api_key_file") or provider_config.get("api_key_env"):
-            try:
-                helpers = _provider_instances_module()
-                kind = str(provider_config.get("type") or provider_name.rsplit("_llm", 1)[0]).lower()
-                resolved_key = helpers["resolve_secret_value"](
-                    provider_config,
-                    file_field="api_key_file",
-                    env_field="api_key_env",
-                    inline_field="api_key",
-                    legacy_env_names=_llm_legacy_env_names(provider_name, kind),
-                )
-                if resolved_key:
-                    provider_config["api_key"] = resolved_key
-            except Exception:
-                logger.warning("Provider connection test could not resolve managed API key")
-        
-        # ============================================================
-        # LOCAL PROVIDER - test connection to local_ai_server
-        # ============================================================
-        if 'local' in provider_name or provider_config.get('type') == 'local':
-            import websockets
-            import json
-            
-            # Get WebSocket URL from either base_url or ws_url
-            ws_url = provider_config.get('base_url') or provider_config.get('ws_url') or 'ws://127.0.0.1:8765'
-            # Handle env var format
-            if '${' in ws_url:
-                ws_url = 'ws://127.0.0.1:8765'  # Default fallback
-            
-            try:
-                def _fallback_ws_url(url: str) -> str:
-                    """
-                    In host-networked deployments, `local_ai_server` DNS does not resolve because it is not
-                    a Docker bridge network hostname. Fall back to localhost for best compatibility.
-                    """
-                    try:
-                        if 'local_ai_server' in url:
-                            return url.replace('local_ai_server', '127.0.0.1')
-                    except Exception:
-                        pass
-                    return url
 
-                async def _try_connect(url: str):
-                    async with websockets.connect(url, open_timeout=5.0) as ws:
-                        # Send status request to check models
-                        await ws.send(json.dumps({"type": "status"}))
-                        response = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                        data = json.loads(response)
-                        return data
+_VOICE_SAMPLE_MAX_BYTES = 10 * 1024 * 1024
 
-                try:
-                    data = await _try_connect(ws_url)
-                    effective_url = ws_url
-                except Exception as e:
-                    alt = _fallback_ws_url(ws_url)
-                    if alt != ws_url:
-                        data = await _try_connect(alt)
-                        effective_url = alt
-                    else:
-                        raise e
 
-                if data.get("type") == "status_response" and data.get("status") == "ok":
-                    models = data.get("models", {})
-                    stt_loaded = models.get("stt", {}).get("loaded", False)
-                    llm_loaded = models.get("llm", {}).get("loaded", False)
-                    tts_loaded = models.get("tts", {}).get("loaded", False)
+@router.post("/providers/{name}/voices")
+async def register_provider_voice(
+    name: str,
+    audio_sample: UploadFile = File(...),
+    ref_text: str = Form(...),
+    voice_name: Optional[str] = Form(None),
+    consent: Optional[str] = Form(None),
+):
+    """Register a reference voice on a saved self-hosted speech provider.
 
-                    stt_backend = data.get("stt_backend", "unknown")
-                    tts_backend = data.get("tts_backend", "unknown")
-                    llm_model = models.get("llm", {}).get("path", "").split("/")[-1] if models.get("llm", {}).get("path") else "none"
+    The sample comes from the operator's browser. This backend relays it to
+    the engine (over the network as multipart, or staged into the engine
+    container through the Docker socket), and the engine uploads it to the
+    provider's own ``/audio/voices``; this backend has neither the endpoint's
+    network nor the server's registry.
+    """
+    data = await audio_sample.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The sample file is empty")
+    if len(data) > _VOICE_SAMPLE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The sample is larger than 10 MB, which the speech server refuses")
+    fields: Dict[str, str] = {"ref_text": ref_text}
+    # Called through FastAPI the optional fields are str or None; a direct call
+    # without them carries the Form() marker instead, which is not a value.
+    if isinstance(voice_name, str) and voice_name.strip():
+        fields["name"] = voice_name.strip()
+    if isinstance(consent, str) and consent.strip():
+        fields["consent"] = consent.strip()
+    from urllib.parse import quote
 
-                    status_parts = []
-                    status_parts.append(f"STT: {stt_backend} ✓" if stt_loaded else "STT: not loaded")
-                    status_parts.append(f"LLM: {llm_model} ✓" if llm_loaded else "LLM: not loaded")
-                    status_parts.append(f"TTS: {tts_backend} ✓" if tts_loaded else "TTS: not loaded")
+    result = await engine_relay.post_engine_multipart(
+        f"/providers/{quote(name, safe='')}/voices",
+        fields=fields,
+        sample=(audio_sample.filename or "sample.wav", data, audio_sample.content_type or "application/octet-stream"),
+        timeout=150.0,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AI Engine is not reachable. A voice is registered from the engine host, where the speech server is.",
+        )
+    return result
 
-                    all_loaded = stt_loaded and llm_loaded and tts_loaded
-                    return {
-                        "success": all_loaded,
-                        "message": f"Local AI Server connected ({effective_url}). {' | '.join(status_parts)}",
-                    }
-                return {"success": False, "message": "Local AI Server responded but status invalid"}
-            except Exception as e:
-                logger.debug("Local AI Server validation failed", error=str(e), exc_info=True)
-                return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
-        
-        # ============================================================
-        # ELEVENLABS AGENT - check before other providers
-        # ============================================================
-        if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
-            api_key = get_env_key('ELEVENLABS_API_KEY')
-            if not api_key:
-                return {"success": False, "message": "ELEVENLABS_API_KEY not set in .env file"}
-            
-            async with httpx.AsyncClient() as client:
-                # Use /v1/voices endpoint for validation (works with all API key types)
-                response = await client.get(
-                    "https://api.elevenlabs.io/v1/voices",
-                    headers={"xi-api-key": api_key, "Accept": "application/json"},
-                    timeout=10.0
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    voice_count = len(data.get('voices', []))
-                    return {"success": True, "message": f"Connected to ElevenLabs ({voice_count} voices available)"}
-                return {"success": False, "message": f"ElevenLabs API error: HTTP {response.status_code}"}
-        
-        # ============================================================
-        # OPENAI REALTIME
-        # ============================================================
-        if 'realtime_base_url' in provider_config or 'turn_detection' in provider_config:
-            # OpenAI Realtime
-            api_key = get_env_key('OPENAI_API_KEY')
-            if not api_key:
-                return {"success": False, "message": "OPENAI_API_KEY not set in .env file"}
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10.0
-                )
-                if response.status_code == 200:
-                    return {"success": True, "message": f"Connected to OpenAI (HTTP {response.status_code})"}
-                return {"success": False, "message": f"OpenAI API error: HTTP {response.status_code}"}
 
-        # ============================================================
-        # TELNYX (OpenAI-compatible) - validate /models + a tiny /chat/completions
-        # ============================================================
-        provider_type = str(provider_config.get('type') or '').lower()
-        chat_base_url = (provider_config.get('chat_base_url') or provider_config.get('base_url') or '').rstrip('/')
-        host = _url_host(chat_base_url)
-        is_telnyx = provider_type in ('telnyx', 'telenyx') or ('telnyx' in provider_name) or host == 'api.telnyx.com'
-        if is_telnyx:
-            base_url = _safe_base_url(chat_base_url, 'https://api.telnyx.com/v2/ai')
-            api_key = (
-                str(provider_config.get('api_key') or '').strip()
-                or get_env_key('TELNYX_API_KEY')
-                or os.getenv('TELNYX_API_KEY')
-                or ''
-            )
-            if not api_key:
-                return {"success": False, "message": "TELNYX_API_KEY not set in .env"}
+@router.get("/providers/{name}/voices")
+async def list_provider_voices(name: str):
+    """List the voices the saved provider's speech server knows (registered ones in full)."""
+    from urllib.parse import quote
 
-            # Prefer explicit model config; if unset, use a safe default for testing.
-            model = (provider_config.get('chat_model') or provider_config.get('model') or '').strip()
-            if not model:
-                model = "Qwen/Qwen3-235B-A22B"
+    result = await engine_relay.get_engine_json(f"/providers/{quote(name, safe='')}/voices", timeout=40.0)
+    if result is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AI Engine is not reachable. Voices are listed from the engine host, where the speech server is.",
+        )
+    return result
 
-            api_key_ref = (provider_config.get('api_key_ref') or '').strip()
-            if model.startswith('openai/') and not api_key_ref:
-                return {
-                    "success": False,
-                    "message": "Telnyx external models like openai/* require api_key_ref (Integration Secret identifier).",
-                }
-
-            def _telnyx_error_summary(resp: httpx.Response) -> str:
-                try:
-                    j = resp.json()
-                    if isinstance(j, dict) and isinstance(j.get("errors"), list) and j["errors"]:
-                        e0 = j["errors"][0] if isinstance(j["errors"][0], dict) else {}
-                        code = e0.get("code")
-                        title = e0.get("title")
-                        detail = e0.get("detail")
-                        parts = [p for p in [code, title, detail] if p]
-                        if parts:
-                            return " / ".join(str(p) for p in parts)
-                except Exception:
-                    pass
-                text = (resp.text or "").strip().replace("\n", " ")
-                return text[:180] if text else f"HTTP {resp.status_code}"
-
-            try:
-                async with httpx.AsyncClient(timeout=20.0) as client:
-                    models_resp = await client.get(
-                        f"{base_url}/models",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                    )
-                    if models_resp.status_code != 200:
-                        return {"success": False, "message": f"Telnyx /models failed: {_telnyx_error_summary(models_resp)}"}
-
-                    payload: Dict[str, Any] = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": "You are a test assistant."},
-                            {"role": "user", "content": "Reply with exactly: OK"},
-                        ],
-                        "temperature": 0.0,
-                        "max_tokens": 16,
-                    }
-                    if api_key_ref:
-                        payload["api_key_ref"] = api_key_ref
-
-                    chat_resp = await client.post(
-                        f"{base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json=payload,
-                    )
-                    if chat_resp.status_code == 200:
-                        return {"success": True, "message": f"Connected to Telnyx. Chat completion OK with model: {model}"}
-                    return {"success": False, "message": f"Telnyx chat completion failed: {_telnyx_error_summary(chat_resp)}"}
-            except Exception as e:
-                logger.debug("Telnyx provider validation failed", error=str(e), exc_info=True)
-                return {"success": False, "message": f"Cannot connect to Telnyx at {base_url} (see server logs)"}
-
-        # ============================================================
-        # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.) - validate /models
-        # ============================================================
-        if provider_type == 'openai':
-            chat_base_url = _safe_base_url(
-                provider_config.get('chat_base_url') or '', 'https://api.openai.com/v1'
-            )
-            api_key = provider_config.get('api_key')
-            if not api_key:
-                inferred_env = None
-                host = _url_host(chat_base_url)
-                if 'groq' in provider_name or host == 'api.groq.com':
-                    inferred_env = 'GROQ_API_KEY'
-                elif 'openai' in provider_name or host == 'api.openai.com':
-                    inferred_env = 'OPENAI_API_KEY'
-
-                if inferred_env:
-                    api_key = get_env_key(inferred_env) or os.getenv(inferred_env) or ''
-
-            if not api_key:
-                return {"success": False, "message": "API key missing for OpenAI-compatible provider (set api_key or env var)"}
-
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        f"{chat_base_url}/models",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                        timeout=10.0,
-                    )
-                    if response.status_code == 200:
-                        try:
-                            data = response.json()
-                            models = data.get('data') or []
-                            return {"success": True, "message": f"Connected (OpenAI-compatible). Found {len(models)} models."}
-                        except Exception:
-                            return {"success": True, "message": f"Connected (OpenAI-compatible) (HTTP {response.status_code})"}
-                    if response.status_code == 401:
-                        return {"success": False, "message": "Invalid API key (401)"}
-                    return {"success": False, "message": f"Provider API error: HTTP {response.status_code}"}
-            except Exception as e:
-                # Avoid leaking exception internals in API responses (CodeQL).
-                logger.debug("OpenAI-compatible provider validation failed", error=str(e), exc_info=True)
-                return {"success": False, "message": f"Cannot connect to provider at {chat_base_url} (see server logs)"}
-
-        # ============================================================
-        # GROQ SPEECH (STT/TTS) - validate via /models (OpenAI-compatible)
-        # ============================================================
-        if provider_config.get('type') == 'groq':
-            api_key = provider_config.get('api_key') or get_env_key('GROQ_API_KEY') or os.getenv('GROQ_API_KEY') or ''
-            if not api_key:
-                return {"success": False, "message": "GROQ_API_KEY not set (set api_key or env var)"}
-
-            # SECURITY: For provider validation, do not call user-provided base URLs.
-            # Keep this check pinned to the official Groq OpenAI-compatible endpoint.
-            base_url = 'https://api.groq.com/openai/v1'
-
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        f"{base_url}/models",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                        timeout=10.0,
-                    )
-                    if response.status_code == 200:
-                        try:
-                            data = response.json()
-                            models = data.get('data') or []
-                            return {"success": True, "message": f"Connected (Groq Speech). Found {len(models)} models."}
-                        except Exception:
-                            return {"success": True, "message": f"Connected (Groq Speech) (HTTP {response.status_code})"}
-                    if response.status_code == 401:
-                        return {"success": False, "message": "Invalid API key (401)"}
-                    return {"success": False, "message": f"Provider API error: HTTP {response.status_code}"}
-            except Exception as e:
-                logger.debug("Groq Speech provider validation failed", error=str(e), exc_info=True)
-                return {"success": False, "message": f"Cannot connect to provider at {base_url} (see server logs)"}
-                
-        elif 'google_live' in provider_config or ('llm_model' in provider_config and 'gemini' in provider_config.get('llm_model', '')):
-            # Google Live
-            api_key = get_env_key('GOOGLE_API_KEY')
-            if not api_key:
-                return {"success": False, "message": "GOOGLE_API_KEY not set in .env file"}
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-                    timeout=10.0
-                )
-                if response.status_code == 200:
-                    return {"success": True, "message": f"Connected to Google API (HTTP {response.status_code})"}
-                return {"success": False, "message": f"Google API error: HTTP {response.status_code}"}
-                
-        elif 'ws_url' in provider_config:
-            # Local provider (WebSocket)
-            ws_url = provider_config.get('ws_url', '')
-            if not ws_url:
-                 return {"success": False, "message": "No WebSocket URL provided"}
-            
-            try:
-                import websockets
-                # Try connecting to the WebSocket
-                async with websockets.connect(ws_url, open_timeout=5.0) as ws:
-                    await ws.close()
-                return {"success": True, "message": "Local AI server is reachable via WebSocket"}
-            except ImportError:
-                 return {"success": False, "message": "websockets library not installed"}
-            except Exception as e:
-                # If local-ai-server is on host network, ensure we use host.docker.internal or host networking properties
-                return {"success": False, "message": f"Cannot reach local AI server at {ws_url}. Error: {str(e)}"}
-        
-        # ============================================================
-        # OLLAMA - Self-hosted LLM
-        # ============================================================
-        if 'ollama' in provider_name or provider_config.get('type') == 'ollama':
-            import aiohttp
-            base_url = provider_config.get('base_url', 'http://localhost:11434').rstrip('/')
-            try:
-                async with aiohttp.ClientSession() as session:
-                    url = f"{base_url}/api/tags"
-                    timeout = aiohttp.ClientTimeout(total=10)
-                    async with session.get(url, timeout=timeout) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            models = data.get("models", [])
-                            return {"success": True, "message": f"Connected to Ollama! Found {len(models)} models."}
-                        else:
-                            return {"success": False, "message": f"Ollama returned status {response.status}"}
-            except aiohttp.ClientConnectorError:
-                return {"success": False, "message": f"Cannot connect to Ollama at {base_url}. Ensure Ollama is running and accessible."}
-            except asyncio.TimeoutError:
-                return {"success": False, "message": "Connection timeout - is Ollama running?"}
-            except Exception as e:
-                return {"success": False, "message": f"Ollama connection failed: {str(e)}"}
-                
-        elif 'model' in provider_config or 'stt_model' in provider_config or 'chat_model' in provider_config or 'tts_model' in provider_config:
-            # Check if it's Deepgram or OpenAI standard
-            # Deepgram often has 'deepgram' in name or model names like 'nova'
-            if provider_config.get('model', '').startswith('nova') or 'deepgram' in provider_name.lower():
-                # Deepgram
-                api_key = get_env_key('DEEPGRAM_API_KEY')
-                if not api_key:
-                    return {"success": False, "message": "DEEPGRAM_API_KEY not set in .env file"}
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        "https://api.deepgram.com/v1/projects",
-                        headers={"Authorization": f"Token {api_key}"},
-                        timeout=10.0
-                    )
-                    if response.status_code == 200:
-                        return {"success": True, "message": f"Connected to Deepgram (HTTP {response.status_code})"}
-                    return {"success": False, "message": f"Deepgram API error: HTTP {response.status_code}"}
-            else:
-                # OpenAI Standard or Generic
-                # Try OpenAI first
-                api_key = get_env_key('OPENAI_API_KEY')
-                if api_key:
-                   async with httpx.AsyncClient() as client:
-                        try:
-                            response = await client.get(
-                                "https://api.openai.com/v1/models",
-                                headers={"Authorization": f"Bearer {api_key}"},
-                                timeout=5.0
-                            )
-                            if response.status_code == 200:
-                                return {"success": True, "message": f"Connected to OpenAI (HTTP {response.status_code})"}
-                        except:
-                            pass
-                
-                # If we are here, it might be a local provider using 'model' key (e.g. local_tts)
-                # but without ws_url? Usually local providers have ws_url. 
-                # If it's pure local without WS (e.g. wrapper), assume success if file paths exist?
-                return {"success": True, "message": "Provider configuration valid (No specific connection test available)"}
-        
-        # ============================================================
-        # AZURE SPEECH SERVICE (STT / TTS)
-        # ============================================================
-        if provider_config.get('type') == 'azure' or 'azure' in provider_name:
-            api_key = get_env_key('AZURE_SPEECH_KEY') or os.getenv('AZURE_SPEECH_KEY') or ''
-            if not api_key:
-                return {"success": False, "message": "AZURE_SPEECH_KEY not set in .env file"}
-            region = provider_config.get('region', 'eastus')
-            # Validate region to prevent SSRF via crafted region values
-            import re
-            _azure_region_re = re.compile(r"^[a-z][a-z0-9-]{0,48}[a-z0-9]$")
-            region = str(region).strip().lower()
-            if not region or not _azure_region_re.match(region):
-                return {"success": False, "message": f"Invalid Azure region '{region}'. Expected lowercase alphanumeric (e.g. 'eastus')."}
-            # Hit the token endpoint — a 200 or 400 response proves the key is recognized
-            token_url = f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        token_url,
-                        headers={"Ocp-Apim-Subscription-Key": api_key},
-                        timeout=10.0,
-                    )
-                    if response.status_code == 200:
-                        capabilities = provider_config.get('capabilities', [])
-                        cap_str = '/'.join(str(c).upper() for c in capabilities) if capabilities else 'Speech'
-                        return {"success": True, "message": f"Connected to Azure Speech Service ({region}). {cap_str} key valid."}
-                    if response.status_code == 401:
-                        return {"success": False, "message": "Invalid AZURE_SPEECH_KEY (401 Unauthorized)"}
-                    return {"success": False, "message": f"Azure Speech API returned HTTP {response.status_code} for region '{region}'"}
-            except Exception as e:
-                logger.debug("Azure Speech provider validation failed", error=str(e), exc_info=True)
-                return {"success": False, "message": f"Cannot connect to Azure Speech Service at region '{region}' (see server logs)"}
-
-        return {"success": False, "message": "Unknown provider type - cannot test"}
-        
-    except httpx.TimeoutException:
-        return {"success": False, "message": "Connection timeout"}
-    except Exception as e:
-        return {"success": False, "message": f"Test failed: {str(e)}"}
 
 @router.get("/export")
 async def export_configuration(include_secrets: bool = False):

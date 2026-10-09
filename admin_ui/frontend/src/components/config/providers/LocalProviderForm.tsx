@@ -120,6 +120,19 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
     const isTTS = isFullAgent || name.includes('tts') || caps.includes('tts');
     const isLLM = isFullAgent || name.includes('llm') || caps.includes('llm') || (!name.includes('stt') && !name.includes('tts'));
 
+    // Labels for the backends the local AI server API reports (its keys are the raw backend ids).
+    const STT_BACKEND_LABELS: Record<string, string> = {
+        vosk: 'Vosk (Local)',
+        kroko: 'Kroko',
+        sherpa: 'Sherpa-ONNX (Local)',
+        tone: 'T-one',
+        onnx_asr: 'GigaAM v3 / NeMo (onnx-asr)',
+        faster_whisper: 'Faster-Whisper',
+        whisper_cpp: 'Whisper.cpp',
+    };
+    const sttBackendLabel = (backend: string) =>
+        STT_BACKEND_LABELS[backend] || backend.charAt(0).toUpperCase() + backend.slice(1);
+
     // Helpers to find model details
     const getModelPathPlaceholder = (backend: string, type: 'stt' | 'tts') => {
         if (loading) return "Loading...";
@@ -130,6 +143,7 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                 : '/app/models/stt/sherpa-onnx-streaming-zipformer-en-2023-06-26';
         }
         if (backend === 'tone') return '/app/models/stt/t-one';
+        if (backend === 'onnx_asr') return 'gigaam-v3-e2e-ctc';
         if (backend === 'piper') return '/app/models/tts/en_US-lessac-medium.onnx';
         if (backend === 'kokoro') return '/app/models/tts/kokoro';
         return '';
@@ -604,7 +618,7 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                                 {/* Dynamic options based on available backends */}
                                 {!loading && Object.keys(rawModelData.stt).map(backend => (
                                     <option key={backend} value={backend}>
-                                        {backend.charAt(0).toUpperCase() + backend.slice(1)}
+                                        {sttBackendLabel(backend)}
                                     </option>
                                 ))}
 
@@ -615,8 +629,34 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                                         <option value="kroko">Kroko</option>
                                         <option value="sherpa">Sherpa-ONNX (Local)</option>
                                         <option value="tone">T-one</option>
+                                        <option value="onnx_asr">GigaAM v3 / NeMo (onnx-asr)</option>
                                     </>
                                 )}
+                            </select>
+                        </div>
+
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-1.5">
+                                <label className="text-sm font-medium">STT Input Upsampler (8 → 16 kHz)</label>
+                                <HelpTooltip
+                                    content={
+                                        <>
+                                            <strong>STT Input Upsampler</strong> — how the caller's 8 kHz telephone audio is brought to the 16 kHz the local recognizers decode, before it is sent to the Local AI Server.
+                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                <li><code>fir</code> — polyphase windowed-sinc interpolation: flat telephone band, no spectral images, about 3 ms of delay. Recommended for GigaAM v3, Sherpa and Whisper.</li>
+                                                <li><code>linear</code> — the previous linear interpolation: rolls the band off by 2–3 dB at 3 kHz and mirrors it above 4 kHz (a 3 kHz tone shows up at 5 kHz at about −13 dB), which the recognizer sees as noise.</li>
+                                            </ul>
+                                        </>
+                                    }
+                                />
+                            </div>
+                            <select
+                                className="w-full p-2 rounded border border-input bg-background"
+                                value={config.stt_input_resampler || 'fir'}
+                                onChange={(e) => handleChange('stt_input_resampler', e.target.value)}
+                            >
+                                <option value="fir">FIR (alias-safe, recommended)</option>
+                                <option value="linear">Linear (legacy)</option>
                             </select>
                         </div>
 
@@ -765,6 +805,65 @@ const LocalProviderForm: React.FC<LocalProviderFormProps> = ({ config, onChange 
                                         </p>
                                     </div>
                                 )}
+                            </>
+                        )}
+
+                        {config.stt_backend === 'onnx_asr' && (
+                            <>
+                                <div className="space-y-2">
+                                    <div className="flex items-center gap-1.5">
+                                        <label className="text-sm font-medium">onnx-asr Model</label>
+                                        <HelpTooltip
+                                            content={
+                                                <>
+                                                    <strong>onnx-asr</strong> — offline Russian ASR (GigaAM v3, NeMo FastConformer RU) run by the Local AI Server through ONNX Runtime. The model is downloaded from Hugging Face on first start.
+                                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                                        <li>The <code>e2e</code> variants add punctuation and number normalization.</li>
+                                                        <li>Phrases are recognized once the caller pauses (Silero VAD gate); no partial results.</li>
+                                                        <li>Requires an image built with <code>INCLUDE_ONNX_ASR=true</code>; a GPU is recommended.</li>
+                                                    </ul>
+                                                </>
+                                            }
+                                        />
+                                    </div>
+                                    <select
+                                        className="w-full p-2 rounded border border-input bg-background"
+                                        value={config.onnx_asr_model || 'gigaam-v3-e2e-ctc'}
+                                        onChange={(e) => handleChange('onnx_asr_model', e.target.value)}
+                                    >
+                                        <option value="gigaam-v3-e2e-ctc">GigaAM v3 E2E CTC (ru, punctuation)</option>
+                                        <option value="gigaam-v3-e2e-rnnt">GigaAM v3 E2E RNNT (ru, punctuation)</option>
+                                        <option value="gigaam-v3-ctc">GigaAM v3 CTC (ru, lowercase)</option>
+                                        <option value="gigaam-v3-rnnt">GigaAM v3 RNNT (ru, lowercase)</option>
+                                        <option value="nemo-fastconformer-ru-ctc">NeMo FastConformer RU (CTC)</option>
+                                        <option value="nemo-fastconformer-ru-rnnt">NeMo FastConformer RU (RNNT)</option>
+                                    </select>
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium">Device</label>
+                                        <select
+                                            className="w-full p-2 rounded border border-input bg-background"
+                                            value={config.onnx_asr_device || 'auto'}
+                                            onChange={(e) => handleChange('onnx_asr_device', e.target.value)}
+                                        >
+                                            <option value="auto">Auto (CUDA when available)</option>
+                                            <option value="cuda">CUDA</option>
+                                            <option value="cpu">CPU</option>
+                                        </select>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium">Quantization</label>
+                                        <select
+                                            className="w-full p-2 rounded border border-input bg-background"
+                                            value={config.onnx_asr_quantization || ''}
+                                            onChange={(e) => handleChange('onnx_asr_quantization', e.target.value)}
+                                        >
+                                            <option value="">fp32 (default)</option>
+                                            <option value="int8">int8</option>
+                                        </select>
+                                    </div>
+                                </div>
                             </>
                         )}
 

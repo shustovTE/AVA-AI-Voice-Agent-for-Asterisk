@@ -147,6 +147,28 @@ def test_post_call_webhook(client):
     assert r.json()["config"]["method"] == "POST"
 
 
+def test_post_call_webhook_keeps_the_failed_dial_switch(client):
+    r = client.post("/api/tools/managed", json={
+        "name": "crm_hook", "phase": "post_call",
+        "url": "https://hooks.example.com/x", "is_global": True,
+        "send_on_failed_dial": False,
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["config"]["send_on_failed_dial"] is False
+    assert client.cfg_state["cfg"]["tools"]["crm_hook"]["send_on_failed_dial"] is False
+
+    r = client.patch("/api/tools/managed/crm_hook", json={"send_on_failed_dial": True})
+    assert r.status_code == 200, r.text
+    assert client.cfg_state["cfg"]["tools"]["crm_hook"]["send_on_failed_dial"] is True
+
+    # Without the key the engine's default (send) applies; nothing is persisted for it.
+    r = client.post("/api/tools/managed", json={
+        "name": "plain_hook", "phase": "post_call", "url": "https://hooks.example.com/y",
+    })
+    assert r.status_code == 201, r.text
+    assert "send_on_failed_dial" not in client.cfg_state["cfg"]["tools"]["plain_hook"]
+
+
 def test_post_call_rejects_unavailable_explicit_summary_provider(client, monkeypatch):
     async def fake_options():
         return {
@@ -676,3 +698,31 @@ def test_builtin_patch_accepts_valid_email_and_persists(email_client):
     assert len(email_client.state["writes"]) == 1  # valid data persisted once
     persisted = yaml.safe_load(email_client.state["writes"][0])
     assert persisted["tools"]["send_email_summary"]["admin_email"] == "ops@example.com"
+
+
+def test_in_call_parameters_keep_their_enum(client):
+    r = client.post("/api/tools/managed", json={
+        "name": "book_slot", "phase": "in_call",
+        "url": "https://api.example.com/book", "method": "POST",
+        "description": "Book a slot",
+        "parameters": [
+            {"name": "slot", "type": "string", "enum": ["morning", "evening"], "required": True},
+            {"name": "note", "type": "string"},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    stored = client.cfg_state["cfg"]["in_call_tools"]["book_slot"]["parameters"]
+    assert stored[0]["enum"] == ["morning", "evening"]
+    # A parameter without allowed values carries no enum key at all.
+    assert "enum" not in stored[1]
+    assert r.json()["config"]["parameters"][0]["enum"] == ["morning", "evening"]
+
+    r = client.patch("/api/tools/managed/book_slot", json={
+        "parameters": [{"name": "slot", "type": "string", "enum": ["morning"]}],
+    })
+    assert r.status_code == 200, r.text
+    # PATCH stores the fields it was given, as before; the enum is among them.
+    stored = client.cfg_state["cfg"]["in_call_tools"]["book_slot"]["parameters"]
+    assert len(stored) == 1
+    assert stored[0]["name"] == "slot"
+    assert stored[0]["enum"] == ["morning"]
