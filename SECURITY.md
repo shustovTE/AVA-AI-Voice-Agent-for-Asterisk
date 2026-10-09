@@ -219,6 +219,85 @@ docker pull python:3.11@sha256:e8ab764baee5109566456913b42d7d4ad97c13385e4002973
 docker compose build --no-cache
 ```
 
+#### Public detector model files
+
+`src/core/model_fetch.py`, `scripts/fetch_silero_vad.sh`, and
+`scripts/fetch_smart_turn.sh` intentionally publish downloaded model files as
+`0644` (`rw-r--r--`). This policy applies to the public Silero VAD and Smart Turn
+ONNX weights, not to credentials, recordings, transcripts, or private models.
+Reading these weights discloses no application secrets or call data; group and
+other users receive no file write or execute permission.
+
+The engine runs as non-root `appuser` (`Dockerfile`), and the Compose template
+bind-mounts `./models` at `/app/models`. A host-side downloader may have a
+different numeric UID and group membership. Replacing `0644` with `0600` would
+prevent that container user from reading a host-owned model; `0640` would also
+require a reliably shared GID. `0644` preserves the documented host-preseed
+workflow without changing ownership or running the engine as root. Directory
+traversal permissions and any ACL/SELinux policy must still allow the read.
+
+The automatic downloads use fixed public HTTPS URLs and SHA-256 values in
+`src/core/silero_vad.py` and `src/core/smart_turn.py`. Silero is version-tagged;
+Smart Turn's URL uses upstream `main`, but its expected digest is fixed. An
+upstream content change therefore fails verification. Both the Python helper
+and the shell scripts start with a private `mkstemp`/`mktemp` file next to the
+destination, verify the digest before setting `0644`, and rename it into place.
+A failed transfer or digest check leaves an existing destination intact and
+removes the temporary file.
+
+**Trust boundary:** file read permission is not permission to replace the model.
+Only trusted deployment users/services may write model files or their parent
+directories (including ancestors), whether through ownership, groups, ACLs, or
+another container mount. The installer/preflight use shared directories with
+mode `2775`; membership of that writable group is consequently trusted. The
+Admin UI's model-permission repair can also grant group write access to existing
+files. Do not add untrusted users to those groups or make the tree world-writable.
+An attacker with directory write access can replace a file regardless of whether
+the file is `0644` or `0600`; atomic rename and a download checksum do not defend
+against such an attacker. In particular, `ensure_file()` deliberately accepts a
+nonempty operator-provided model with a different digest, logging a warning.
+It is not strict integrity enforcement for files already on disk.
+
+For deployments that pre-provision every required model, a read-only engine
+mount (`./models:/app/models:ro`) is an optional additional boundary. Disable
+`vad.silero_auto_download` and `vad.smart_turn_auto_download` and provision both
+files first. This prevents engine-side downloads/updates and does not prevent
+trusted host processes or other writable mounts from changing the same files.
+Private models need a separate ownership/shared-group/ACL policy; the public
+download helper must not be reused for confidential assets. Existing manually
+provisioned model permissions are not changed by `ensure_file()`.
+
+**CodeQL triage:** `py/overly-permissive-file` checks the permission mask without
+classifying the file's contents. The world-readable observation is correct, but
+for these public weights the security finding is a false positive. Keep the
+literal `0644` and retain analysis of this file and rule. Do not use a broad
+`paths-ignore` entry, disable the query, filter its SARIF results, or obscure the
+mode to hide the alert.
+
+For [alert #11 in shustovTE/AVA-AI-Voice-Agent-for-Asterisk](https://github.com/shustovTE/AVA-AI-Voice-Agent-for-Asterisk/security/code-scanning/11),
+reported on [PR #8](https://github.com/shustovTE/AVA-AI-Voice-Agent-for-Asterisk/pull/8#discussion_r4227981639),
+open **Security / Code scanning**, confirm the rule and location above, and use
+**Dismiss alert → False positive** with the following justification (and a link
+to the reviewed PR):
+
+> This location publishes only public Silero VAD / Smart Turn ONNX weights.
+> Mode 0644 intentionally permits a different container UID to read host-fetched
+> models and grants no group/other file write permission. Downloads use private
+> temporary files, verify a pinned SHA-256, then publish atomically. Model files
+> and parent directories are trusted deployment inputs; existing custom models
+> are allowed with a checksum warning. No credentials or call data are written
+> here. See SECURITY.md, Public detector model files, and the regression tests.
+
+Dismiss the individual alert, not merely its PR review conversation. GitHub
+records the reason/comment and applies the dismissal across branches. Reassess
+if a caller starts downloading confidential files or the deployment trust
+boundary changes. Adding these comments or merging this documentation does not
+itself dismiss the alert.
+
+References: [CodeQL rule](https://codeql.github.com/codeql-query-help/python/py-overly-permissive-file/),
+[GitHub alert resolution](https://docs.github.com/en/code-security/how-tos/manage-security-alerts/manage-code-scanning-alerts/resolve-alerts),
+[Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
+
 ### 4. Dependency Security
 
 **Automated Scanning** (enabled via CI):

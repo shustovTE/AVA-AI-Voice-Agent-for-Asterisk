@@ -42,6 +42,10 @@ def download_file(
     The download goes to a temporary file next to the destination and is
     renamed into place only after the digest matches, so a truncated or
     tampered transfer never leaves a half-written model behind.
+
+    This helper publishes public model weights with mode 0644. Do not use it
+    for credentials, recordings, or private models. The destination directory
+    and its ancestors must only be writable by trusted deployment users.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     try:
@@ -60,7 +64,9 @@ def download_file(
         actual = digest.hexdigest()
         if actual != sha256:
             raise error(f"download from {url} has sha256 {actual}, expected {sha256}")
-        # The container user must be able to read what a host-side run fetched.
+        # Intentional for public, checksum-verified weights: host downloads must
+        # be readable by the container's different UID, without granting write
+        # access to group/others. See SECURITY.md "Public detector model files".
         os.chmod(temp_path, 0o644)
         os.replace(temp_path, path)
     except error:

@@ -31,6 +31,8 @@ if ! echo "${SHA256}  ${TMP}" | sha256sum -c --status; then
   echo "❌ Checksum mismatch for ${URL}; the file was discarded" >&2
   exit 1
 fi
+# Public, verified weights: allow the container's different UID to read them,
+# without group/other write access. See SECURITY.md "Public detector model files".
 chmod 0644 "${TMP}"
 mv "${TMP}" "${DEST}"
 trap - EXIT
