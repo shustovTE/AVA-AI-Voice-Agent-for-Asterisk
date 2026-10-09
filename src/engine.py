@@ -17,6 +17,7 @@ import json
 import ipaddress
 import sqlite3
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import TYPE_CHECKING, AsyncIterator, Dict, Any, Optional, List, Set, Tuple, Callable
@@ -553,10 +554,23 @@ _BARGE_IN_CANCELLABLE_TERMINAL_REASONS = frozenset(
 _cleanup_lock = asyncio.Lock()  # Lock to make cleanup guard atomic (AAVA-148)
 
 
-def _ts_msg(role: str, content, **extra) -> dict:
-    """Build a conversation-history entry with an automatic timestamp."""
-    extra.pop("timestamp", None)
-    msg = {"role": role, "content": content, "timestamp": time.time()}
+@dataclass
+class _PipelineTranscript:
+    """A result keeps its speech/receipt times while the dialog is busy."""
+
+    text: str
+    timestamp: float
+    received_at: float
+    speech_started_at: Optional[float] = None
+    interrupted_agent: bool = False
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _ts_msg(role: str, content, *, timestamp: Optional[float] = None, **extra) -> dict:
+    """Build a history entry, preserving a known speech time on delayed writes."""
+    msg = {"role": role, "content": content, "timestamp": time.time() if timestamp is None else timestamp}
     msg.update(extra)
     return msg
 
@@ -1707,6 +1721,11 @@ class Engine:
         watchdog = getattr(self, "no_input_watchdog", None)
         if watchdog is not None:
             await watchdog.note_processing(call_id, active)
+
+    async def _no_input_note_pending_input(self, call_id: str, active: bool) -> None:
+        watchdog = getattr(self, "no_input_watchdog", None)
+        if watchdog is not None:
+            await watchdog.note_pending_input(call_id, active)
 
     async def _no_input_note_input_state(self, call_id: str, active: bool, source: str) -> None:
         watchdog = getattr(self, "no_input_watchdog", None)
@@ -8566,7 +8585,49 @@ class Engine:
         call_id = getattr(session, "call_id", None)
         return call_id in _cleanup_in_progress or bool(getattr(session, "cleanup_in_progress", False))
 
-    async def _record_caller_words_after_hangup(self, session: CallSession, text: str) -> bool:
+    @staticmethod
+    def _insert_pipeline_caller_words(
+        history: List[Dict[str, Any]], text: str, timestamp: Optional[float] = None
+    ) -> None:
+        """Place delayed caller words before output that started after their speech."""
+        entry = _ts_msg("user", text, timestamp=timestamp)
+        index = len(history)
+        if timestamp is not None:
+            while index:
+                previous = history[index - 1].get("timestamp")
+                if not isinstance(previous, (int, float)) or previous <= timestamp:
+                    break
+                index -= 1
+        history.insert(index, entry)
+
+    async def _wait_for_pipeline_tool_playback(
+        self, session: CallSession, *, stream_id: Optional[str] = None,
+        playback_id: Optional[str] = None, timeout_sec: float = 120.0,
+    ) -> bool:
+        """Wait for the reply's playback, ending promptly when barge-in cuts it.
+
+        Synthesized text length is not the duration left on the transport.
+        Correlate to this reply so a replacement stream cannot extend the wait.
+        """
+        if stream_id:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            while self.streaming_playback_manager.is_stream_active(session.call_id, stream_id):
+                if self._call_cleanup_started(session):
+                    return False
+                if time.monotonic() >= deadline:
+                    logger.warning("Pipeline tool playback wait timed out", call_id=session.call_id, stream_id=stream_id)
+                    return False
+                await asyncio.sleep(0.02)
+        elif playback_id:
+            if not await self.playback_manager.wait_for_playback_end(
+                session.call_id, playback_id, timeout_sec=timeout_sec
+            ):
+                return False
+        return not self._call_cleanup_started(session)
+
+    async def _record_caller_words_after_hangup(
+        self, session: CallSession, text: str, *, timestamp: Optional[float] = None
+    ) -> bool:
         """Keep what the caller said when the call ended before the turn was answered.
 
         The words become the caller's last turn in the conversation history,
@@ -8588,7 +8649,7 @@ class Engine:
                 if str(entry.get("content") or "").strip() == text:
                     return False
                 break
-        history.append(_ts_msg("user", text))
+        self._insert_pipeline_caller_words(history, text, timestamp)
         logger.info(
             "Caller's last words recorded after hangup",
             call_id=session.call_id,
@@ -8602,11 +8663,13 @@ class Engine:
         await self._sync_call_history_transcript(session, reason="last-words")
         return True
 
-    async def _record_turn_cut_by_hangup(self, session: CallSession, transcript_text: str) -> None:
+    async def _record_turn_cut_by_hangup(
+        self, session: CallSession, transcript_text: str, *, timestamp: Optional[float] = None
+    ) -> None:
         """A turn the call's cleanup cancelled: record the caller's words and the heard part of the reply."""
         if not self._call_cleanup_started(session):
             return
-        await self._record_caller_words_after_hangup(session, transcript_text)
+        await self._record_caller_words_after_hangup(session, transcript_text, timestamp=timestamp)
         record = self._spoken_replies.get(session.call_id)
         if record is None or not record.interrupted or record.persisted_text is not None:
             return
@@ -17416,6 +17479,7 @@ class Engine:
             return False
 
         announcement_id = f"no-input:{kind}:{uuid.uuid4().hex}"
+        announcement_timestamp = time.time()
         delivery_complete = False
         self._begin_provider_output_operation(call_id, announcement_id, f"no_input_{kind}")
         session.no_input_state.update(
@@ -17424,7 +17488,7 @@ class Engine:
                 "announcement_id": announcement_id,
                 "announcement_kind": kind,
                 "announcement_text": message,
-                "announcement_requested_at": time.time(),
+                "announcement_requested_at": announcement_timestamp,
             }
         )
         await self._save_session(session)
@@ -17449,7 +17513,7 @@ class Engine:
                     session = await self.session_store.get_by_call_id(call_id)
                     if session:
                         session.conversation_history.append({
-                            **_ts_msg("assistant", message),
+                            **_ts_msg("assistant", message, timestamp=announcement_timestamp),
                             "event": f"no_input_{kind}",
                         })
                         await self._save_session(session)
@@ -17478,7 +17542,7 @@ class Engine:
                 session = await self.session_store.get_by_call_id(call_id)
                 if session:
                     session.conversation_history.append({
-                        **_ts_msg("assistant", message),
+                        **_ts_msg("assistant", message, timestamp=announcement_timestamp),
                         "event": f"no_input_{kind}",
                     })
                     await self._save_session(session)
@@ -17513,7 +17577,7 @@ class Engine:
                 current = await self.session_store.get_by_call_id(call_id)
                 if current:
                     current.conversation_history.append({
-                        **_ts_msg("assistant", message),
+                        **_ts_msg("assistant", message, timestamp=announcement_timestamp),
                         "event": f"no_input_{kind}",
                     })
                     await self._save_session(current)
@@ -18164,13 +18228,14 @@ class Engine:
                             any_audio = False
                             greeting_cut: Optional[str] = None
                             greeting_timing: Dict[str, int] = {}
+                            greeting_timestamp: Optional[float] = None
                             heard_rec = self._begin_spoken_reply(call_id, stream_id, pipeline)
                             if heard_rec is not None:
                                 heard_rec.open_segment(greeting)
                             tts_started = time.monotonic()
 
                             async def _stream_greeting() -> None:
-                                nonlocal any_audio
+                                nonlocal any_audio, greeting_timestamp
                                 # Each frame is put with the stream's liveness checked and
                                 # the synthesis is given up the moment the stream is cut (a
                                 # barge-in into the greeting): a bare put on a stream nobody
@@ -18185,6 +18250,7 @@ class Engine:
                                     if not chunk:
                                         continue
                                     if not any_audio:
+                                        greeting_timestamp = time.time()
                                         greeting_timing.setdefault("tts_ms", _ms_since(tts_started))
                                         await self._stop_connection_audio(
                                             session, reason="first-pipeline-greeting-audio"
@@ -18236,9 +18302,9 @@ class Engine:
                                 try:
                                     if spoken:
                                         session.conversation_history.append(
-                                            _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(greeting_timing))
+                                            _ts_msg("assistant", spoken, timestamp=greeting_timestamp, interrupted=True, **_latency_extra(greeting_timing))
                                             if greeting_cut is not None
-                                            else _ts_msg("assistant", greeting, **_latency_extra(greeting_timing))
+                                            else _ts_msg("assistant", greeting, timestamp=greeting_timestamp, **_latency_extra(greeting_timing))
                                         )
                                     if heard_rec is not None:
                                         heard_rec.persisted_text = spoken
@@ -18359,7 +18425,7 @@ class Engine:
             input_generation = 0
             submitted_utterance_generations: deque = deque()
             # Reuse queue created by _ensure_pipeline_runner, or create if missing
-            # Receiver entries carry (input generation, text); legacy early
+            # Receiver entries carry (input generation, timed result); legacy early
             # flushes may still enqueue text, and None ends the stream.
             transcript_queue: asyncio.Queue[Any] = self._pipeline_transcript_queues.get(call_id) or asyncio.Queue(maxsize=8)
             self._pipeline_transcript_queues[call_id] = transcript_queue
@@ -18367,13 +18433,36 @@ class Engine:
             # notices the caller going on before the reply's first sound.
             self._pipeline_caller_resumed[call_id] = asyncio.Event()
 
-            def remaining_transcript(item: Any) -> str:
+            def remaining_transcript(item: Any) -> Any:
                 """Unwrap results for hangup history without resurrecting discarded input."""
                 if isinstance(item, tuple):
                     generation, item = item
                     if generation != input_generation:
                         return ""
-                return str(item or "")
+                return item or ""
+
+            def timed_transcript(text: str) -> _PipelineTranscript:
+                """Bind the result to its utterance before a busy consumer can lose it."""
+                received_at = time.monotonic()
+                starts = self._pipeline_utterance_starts.get(call_id)
+                speech_started, interrupted = starts.popleft() if starts else (None, False)
+                if speech_started is None:
+                    tracker = self._silero_trackers.get(call_id)
+                    speech_started = getattr(tracker, "segment_started_at", None) if tracker is not None else None
+                timestamp = time.time()
+                if speech_started is not None:
+                    timestamp -= max(0.0, received_at - float(speech_started))
+                return _PipelineTranscript(str(text or ""), timestamp, received_at, speech_started, interrupted)
+
+            async def note_received_result(result: _PipelineTranscript) -> None:
+                if not result.text.strip():
+                    return
+                # Reception is independent of the dialog worker. In particular,
+                # its tool/playback wait must not make accepted words look idle.
+                await self._no_input_note_pending_input(call_id, True)
+                watchdog = getattr(self, "no_input_watchdog", None)
+                if watchdog is not None:
+                    await watchdog.note_activity(call_id, "pipeline:stt_final")
 
             use_streaming = bool(stt_options.get("streaming", True))
             if use_streaming:
@@ -18441,11 +18530,13 @@ class Engine:
                         logger.debug("STT transcribe failed", call_id=call_id, exc_info=True)
                         return
                     asr_ms = (time.monotonic() - asr_started) * 1000.0
+                    result = timed_transcript(transcript)
                     if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
                         return
                     transcript = (transcript or "").strip()
                     if not transcript:
                         return
+                    await note_received_result(result)
                     # Record time when a final transcript is obtained
                     try:
                         self._last_transcript_ts[call_id] = time.time()
@@ -18453,18 +18544,18 @@ class Engine:
                     except Exception:
                         pass
                     try:
-                        transcript_queue.put_nowait((generation, transcript))
+                        transcript_queue.put_nowait((generation, result))
                     except asyncio.QueueFull:
                         try:
                             dropped = transcript_queue.get_nowait()
                             logger.warning(
                                 "Pipeline transcript backlog full; dropping oldest transcript",
                                 call_id=call_id,
-                                dropped_preview=(dropped or "")[:80] if dropped else "",
+                                dropped_preview=str(remaining_transcript(dropped))[:80] if dropped else "",
                             )
                         except asyncio.QueueEmpty:
                             pass
-                        await transcript_queue.put((generation, transcript))
+                        await transcript_queue.put((generation, result))
 
                 async def stt_worker() -> None:
                     local_buf = bytearray()
@@ -18562,13 +18653,15 @@ class Engine:
                                 submitted_utterance_generations.popleft()
                                 if submitted_utterance_generations else input_generation
                             )
+                            result = timed_transcript(final)
                             if generation != input_generation or self._pipeline_input_blocked_before_reply(session):
                                 continue
+                            await note_received_result(result)
                             try:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
                                 self._note_pipeline_final_arrived(call_id)
-                                transcript_queue.put_nowait((generation, final))
+                                transcript_queue.put_nowait((generation, result))
                                 logger.debug(
                                     "Pipeline STT final enqueued for dialog",
                                     call_id=call_id,
@@ -18580,7 +18673,7 @@ class Engine:
                                     transcript_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     pass
-                                await transcript_queue.put((generation, final))
+                                await transcript_queue.put((generation, result))
                     except asyncio.CancelledError:
                         pass
                     except Exception:
@@ -18605,6 +18698,7 @@ class Engine:
                 # When the caller's speech behind the first pending result began
                 # (monotonic), for the wait on a reply they are speaking into.
                 pending_speech_started_at: Optional[float] = None
+                pending_timestamp: Optional[float] = None
                 pending_deadline: Optional[float] = None
                 end_of_turn = EndOfTurnPolicy(pipeline.llm_options)
                 wakeup = asyncio.Event()
@@ -18636,7 +18730,7 @@ class Engine:
                 # AAVA-85 FIX: Initialize from session to preserve greeting
                 conversation_history: List[Dict[str, str]] = list(session.conversation_history or [])
 
-                async def run_turn(transcript_text: str) -> str:
+                async def run_turn(transcript_text: str, timestamp: Optional[float] = None) -> str:
                     """Answer one caller turn; "superseded" when the caller went on before the reply."""
                     nonlocal input_generation
                     if not self._discard_unheard_reply_enabled():
@@ -18649,9 +18743,10 @@ class Engine:
                                 queue.put_nowait(None)
                     self._begin_pipeline_reply(call_id)
                     try:
-                        outcome = await run_turn_body(transcript_text)
+                        outcome = await run_turn_body(transcript_text, timestamp)
                     finally:
                         self._end_pipeline_reply(call_id)
+                        await self._no_input_note_processing(call_id, False)
                     # The call ended while the turn was being answered and the
                     # body left on an output boundary instead of being cancelled
                     # (the LLM answered in the moment between the cleanup's
@@ -18660,16 +18755,16 @@ class Engine:
                     # a reply the hangup cut, still go into the record. Words
                     # already there are not repeated.
                     if outcome != "superseded" and self._call_cleanup_started(session):
-                        await self._record_turn_cut_by_hangup(session, transcript_text)
+                        await self._record_turn_cut_by_hangup(session, transcript_text, timestamp=timestamp)
                     return outcome or "answered"
 
-                async def run_turn_body(transcript_text: str) -> Optional[str]:
+                async def run_turn_body(transcript_text: str, timestamp: Optional[float]) -> Optional[str]:
                     nonlocal conversation_history
                     if not self._pipeline_output_allowed(
                         call_id, session, stage="turn-start"
                     ):
                         # The call is ending; the caller's words still belong in its record.
-                        await self._record_caller_words_after_hangup(session, transcript_text)
+                        await self._record_caller_words_after_hangup(session, transcript_text, timestamp=timestamp)
                         return
                     # A reply still playing now was produced without the caller's
                     # latest words (their speech ran into it, or the recognizer
@@ -18984,12 +19079,12 @@ class Engine:
                             # model answers the next turn with no memory of them. For
                             # the assistant only the sentences that reached playback
                             # are kept, so the history says what was actually heard.
-                            conversation_history.append(_ts_msg("user", transcript_text))
+                            self._insert_pipeline_caller_words(conversation_history, transcript_text, timestamp)
                             if spoken:
                                 conversation_history.append(
-                                    _ts_msg("assistant", spoken, interrupted=True, **_latency_extra(turn_timing))
+                                    _ts_msg("assistant", spoken, timestamp=first_tts_ts, interrupted=True, **_latency_extra(turn_timing))
                                     if heard_known
-                                    else _ts_msg("assistant", spoken, **_latency_extra(turn_timing))
+                                    else _ts_msg("assistant", spoken, timestamp=first_tts_ts, **_latency_extra(turn_timing))
                                 )
                             if heard_rec is not None:
                                 heard_rec.persisted_text = spoken
@@ -19025,18 +19120,18 @@ class Engine:
                         if full_response_text.strip():
                             response_text = full_response_text.strip()
                             _streaming_handled = True
-                            conversation_history.append(_ts_msg("user", transcript_text))
+                            self._insert_pipeline_caller_words(conversation_history, transcript_text, timestamp)
                             if heard_rec is not None and heard_rec.interrupted:
                                 # The caller cut the reply after its last chunk was queued.
                                 heard = str(heard_rec.heard_text or "").strip()
                                 if heard:
                                     conversation_history.append(
-                                        _ts_msg("assistant", heard, interrupted=True, **_latency_extra(turn_timing))
+                                        _ts_msg("assistant", heard, timestamp=first_tts_ts, interrupted=True, **_latency_extra(turn_timing))
                                     )
                                 heard_rec.persisted_text = heard
                             else:
                                 conversation_history.append(
-                                    _ts_msg("assistant", response_text, **_latency_extra(turn_timing))
+                                    _ts_msg("assistant", response_text, timestamp=first_tts_ts, **_latency_extra(turn_timing))
                                 )
                                 if heard_rec is not None:
                                     heard_rec.persisted_text = response_text
@@ -19281,7 +19376,7 @@ class Engine:
 
                     # Update conversation history (skip if streaming path already did this)
                     if not _streaming_handled:
-                        conversation_history.append(_ts_msg("user", transcript_text))
+                        self._insert_pipeline_caller_words(conversation_history, transcript_text, timestamp)
                         if response_text:
                             # The TTS stages land on the same dict once the reply's first audio arrives.
                             conversation_history.append(
@@ -19556,20 +19651,22 @@ class Engine:
 
                     # 2. Execute Tools (if any)
                     if tool_calls:
-                        # Wait for playback to finish before executing tools (especially transfer/hangup)
-                        if playback_id:
-                            try:
-                                # Best effort wait to let user hear the response
-                                await asyncio.sleep(len(response_text) * 0.08)
-                            except Exception:
-                                pass
-                        elif _streaming_handled and response_text:
-                            try:
-                                # Streaming path played audio without setting playback_id;
-                                # estimate wait from response length so caller hears farewell
-                                await asyncio.sleep(len(response_text) * 0.08)
-                            except Exception:
-                                pass
+                        # Follow the actual reply's stream/file lifecycle. A
+                        # stopped stream must release this worker immediately.
+                        reply = self._pipeline_reply_inflight.get(call_id) or {}
+                        reply_stream_id = reply.get("stream_id")
+                        if playback_id and playback_id != reply_stream_id:
+                            # A streaming failure can replace this reply with
+                            # file playback; wait on that file, not the dead stream.
+                            reply_stream_id = None
+                        if playback_id or (_streaming_handled and response_text):
+                            if not await self._wait_for_pipeline_tool_playback(
+                                session, stream_id=reply_stream_id,
+                                playback_id=playback_id,
+                            ):
+                                return
+                        if not self._pipeline_output_allowed(call_id, session, stage="pre-tool"):
+                            return
 
                         from src.tools.context import ToolExecutionContext
                         tool_registry = self._tool_registry_for_session(session)
@@ -20173,6 +20270,7 @@ class Engine:
                     """Hand everything the caller has said so far to the LLM."""
                     nonlocal pending_segments, pending_started_at, pending_deadline, last_final_at
                     nonlocal pending_speech_started_at, pending_resume
+                    nonlocal pending_timestamp
                     aggregated = " ".join(pending_segments).strip()
                     segments = len(pending_segments)
                     resume, pending_resume = pending_resume, False
@@ -20181,9 +20279,7 @@ class Engine:
                     last_final, last_final_at = last_final_at, None
                     started_at, pending_started_at = pending_started_at, None
                     speech_started, pending_speech_started_at = pending_speech_started_at, None
-                    starts = self._pipeline_utterance_starts.get(call_id)
-                    if starts:
-                        starts.clear()
+                    timestamp, pending_timestamp = pending_timestamp, None
                     if not aggregated:
                         return
                     if resume:
@@ -20240,12 +20336,12 @@ class Engine:
                             ended = self._pipeline_turn_speech_ended_at = {}
                         ended[call_id] = float(speech_ended_at)
                     try:
-                        outcome = await run_turn(aggregated)
+                        outcome = await run_turn(aggregated, timestamp)
                     except asyncio.CancelledError:
                         # Cancelled by the call's cleanup with the turn unanswered:
                         # the caller's words, and what they heard of a reply the
                         # hangup cut, still go into the record.
-                        await self._record_turn_cut_by_hangup(session, aggregated)
+                        await self._record_turn_cut_by_hangup(session, aggregated, timestamp=timestamp)
                         raise
                     if outcome == "superseded":
                         # The caller went on before the reply's first sound: their
@@ -20253,6 +20349,7 @@ class Engine:
                         pending_segments.append(aggregated)
                         pending_started_at = started_at if started_at is not None else time.monotonic()
                         pending_speech_started_at = speech_started
+                        pending_timestamp = timestamp
                         last_final_at = last_final if last_final is not None else time.monotonic()
                         logger.info(
                             "Caller's words wait for their next words",
@@ -20353,6 +20450,11 @@ class Engine:
                 get_task: Optional[asyncio.Task] = None
                 try:
                     while True:
+                        await self._no_input_note_pending_input(
+                            call_id,
+                            bool(pending_segments) or not transcript_queue.empty()
+                            or bool(get_task is not None and get_task.done()),
+                        )
                         if get_task is None:
                             get_task = asyncio.ensure_future(transcript_queue.get())
                         timeout = None
@@ -20400,16 +20502,10 @@ class Engine:
                                 continue
                         # When this result's utterance started: the start the
                         # cutter recorded when it sent it, else Silero's latest.
-                        starts = self._pipeline_utterance_starts.get(call_id)
-                        speech_started_for_result, result_interrupted_agent = (
-                            starts.popleft() if starts else (None, False)
-                        )
-                        if speech_started_for_result is None:
-                            tracker = self._silero_trackers.get(call_id)
-                            speech_started_for_result = (
-                                getattr(tracker, "segment_started_at", None) if tracker is not None else None
-                            )
-                        normalized = (transcript or "").strip()
+                        result = transcript if isinstance(transcript, _PipelineTranscript) else timed_transcript(transcript)
+                        speech_started_for_result = result.speech_started_at
+                        result_interrupted_agent = result.interrupted_agent
+                        normalized = result.text.strip()
                         if not normalized:
                             # An empty result is not speech, so it must not
                             # push the deadline out. When it is all that the
@@ -20437,8 +20533,9 @@ class Engine:
                             pending_started_at = None
                         if not pending_segments:
                             pending_speech_started_at = speech_started_for_result
+                            pending_timestamp = result.timestamp
                         pending_segments.append(normalized)
-                        last_final_at = time.monotonic()
+                        last_final_at = result.received_at
                         self._pipeline_stt_final_expected_at.pop(call_id, None)
                         if pending_started_at is None:
                             pending_started_at = last_final_at
@@ -20464,7 +20561,7 @@ class Engine:
                     )
                     raise
                 finally:
-                    leftovers: List[str] = []
+                    leftovers: List[Any] = []
                     if get_task is not None:
                         if not get_task.done():
                             get_task.cancel()
@@ -20483,9 +20580,15 @@ class Engine:
                                 leftovers.append(remaining_transcript(transcript_queue.get_nowait()))
                             except asyncio.QueueEmpty:
                                 break
-                        text = " ".join(part.strip() for part in leftovers if part and part.strip()).strip()
+                        text = " ".join(str(part).strip() for part in leftovers if part and str(part).strip()).strip()
                         if text:
-                            await self._record_caller_words_after_hangup(session, text)
+                            timestamps = [part.timestamp for part in leftovers if isinstance(part, _PipelineTranscript) and part.text.strip()]
+                            if pending_timestamp is not None:
+                                timestamps.append(pending_timestamp)
+                            await self._record_caller_words_after_hangup(
+                                session, text, timestamp=min(timestamps) if timestamps else None
+                            )
+                    await self._no_input_note_pending_input(call_id, False)
 
             async def dialog_supervisor() -> None:
                 restart_count = 0

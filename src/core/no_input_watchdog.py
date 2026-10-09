@@ -151,6 +151,9 @@ class _CallState:
     input_active: bool = False
     output_active: bool = False
     processing: bool = False
+    # Accepted pipeline words, including a turn waiting on playback/tools.
+    # Output callbacks must not clear this hold when a barge-in stops audio.
+    pending_input: bool = False
     suspended: bool = False
     self_announcement: bool = False
     terminal: bool = False
@@ -213,6 +216,7 @@ class NoInputWatchdog:
             "input_active": state.input_active,
             "output_active": state.output_active,
             "processing": state.processing,
+            "pending_input": state.pending_input,
             "suspended": state.suspended,
             "phase": state.phase,
             "check_ins": state.check_ins,
@@ -349,6 +353,22 @@ class NoInputWatchdog:
             self._reset_initial_deadline(state)
         self._wake(state)
 
+    async def note_pending_input(self, call_id: str, active: bool) -> None:
+        """Hold caller-idle timing until the pipeline has consumed its accepted words.
+
+        This is independent of playback's processing flag. The stall timer and
+        hard duration cap continue to bound a dialog that never finishes.
+        """
+        state = self._states.get(call_id)
+        if not state or state.terminal or state.pending_input == bool(active):
+            return
+        state.pending_input = bool(active)
+        if active:
+            state.deadline = None
+        elif self._can_count(state):
+            self._reset_initial_deadline(state)
+        self._wake(state)
+
     async def note_input_state(self, call_id: str, active: bool, source: str) -> None:
         """Pause timing while a detector reports caller sound; resume after it ends.
 
@@ -466,6 +486,7 @@ class NoInputWatchdog:
             and not state.input_active
             and not state.output_active
             and not state.processing
+            and not state.pending_input
             and not state.suspended
             and not state.terminal
         )
@@ -566,6 +587,11 @@ class NoInputWatchdog:
                     state.phase = "waiting"
                     self._reset_initial_deadline(state)
                     _NO_INPUT_EVENTS.labels("policy_paused").inc()
+                    continue
+
+                # Receiving a result while the eligibility callback awaited
+                # session state can have put the pipeline back to work.
+                if not self._can_count(state):
                     continue
 
                 if state.phase == "grace" and state.check_ins >= state.policy.max_check_ins:

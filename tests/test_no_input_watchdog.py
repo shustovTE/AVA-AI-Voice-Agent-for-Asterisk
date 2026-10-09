@@ -1395,3 +1395,43 @@ async def test_engine_registers_the_watchdog_with_the_time_the_call_already_last
     assert policy.max_call_duration_sec == 1800.0
     assert policy.max_duration_applies() is True
     assert policy.applies_to(is_outbound=True) is False  # the check-ins stay opt-in for outbound
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["stall_timeout_sec", "max_call_duration_sec"])
+async def test_pending_pipeline_input_keeps_call_duration_limits_active(limit):
+    announce = AsyncMock(return_value=True)
+    hangup = AsyncMock()
+    watchdog = NoInputWatchdog(announce, hangup)
+    policy = NoInputPolicy(initial_timeout_sec=0.01, **{limit: 0.05})
+    await watchdog.register("pending-limit", policy, is_outbound=False)
+    try:
+        await watchdog.note_pending_input("pending-limit", True)
+        await watchdog.mark_ready("pending-limit")
+        await _wait_until(lambda: hangup.await_count == 1)
+        assert all(call.args[2] != "check_in" for call in announce.await_args_list)
+        assert watchdog.snapshot("pending-limit")["pending_input"] is True
+    finally:
+        await watchdog.stop("pending-limit")
+
+
+@pytest.mark.asyncio
+async def test_receiving_input_during_the_idle_eligibility_check_prevents_the_announcement():
+    announce = AsyncMock(return_value=True)
+    eligible = asyncio.Event()
+    watchdog = NoInputWatchdog(announce, AsyncMock())
+
+    async def pause_check(call_id):
+        await watchdog.note_pending_input(call_id, True)
+        eligible.set()
+        return False
+
+    watchdog._should_pause = pause_check
+    await watchdog.register("input-race", NoInputPolicy(initial_timeout_sec=0.02), is_outbound=False)
+    try:
+        await watchdog.mark_ready("input-race")
+        await asyncio.wait_for(eligible.wait(), 1)
+        await asyncio.sleep(0.06)
+        announce.assert_not_awaited()
+    finally:
+        await watchdog.stop("input-race")
