@@ -17351,6 +17351,12 @@ class Engine:
                 return False
             if call_outcome:
                 session.call_outcome = call_outcome
+            elif not str(getattr(session, "call_outcome", "") or "").strip():
+                # Every hangup committed here is engine-initiated. Persist the
+                # default before clearing the TTS flag and issuing ARI hangup,
+                # or cleanup reports a caller hangup for paths without an
+                # explicit outcome (pipeline tools and farewell fallbacks).
+                session.call_outcome = "agent_hangup"
             session.cleanup_after_tts = False
             await self._save_session(session)
             logger.info(
